@@ -20,15 +20,17 @@ from agentchat.channels.telegram import Telegram
 from agentchat.channels.telegram.rendering import RenderedText, render
 from agentchat.channels.telegram.transport import TelegramBotClient
 from agentchat.channels.whatsapp import WhatsApp
+from agentchat.channels.ycloud import YCloud
 from agentchat.rich import RichReply
 from agentchat.state import MemoryState
 
 
 async def check_api(
     slack: Slack, discord: Discord, teams: Teams, imessage: IMessage,
-    telegram: Telegram, whatsapp: WhatsApp, context: MessageContext, message: Message,
+    telegram: Telegram, whatsapp: WhatsApp, ycloud: YCloud, context: MessageContext,
+    message: Message,
 ) -> None:
-    channels: list[Channel] = [slack, discord, teams, imessage, telegram, whatsapp]
+    channels: list[Channel] = [slack, discord, teams, imessage, telegram, whatsapp, ycloud]
     app = AgentChat(channels=channels, state=MemoryState())
     assert_type(app.channels, tuple[Channel, ...])
     assert_type(context.sender, Sender)
@@ -43,6 +45,7 @@ async def check_api(
     assert_type(await slack.get_user("U123"), SlackUser)
     assert_type(await telegram.reply(message, "hello"), Message)
     assert_type(await whatsapp.reply(message, "hello"), Message)
+    assert_type(await ycloud.reply(message, "hello"), Message)
     assert_type(render("**hello**"), RenderedText)
     assert_type(TelegramBotClient("99:token"), TelegramBotClient)
 

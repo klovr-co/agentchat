@@ -13,6 +13,7 @@ IMPORT_HOOK_FILES = {
     "channels/slack/__init__.py",
     "channels/telegram/__init__.py",
     "channels/whatsapp/__init__.py",
+    "channels/ycloud/__init__.py",
 }
 
 

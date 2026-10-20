@@ -25,6 +25,7 @@ def test_native_instances_can_be_collected_during_dictionary_allocation():
         from agentchat.channels.telegram import Telegram
         from agentchat.channels.telegram.transport import TelegramBotClient
         from agentchat.channels.whatsapp import WhatsApp
+        from agentchat.channels.ycloud import YCloud
         from tests.support.channels import FakeChannel, incoming
         from tests.support.discord import DiscordClient
         from tests.support.imessage import BubblesClient, SocketClient
@@ -49,6 +50,8 @@ def test_native_instances_can_be_collected_during_dictionary_allocation():
                     Telegram(bot_token="99:fake", client=TelegramClient()),
                     WhatsApp(phone_number_id="123", access_token="token",
                              app_secret="secret", verify_token="verify"),
+                    YCloud(phone_number="+15550001111", api_key="key",
+                           webhook_secret="secret"),
                 ]
                 transport = TelegramBotClient("99:fake")
                 socket = SocketMode(app_token="fake", web_client=slack_client)

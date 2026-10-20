@@ -10,10 +10,11 @@ a runnable echo example; no agent framework or model key is needed for that chec
 | Teams | `pip install -e '.[teams]'` | Authenticated HTTPS endpoint | [Teams](teams.md) |
 | iMessage | `pip install -e '.[imessage]'` | BlueBubbles Socket.IO + REST | [iMessage](imessage.md) |
 | WhatsApp | `pip install -e '.[whatsapp]'` | Signed HTTPS webhook + Cloud API | [WhatsApp](whatsapp.md) |
+| YCloud (WhatsApp) | `pip install -e '.[ycloud]'` | Signed HTTPS webhook + YCloud API | [YCloud](ycloud.md) |
 | Telegram | `pip install -e '.[telegram]'` | Bot API long polling or HTTPS webhook | [Telegram](telegram.md) |
 
 Use each provider's own package for imports, following the current Slack guide.
-The `whatsapp` and `telegram` extras need
+The `whatsapp`, `ycloud`, and `telegram` extras need
 no additional dependency because aiohttp is already installed. Provider packages
 and agent-framework integrations load only when imported. Python 3.11+ is required.
 
@@ -106,7 +107,7 @@ Each adapter admits at most `max_pending_events=64` in-process handler tasks.
 `AgentChat` deduplicates accepted message IDs and serializes handlers by
 conversation using the configured `State`.
 
-- Teams returns 202 after admission; WhatsApp returns 200. A full HTTP receiver
+- Teams returns 202 after admission; WhatsApp and YCloud return 200. A full HTTP receiver
   returns 503 before admission so the provider can apply its retry policy.
   WhatsApp batches are admitted atomically.
 - Telegram webhooks return 503 the same way. Telegram polling stops reading at
