@@ -20,7 +20,8 @@ from agentchat.channels.telegram import Telegram
 from agentchat.channels.telegram.rendering import RenderedText, render
 from agentchat.channels.telegram.transport import TelegramBotClient
 from agentchat.channels.whatsapp import WhatsApp
-from agentchat.channels.ycloud import YCloud
+from agentchat.channels.ycloud import YCloud, YCloudError, YCloudStatus, YCloudTemplate
+from agentchat.models import DownloadedFile
 from agentchat.rich import RichReply
 from agentchat.state import MemoryState
 
@@ -45,7 +46,16 @@ async def check_api(
     assert_type(await slack.get_user("U123"), SlackUser)
     assert_type(await telegram.reply(message, "hello"), Message)
     assert_type(await whatsapp.reply(message, "hello"), Message)
-    assert_type(await ycloud.reply(message, "hello"), Message)
+    assert_type(await ycloud.reply(message, "hello", external_id="outbox-1"), Message)
+    assert_type(await ycloud.send_template("+15551234567", "order_ready", "en"), Message)
+    assert_type(await ycloud.list_templates(), list[YCloudTemplate])
+    assert_type(await ycloud.download_media(message), DownloadedFile)
+
+    async def on_event(channel: YCloud, event: YCloudStatus | Message) -> None:
+        if isinstance(event, YCloudStatus) and event.error_kind == YCloudError.WINDOW_EXPIRED:
+            assert_type(event.wamid, str | None)
+
+    ycloud.bind_events(on_event)
     assert_type(render("**hello**"), RenderedText)
     assert_type(TelegramBotClient("99:token"), TelegramBotClient)
 
