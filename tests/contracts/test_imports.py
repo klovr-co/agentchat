@@ -35,6 +35,7 @@ import agentchat.channels.discord.events
 import agentchat.channels.teams.events
 import agentchat.channels.imessage.events
 import agentchat.channels.whatsapp.events
+import agentchat.channels.ycloud.events
 import agentchat.channels.telegram.events
 from agentchat.channels.telegram.rendering import text_payload
 assert 'agentchat.channels.slack' not in sys.modules
@@ -87,6 +88,7 @@ from agentchat.channels.discord.adapter import Discord as DiscordDirect
 from agentchat.channels.teams.adapter import Teams as TeamsDirect
 from agentchat.channels.imessage.adapter import IMessage as IMessageDirect
 from agentchat.channels.whatsapp.adapter import WhatsApp as WhatsAppDirect
+from agentchat.channels.ycloud.adapter import YCloud as YCloudDirect
 from agentchat.channels.telegram.adapter import Telegram as TelegramDirect
 from agentchat.integrations.openai_agents import should_reply as should_reply_direct
 """
@@ -96,6 +98,7 @@ from agentchat.channels.discord import Discord
 from agentchat.channels.teams import Teams
 from agentchat.channels.imessage import IMessage
 from agentchat.channels.whatsapp import WhatsApp
+from agentchat.channels.ycloud import YCloud
 from agentchat.channels.telegram import Telegram
 from agentchat.integrations import should_reply
 """
@@ -103,7 +106,7 @@ from agentchat.integrations import should_reply
 assert Slack is SlackDirect and SlackUser is SlackUserDirect
 assert Discord is DiscordDirect and Teams is TeamsDirect
 assert IMessage is IMessageDirect and WhatsApp is WhatsAppDirect
-assert Telegram is TelegramDirect
+assert Telegram is TelegramDirect and YCloud is YCloudDirect
 assert should_reply is should_reply_direct
 """
     code = explicit + namespace if order == "explicit_first" else namespace + explicit

@@ -25,6 +25,7 @@ teams = [
 ]
 imessage = ["python-socketio[asyncio-client]>=5.13,<6"]
 whatsapp = []  # Uses the existing aiohttp dependency.
+ycloud = []  # Uses the existing aiohttp dependency.
 telegram = []
 dev = [
     "openai-agents>=0.4,<1",

@@ -94,6 +94,7 @@ integer precision loss.
 | Slack | Rust implementation, compatible Python SDK injection | Native Rust transport |
 | Telegram | Rust implementation, Python SDK/HTTP I/O | Transport binding pending |
 | WhatsApp | Rust implementation, Python HTTP I/O | Transport binding pending |
+| YCloud | Rust implementation, Python HTTP I/O | Transport binding pending |
 | Discord | Rust implementation, Python SDK/HTTP I/O | Transport binding pending |
 | iMessage | Rust implementation, Python SDK/HTTP I/O | Transport binding pending |
 | Teams | Rust implementation, Python SDK I/O | Transport binding pending |

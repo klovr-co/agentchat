@@ -6,7 +6,7 @@ the [Claude Agent SDK example](examples/node/README.md). Existing Python channel
 integrations remain supported through native bindings. Implementation code lives under
 `src/`; `python/agentchat/` contains only the compatible interface. See the [migration and support guide](docs/rust-core.md).
 
-a minimal sdk to connect your agents to slack, teams, imessage, whatsapp, telegram.
+a minimal sdk to connect your agents to slack, teams, imessage, whatsapp, ycloud, telegram.
 
 use any SDK (Claude Agents, OpenAI Agents, Langchain DeepAgents, Pydantic Agents) and instantly connect it to all supported channels.
 
@@ -195,5 +195,6 @@ async def respond(context: MessageContext) -> str:
 | Microsoft Teams | Authenticated HTTPS endpoint | `teams` | [Teams guide](docs/teams.md) |
 | iMessage | BlueBubbles on a Mac signed into Messages | `imessage` | [iMessage guide](docs/imessage.md) |
 | WhatsApp | Business Cloud API with signed webhooks | `whatsapp` | [WhatsApp guide](docs/whatsapp.md) |
+| YCloud (WhatsApp) | YCloud WhatsApp API with signed webhooks | `ycloud` | [YCloud guide](docs/ycloud.md) |
 | Discord | Bot gateway | `discord` | [Discord guide](docs/discord.md) |
 | Telegram | Bot API long polling or HTTPS webhook | `telegram` | [Telegram guide](docs/telegram.md) |

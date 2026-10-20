@@ -22,15 +22,18 @@ from agentchat.channels.telegram import Telegram
 from agentchat.channels.telegram.events import normalize as telegram_message
 from agentchat.channels.whatsapp import WhatsApp
 from agentchat.channels.whatsapp.events import normalize as whatsapp_messages
+from agentchat.channels.ycloud import YCloud
+from agentchat.channels.ycloud.events import normalize as ycloud_messages
 from tests.support.discord import DiscordClient, discord_event
 from tests.support.imessage import BubblesClient, SocketClient, imessage_event
 from tests.support.receipts import Receipt
 from tests.support.teams import APP_ID, TENANT_ID, teams_adapter, teams_event
 from tests.support.telegram import TelegramClient, telegram_update
 from tests.support.whatsapp import WhatsAppSession, whatsapp_event
+from tests.support.ycloud import YCloudSession, ycloud_event
 
 
-@pytest.fixture(params=["discord", "teams", "imessage", "whatsapp", "telegram"])
+@pytest.fixture(params=["discord", "teams", "imessage", "whatsapp", "ycloud", "telegram"])
 def harness(request):
     receipt = Receipt(101 if request.param in ("discord", "telegram") else "sent")
     options = {"max_pending_events": 2, "shutdown_timeout": 0.01}
@@ -64,6 +67,16 @@ def harness(request):
         channel = Telegram(bot_token="99:fake", client=TelegramClient(receipt), **options)
         source = telegram_message(telegram_update(), bot_id=99, bot_username="agentchat_bot")
         capabilities = {StatusChannel, RichReplyChannel, FileUploadChannel}
+    elif request.param == "ycloud":
+        channel = YCloud(
+            phone_number="+15550001111",
+            api_key="fake",
+            webhook_secret="secret",
+            port=0,
+            **options,
+        )
+        channel._session = YCloudSession(receipt)
+        source = ycloud_messages(ycloud_event(), phone_number="+15550001111")[0]
     else:
         channel = WhatsApp(
             phone_number_id="123",

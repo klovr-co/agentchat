@@ -5,5 +5,6 @@ pub mod imessage;
 pub mod teams;
 pub mod telegram;
 pub mod whatsapp;
+pub mod ycloud;
 
 pub mod wire;

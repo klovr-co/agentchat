@@ -97,10 +97,7 @@ pub(crate) fn env(name: &str, default: &str) -> PyResult<String> {
         None,
     )?)
 }
-pub(crate) async fn exit_context(
-    context: &Py<PyAny>,
-    result: PyResult<Py<PyAny>>,
-) -> PyResult<Py<PyAny>> {
+pub(crate) async fn exit_context<T>(context: &Py<PyAny>, result: PyResult<T>) -> PyResult<T> {
     let args = match &result {
         Ok(_) => vec![none(), none(), none()],
         Err(error) => Python::attach(|py| {

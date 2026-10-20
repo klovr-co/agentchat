@@ -35,7 +35,7 @@ AgentChat             append the returned reply to local state
 | `src/agentchat-core` | Typed models, turn transitions, state contracts, claims/history, context operations |
 | `src/agentchat` | Public Rust interface |
 | `src/agentchat-slack` | Shared Slack policy, rendering, history, files, native HTTP and Socket Mode transport |
-| `src/agentchat-providers` | Telegram, WhatsApp, Discord, iMessage and Teams normalization, routing and validation |
+| `src/agentchat-providers` | Telegram, WhatsApp, YCloud, Discord, iMessage and Teams normalization, routing and validation |
 | `src/bindings/python` | Native Python classes, foreign object ownership, original-task async execution and SDK I/O adapters |
 | `src/bindings/node` | Node native addon, callback and lifecycle bridge |
 | `python/agentchat` | Compatible imports, dataclasses, protocols, optional SDK imports and native aliases |
@@ -143,5 +143,5 @@ not import Slack, aiohttp or OpenAI Agents. Installation defaults are unchanged:
 Slack dependencies remain installed with the base package, while OpenAI Agents
 still uses the `openai` extra.
 
-Discord, Teams, and iMessage use separate optional extras. WhatsApp and Telegram use aiohttp
-from the base install. Requesting one provider does not import the others.
+Discord, Teams, and iMessage use separate optional extras. WhatsApp, YCloud, and Telegram use
+aiohttp from the base install. Requesting one provider does not import the others.

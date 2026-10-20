@@ -30,6 +30,7 @@ mod providers {
     pub mod telegram;
     pub mod transport;
     pub mod whatsapp;
+    pub mod ycloud;
 }
 
 #[pyclass(eq, eq_int, skip_from_py_object, module = "agentchat._native")]
@@ -191,6 +192,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     providers::teams::register(module)?;
     providers::telegram::register(module)?;
     providers::whatsapp::register(module)?;
+    providers::ycloud::register(module)?;
     module.add_class::<Effect>()?;
     module.add_class::<NativeTurn>()?;
     module.add_class::<NativeMemoryStore>()?;
