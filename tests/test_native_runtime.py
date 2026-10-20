@@ -140,7 +140,7 @@ async def test_ambiguous_send_is_not_retried_or_recorded(backend):
 
 
 def test_native_boundary_rejects_invalid_transition_without_panicking():
-    assert core_version == "0.1.0-alpha.1"
+    assert core_version == "0.1.0-alpha.2"
     turn = NativeTurn()
     with pytest.raises(RuntimeError):
         turn.reply_sent()

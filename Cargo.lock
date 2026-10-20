@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentchat"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "agentchat-core",
  "agentchat-providers",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "agentchat-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agentchat-node"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "agentchat-core",
  "agentchat-slack",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "agentchat-providers"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "agentchat-core",
  "hex",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agentchat-python"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "agentchat-core",
  "agentchat-providers",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agentchat-slack"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "agentchat-core",
  "async-trait",

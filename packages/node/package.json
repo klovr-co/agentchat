@@ -1,6 +1,6 @@
 {
   "name": "@berriai/agentchat",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Connect Node.js agents to chat channels through the shared AgentChat Rust core",
   "type": "module",
   "main": "./dist/index.js",
