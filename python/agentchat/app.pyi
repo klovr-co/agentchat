@@ -1,5 +1,5 @@
 # Public compatibility signatures; update with the corresponding Rust binding API.
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Literal
 
 from agentchat._backend import Backend
@@ -72,3 +72,8 @@ class AgentChat:
     async def mirror(
         self, channel: Channel, source: Message, message: Message, *, origin: str = ...
     ) -> Message: ...
+    async def send_ephemeral(
+        self, channel: Channel, source: Message, user_id: str, text: str, *,
+        blocks: Sequence[Mapping[str, object]] | None = ...,
+    ) -> Message: ...
+    async def delete(self, channel: Channel, message: Message) -> None: ...

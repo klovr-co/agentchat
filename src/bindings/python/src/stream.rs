@@ -5,8 +5,12 @@
 //! or append to a native stream. Text past the channel's `stream_limit` continues
 //! in a new message. Channels without streaming get one reply when the stream
 //! finishes. Stream errors propagate; nothing is retried or sent twice.
+//!
+//! On a `TaskStreamingChannel`, `task()` and `plan()` show progress next to the
+//! answer; other channels ignore them.
 use crate::host::coroutine;
 use crate::runtime::{call, copy, none};
+use agentchat_core::{StreamUpdate, TaskStatus, TaskUpdate};
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
@@ -29,6 +33,9 @@ pub struct AnswerStream {
     text: String,
     offset: usize,
     streaming: bool,
+    /// Whether the channel shows task and plan updates, and the unsent ones.
+    tasks: bool,
+    updates: Vec<StreamUpdate>,
     interval: Duration,
     limit: Option<usize>,
     last_flush: Option<Instant>,
@@ -68,6 +75,11 @@ impl AnswerStream {
             ));
         }
         let limit = attribute::<usize>(bound, "stream_limit").filter(|&limit| limit > 0);
+        let tasks = streaming
+            && bound.is_instance(
+                &py.import("agentchat.channels.base")?
+                    .getattr("TaskStreamingChannel")?,
+            )?;
         Ok(Self {
             app: Some(app),
             channel: Some(channel),
@@ -77,6 +89,8 @@ impl AnswerStream {
             text: String::new(),
             offset: 0,
             streaming,
+            tasks,
+            updates: Vec::new(),
             interval: Duration::from_secs_f64(interval),
             limit,
             last_flush: None,
@@ -99,8 +113,78 @@ fn text_object(py: Python<'_>, text: &str) -> PyResult<Object> {
     Ok(text.into_pyobject(py)?.into_any().unbind())
 }
 
+/// Send pending task and plan updates, starting the stream with them if needed.
+async fn send_updates(slf: &Py<AnswerStream>) -> PyResult<()> {
+    let pending = Python::attach(|py| -> PyResult<_> {
+        let mut this = slf.borrow_mut(py);
+        if this.updates.is_empty() {
+            return Ok(None);
+        }
+        let updates = std::mem::take(&mut this.updates);
+        let (_, channel, source) = this.parts(py)?;
+        let handle = this
+            .handle
+            .as_ref()
+            .map_or_else(|| py.None(), |h| h.clone_ref(py));
+        let updates =
+            serde_json::to_value(updates).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let updates = PyTuple::new(
+            py,
+            updates
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|update| crate::convert::from_json(py, update))
+                .collect::<PyResult<Vec<_>>>()?,
+        )?
+        .into_any()
+        .unbind();
+        Ok(Some((channel, source, handle, updates)))
+    })?;
+    if let Some((channel, source, handle, updates)) = pending {
+        let handle = call(
+            channel,
+            "update_stream_tasks",
+            vec![source, handle, updates],
+            vec![],
+        )
+        .await?;
+        Python::attach(|py| slf.borrow_mut(py).handle = Some(handle));
+    }
+    Ok(())
+}
+
+/// Send an update when the interval has passed.
+async fn tick(slf: &Py<AnswerStream>) -> PyResult<()> {
+    let due = Python::attach(|py| {
+        let mut this = slf.borrow_mut(py);
+        let due = this.streaming
+            && this
+                .last_flush
+                .is_none_or(|last| last.elapsed() >= this.interval);
+        if due {
+            this.last_flush = Some(Instant::now());
+        }
+        due
+    });
+    if due {
+        flush(slf, false).await?;
+    }
+    Ok(())
+}
+
+fn open(this: &AnswerStream) -> PyResult<()> {
+    if this.done {
+        return Err(PyRuntimeError::new_err(
+            "This answer stream is already finished",
+        ));
+    }
+    Ok(())
+}
+
 /// Send the unconfirmed text: finish full messages, then start or update the last one.
 async fn flush(slf: &Py<AnswerStream>, finishing: bool) -> PyResult<()> {
+    send_updates(slf).await?;
     loop {
         let (app, channel, source, handle, part, limit) = Python::attach(|py| {
             let this = slf.borrow(py);
@@ -223,25 +307,82 @@ impl AnswerStream {
     /// Add text to the answer; sends an update when the interval has passed.
     fn append(slf: Py<Self>, py: Python<'_>, text: String) -> PyResult<Object> {
         coroutine(py, async move {
-            let due = Python::attach(|py| {
+            Python::attach(|py| {
                 let mut this = slf.borrow_mut(py);
-                if this.done {
-                    return Err(PyRuntimeError::new_err(
-                        "This answer stream is already finished",
-                    ));
-                }
+                open(&this)?;
                 this.text.push_str(&text);
-                let due = this.streaming
-                    && this
-                        .last_flush
-                        .is_none_or(|last| last.elapsed() >= this.interval);
-                if due {
-                    this.last_flush = Some(Instant::now());
-                }
-                Ok(due)
+                Ok::<_, PyErr>(())
             })?;
-            if due {
-                flush(&slf, false).await?;
+            tick(&slf).await?;
+            Ok(none())
+        })
+    }
+    /// Show a task's progress with the answer: `status` is "pending",
+    /// "in_progress", "complete" or "error". A later call with the same `id`
+    /// updates it; `details` and `output` add text. Channels that cannot show
+    /// tasks ignore it. On Slack, call `plan()` or `task()` before the first
+    /// `append()`: a stream started with text alone cannot show tasks later.
+    #[pyo3(signature=(id,title,status="in_progress",*,details=None,output=None))]
+    fn task(
+        slf: Py<Self>,
+        py: Python<'_>,
+        id: String,
+        title: String,
+        status: &str,
+        details: Option<String>,
+        output: Option<String>,
+    ) -> PyResult<Object> {
+        let status: TaskStatus = status
+            .parse()
+            .map_err(|e: agentchat_core::Error| PyValueError::new_err(e.to_string()))?;
+        let update = TaskUpdate {
+            id,
+            title,
+            status,
+            details,
+            output,
+        };
+        coroutine(py, async move {
+            let tasks = Python::attach(|py| {
+                let mut this = slf.borrow_mut(py);
+                open(&this)?;
+                let mut ignored = Vec::new();
+                let tasks = this.tasks;
+                let updates = if tasks {
+                    &mut this.updates
+                } else {
+                    &mut ignored
+                };
+                agentchat_core::queue_task(updates, update)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok::<_, PyErr>(tasks)
+            })?;
+            if tasks {
+                tick(&slf).await?;
+            }
+            Ok(none())
+        })
+    }
+    /// Group this answer's tasks under a plan with `title`; ignored by channels
+    /// that cannot show tasks.
+    fn plan(slf: Py<Self>, py: Python<'_>, title: String) -> PyResult<Object> {
+        coroutine(py, async move {
+            let tasks = Python::attach(|py| {
+                let mut this = slf.borrow_mut(py);
+                open(&this)?;
+                let mut ignored = Vec::new();
+                let tasks = this.tasks;
+                let updates = if tasks {
+                    &mut this.updates
+                } else {
+                    &mut ignored
+                };
+                agentchat_core::queue_plan(updates, &title)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok::<_, PyErr>(tasks)
+            })?;
+            if tasks {
+                tick(&slf).await?;
             }
             Ok(none())
         })

@@ -4,11 +4,19 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Protocol
 
-SlackEventReceiver = Callable[[Mapping[str, object]], Awaitable[None]]
+SlackEventReceiver = Callable[[Mapping[str, object]], Awaitable[Mapping[str, object] | None]]
 
 
 class SlackEventSource(Protocol):
-    """Deliver authenticated Events API payloads to the shared Slack adapter.
+    """Deliver authenticated Slack payloads to the shared Slack adapter.
+
+    Payloads are Events API envelopes, interactive payloads (button presses, view
+    submissions, shortcuts) and slash commands. The receiver returns the response
+    body for payloads whose acknowledgement may carry one: view submissions,
+    options requests and slash commands (see
+    ``agentchat.channels.slack.events.responds``). For those, await the receiver
+    before responding; it returns within ``events.ACK_DEADLINE`` seconds.
+    Acknowledge everything else first, as before.
 
     ``run`` stays active until shutdown and propagates startup/transport errors.
     The source owns acknowledgement, backpressure and accepted background work;

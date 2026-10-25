@@ -9,6 +9,7 @@ use agentchat_core::{Message, Role};
 use agentchat_slack::{
     events,
     host::ack_request,
+    interaction::{self, Route, ViewTarget},
     policy::{
         self, DeliveryKind, MessageReceipt, MirroredReply, ReplyDestination, ReplyMessageRoute,
         ThreadHistory,
@@ -16,13 +17,14 @@ use agentchat_slack::{
     rendering,
 };
 use pyo3::{
-    exceptions::{PyException, PyRuntimeError, PyValueError},
+    exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
-    types::{PyDict, PyTuple, PyType},
+    types::{PyDict, PyList, PySet, PyTuple, PyType},
     PyTraverseError, PyVisit,
 };
 use serde_json::json;
 type Object = Py<PyAny>;
+const MODULE: &str = "agentchat.channels.slack";
 /// Call a Web API method the SDK may not wrap yet; an unconfirmed call raises.
 async fn slack_api(
     web: &Object,
@@ -40,6 +42,61 @@ async fn slack_api(
     if response["ok"] != true {
         return Err(PyRuntimeError::new_err(format!(
             "Slack {method} could not be confirmed"
+        )));
+    }
+    Ok(response)
+}
+/// One write attempt: `Ok(Err(code))` when Slack definitely refused it, `Err` when
+/// the outcome is unknown.
+async fn slack_attempt(
+    web: &Object,
+    method: &str,
+    payload: serde_json::Value,
+) -> PyResult<Result<serde_json::Value, String>> {
+    let response = acall(
+        web,
+        "api_call",
+        vec![j(json!(method))?],
+        Some(j(json!({"json": payload}))?),
+    )
+    .await;
+    let response = match response {
+        Ok(response) => value(&response)?,
+        Err(error) => {
+            // slack_sdk raises SlackApiError for `ok: false`; its response holds the code.
+            let refused = Python::attach(|py| -> PyResult<Option<serde_json::Value>> {
+                let api_error = py.import("slack_sdk.errors")?.getattr("SlackApiError")?;
+                if !error.is_instance(py, &api_error) {
+                    return Ok(None);
+                }
+                let response = error.value(py).getattr("response")?;
+                Ok(Some(crate::convert::to_json(&response)?))
+            });
+            match refused {
+                Ok(Some(response)) => response,
+                _ => return Err(error),
+            }
+        }
+    };
+    if response["ok"] == true {
+        return Ok(Ok(response));
+    }
+    Ok(Err(response["error"]
+        .as_str()
+        .unwrap_or("unknown_error")
+        .to_owned()))
+}
+/// A Web API call through the SDK's own method; an unconfirmed call raises.
+async fn sdk_call(
+    web: &Object,
+    method: &str,
+    payload: serde_json::Value,
+) -> PyResult<serde_json::Value> {
+    let response = value(&acall(web, method, vec![], Some(j(payload)?)).await?)?;
+    if response["ok"] != true {
+        return Err(PyRuntimeError::new_err(format!(
+            "Slack {method} could not be confirmed ({})",
+            response["error"].as_str().unwrap_or("unknown_error")
         )));
     }
     Ok(response)
@@ -114,6 +171,11 @@ pub struct SlackState {
     _workspace_id: Option<String>,
     _bot_user_id: Option<String>,
     _threads: Object,
+    _agent_sessions: bool,
+    /// The application's handlers: `(kind, key, handler)` tuples.
+    _routes: Py<PyList>,
+    /// Handlers that missed the acknowledgement deadline and still run.
+    _late: Py<PySet>,
 }
 impl std::ops::Deref for Slack {
     type Target = SlackState;
@@ -236,7 +298,7 @@ impl Slack {
     ) -> Self {
         Self { state: None }
     }
-    #[pyo3(signature=(*,bot_token,app_token=None,event_source=None,web_client=None,ack_emoji=Some("eyes"),workspace_id=None,bot_user_id=None,thread_subscriptions=None,max_pending_events=64))]
+    #[pyo3(signature=(*,bot_token,app_token=None,event_source=None,web_client=None,ack_emoji=Some("eyes"),workspace_id=None,bot_user_id=None,thread_subscriptions=None,max_pending_events=64,agent_sessions=false))]
     #[allow(clippy::too_many_arguments)]
     fn initialize(
         &mut self,
@@ -250,6 +312,7 @@ impl Slack {
         bot_user_id: Option<String>,
         thread_subscriptions: Option<Object>,
         max_pending_events: i64,
+        agent_sessions: bool,
     ) -> PyResult<()> {
         *self = Self::build(
             py,
@@ -262,8 +325,73 @@ impl Slack {
             bot_user_id,
             thread_subscriptions,
             max_pending_events,
+            agent_sessions,
         )?;
         Ok(())
+    }
+    #[getter(agent_sessions)]
+    fn get_agent_sessions(&self) -> bool {
+        self._agent_sessions
+    }
+    fn _register(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        key: Object,
+        handler: Object,
+    ) -> PyResult<Object> {
+        if !handler.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("A Slack handler must be callable"));
+        }
+        self._routes
+            .bind(py)
+            .append((kind, key, handler.clone_ref(py)))?;
+        Ok(handler)
+    }
+    fn _decorator(slf: &Bound<'_, Self>, kind: &str, key: Object) -> PyResult<Object> {
+        let py = slf.py();
+        let text = key.bind(py).extract::<String>().is_ok();
+        if !text && (matches!(kind, "event" | "command") || !key.bind(py).hasattr("search")?) {
+            return Err(PyTypeError::new_err(
+                if matches!(kind, "event" | "command") {
+                    "Expected a string"
+                } else {
+                    "Expected a string or a compiled pattern"
+                },
+            ));
+        }
+        Ok(py
+            .import("functools")?
+            .getattr("partial")?
+            .call1((slf.getattr("_register")?, kind, key))?
+            .unbind())
+    }
+    /// Handle Events API events of `event_type` that AgentChat does not turn into
+    /// a message, such as `app_home_opened`. The handler receives the whole event
+    /// envelope; the event is `payload["event"]`.
+    fn on_event(slf: &Bound<'_, Self>, event_type: Object) -> PyResult<Object> {
+        Self::_decorator(slf, "event", event_type)
+    }
+    /// Handle `block_actions` whose `action_id` equals `action_id`, or where a
+    /// compiled pattern's `search` matches. AgentChat's prompt buttons never reach it.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Object) -> PyResult<Object> {
+        Self::_decorator(slf, "action", action_id)
+    }
+    /// Handle `view_submission` and `view_closed` for matching `callback_id`s. A
+    /// submission handler's return value is the acknowledgement body, such as
+    /// `{"response_action": "errors", "errors": {...}}`.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Object) -> PyResult<Object> {
+        Self::_decorator(slf, "view", callback_id)
+    }
+    /// Handle a slash command such as "/deploy"; the return value is the response.
+    fn on_command(slf: &Bound<'_, Self>, command: Object) -> PyResult<Object> {
+        Self::_decorator(slf, "command", command)
+    }
+    /// Handle every other payload no handler above matched, such as shortcuts and
+    /// options requests.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Object) -> PyResult<Object> {
+        let py = slf.py();
+        slf.borrow()._register(py, "raw", py.None(), handler)
     }
     #[classmethod]
     #[pyo3(signature=(*,ack_emoji=Some("eyes")))]
@@ -391,7 +519,39 @@ impl Slack {
                     .await?;
                 }
             }
-            acall(&source, "close", vec![], None).await
+            let closed = acall(&source, "close", vec![], None).await;
+            // Handlers that missed their acknowledgement deadline get the same drain time.
+            let late = Python::attach(|py| -> PyResult<_> {
+                let late = slf.borrow(py)._late.clone_ref(py);
+                if late.bind(py).is_empty() {
+                    return Ok(None);
+                }
+                let kwargs = PyDict::new(py);
+                kwargs.set_item(
+                    "timeout",
+                    py.import("agentchat.channels.slack.socket_mode")?
+                        .getattr("EVENT_DRAIN_TIMEOUT")?,
+                )?;
+                Ok(Some(
+                    py.import("asyncio")?
+                        .call_method(
+                            "wait",
+                            (PyTuple::new(py, late.bind(py).iter())?,),
+                            Some(&kwargs),
+                        )?
+                        .unbind(),
+                ))
+            })?;
+            if let Some(waiting) = late {
+                let results = host::await_py(waiting).await?;
+                Python::attach(|py| -> PyResult<()> {
+                    for task in results.bind(py).get_item(1)?.try_iter()? {
+                        task?.call_method0("cancel")?;
+                    }
+                    Ok(())
+                })?;
+            }
+            closed
         })
     }
     fn is_connected(&self, py: Python<'_>) -> PyResult<Object> {
@@ -481,10 +641,15 @@ impl Slack {
             Ok(none())
         })
     }
+    /// Deliver an authenticated payload. Messages, prompt answers and stop requests
+    /// go to AgentChat; everything else goes to the application's handlers. Returns
+    /// the acknowledgement body for payloads that take one (view submissions,
+    /// options requests and slash commands), waiting at most the acknowledgement
+    /// deadline; otherwise None.
     fn handle_event(slf: Py<Self>, py: Python<'_>, payload: Object) -> PyResult<Object> {
         host::coroutine(py, async move {
-            let payload = value(&payload)?;
-            let (message, threads, receiver) = Python::attach(|py| {
+            let data = value(&payload)?;
+            let (workspace, bot, threads, receiver) = Python::attach(|py| {
                 let this = slf.borrow(py);
                 let receiver = this
                     ._receiver
@@ -494,53 +659,85 @@ impl Slack {
                     })?
                     .clone_ref(py);
                 Ok::<_, PyErr>((
-                    events::normalize_scoped(
-                        &payload,
-                        this._bot_user_id.as_deref(),
-                        this._workspace_id.as_deref(),
-                        "slack",
-                    ),
+                    this._workspace_id.clone(),
+                    this._bot_user_id.clone(),
                     this._threads.clone_ref(py),
                     receiver,
                 ))
             })?;
-            if message.is_none() {
-                let press = Python::attach(|py| {
-                    let this = slf.borrow(py);
-                    events::normalize_action(
-                        &payload,
-                        this._bot_user_id.as_deref(),
-                        this._workspace_id.as_deref(),
-                        "slack",
-                    )
-                });
-                if let Some(press) = press {
-                    let press = Python::attach(|py| convert::to_message(py, &press))?;
-                    acall(&receiver, "__call__", vec![slf.into_any(), press], None).await?;
-                }
+            if !interaction::in_workspace(&data, workspace.as_deref()) {
                 return Ok(none());
             }
-            if let Some(message) = message {
-                if message.metadata.get("requires_subscription") == Some(&json!(true))
-                    && !extract::<bool>(
-                        &acall(
-                            &threads,
-                            "contains",
-                            vec![j(json!(message.conversation_id.as_ref()))?],
-                            None,
-                        )
-                        .await?,
-                    )?
+            let channel = Python::attach(|py| slf.clone_ref(py).into_any());
+            if data.get("event").is_some_and(|event| event.is_object()) {
+                // Slack's native stop is a stop request, and the application sees it too.
+                if let Some(stop) =
+                    interaction::normalize_stop(&data, workspace.as_deref(), "slack")
                 {
+                    let stop = Python::attach(|py| convert::to_message(py, &stop))?;
+                    let delivered = acall(
+                        &receiver,
+                        "__call__",
+                        vec![clone_obj(&channel), clone_obj(&stop)],
+                        None,
+                    )
+                    .await;
+                    let cleared =
+                        acall(&channel, "set_status", vec![stop, j(json!(""))?], None).await;
+                    if cleared.is_err() {
+                        log_warning(MODULE, "Could not clear the Slack status after a stop")?;
+                    }
+                    delivered?;
+                    Self::dispatch(&slf, payload, false).await?;
                     return Ok(none());
                 }
+                let mut message =
+                    events::normalize_scoped(&data, bot.as_deref(), workspace.as_deref(), "slack");
+                if let Some(found) = &message {
+                    if found.metadata.get("requires_subscription") == Some(&json!(true))
+                        && !extract::<bool>(
+                            &acall(
+                                &threads,
+                                "contains",
+                                vec![j(json!(found.conversation_id.as_ref()))?],
+                                None,
+                            )
+                            .await?,
+                        )?
+                    {
+                        message = None;
+                    }
+                }
+                let Some(message) = message else {
+                    Self::dispatch(&slf, payload, false).await?;
+                    return Ok(none());
+                };
                 let message = Python::attach(|py| convert::to_message(py, &message))?;
-                let channel = slf.into_any();
                 acall(&channel, "_ack", vec![clone_obj(&message)], None).await?;
                 acall(&receiver, "__call__", vec![channel, message], None).await?;
+                return Ok(none());
             }
-            Ok(none())
+            let press =
+                events::normalize_action(&data, bot.as_deref(), workspace.as_deref(), "slack");
+            if let Some(press) = press {
+                let press = Python::attach(|py| convert::to_message(py, &press))?;
+                acall(&receiver, "__call__", vec![channel, press], None).await?;
+                return Ok(none());
+            }
+            Self::dispatch(&slf, payload, interaction::responds(&data)).await
         })
+    }
+    fn _late_done(&self, py: Python<'_>, task: &Bound<'_, PyAny>) -> PyResult<()> {
+        self._late.bind(py).discard(task)?;
+        if !task.call_method0("cancelled")?.is_truthy()?
+            && !task.call_method0("exception")?.is_none()
+        {
+            log_warning(
+                MODULE,
+                "A Slack handler failed after its acknowledgement deadline",
+            )?;
+        }
+        Ok(())
     }
     fn _ack(&self, py: Python<'_>, message: Object) -> PyResult<Object> {
         let web = self._web_client.clone_ref(py);
@@ -574,6 +771,7 @@ impl Slack {
     fn set_status(&self, py: Python<'_>, source: Object, status: String) -> PyResult<Object> {
         let web = self._web_client.clone_ref(py);
         let workspace = self._workspace_id.clone();
+        let sessions = self._agent_sessions;
         host::coroutine(py, async move {
             let destination =
                 ReplyDestination::from_source(&from_message(&source)?, workspace.as_deref())
@@ -581,6 +779,12 @@ impl Slack {
             let Some(thread) = destination.thread_ts else {
                 return j(json!(false));
             };
+            if sessions {
+                let (method, payload) =
+                    policy::status_request(&destination.channel_id, &thread, &status, true);
+                slack_api(&web, method, payload).await?;
+                return j(json!(true));
+            }
             let response = acall(
                 &web,
                 "assistant_threads_setStatus",
@@ -596,6 +800,189 @@ impl Slack {
                 ));
             }
             j(json!(true))
+        })
+    }
+    /// Post a notice in the source conversation that only `user_id` can see. It is
+    /// never posted publicly instead.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        &self,
+        py: Python<'_>,
+        source: Object,
+        user_id: String,
+        text: String,
+        blocks: Option<Object>,
+    ) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        let message = from_message(&source)?;
+        let destination = self.destination(&message, true)?;
+        let content = Python::attach(|py| -> PyResult<_> {
+            let reply = PyDict::new(py);
+            reply.set_item("text", &text)?;
+            if let Some(blocks) = &blocks {
+                reply.set_item("blocks", blocks)?;
+            }
+            convert::from_rich_reply(
+                py.import("agentchat.models")?
+                    .getattr("RichReply")?
+                    .call((), Some(&reply))?
+                    .as_any(),
+            )
+        })?;
+        let request = interaction::ephemeral_request(
+            &destination.channel_id,
+            destination.thread_ts.as_deref(),
+            &user_id,
+            &content,
+        )
+        .map_err(policy_error)?;
+        host::coroutine(py, async move {
+            let response = sdk_call(&web, "chat_postEphemeral", request).await?;
+            let sent = interaction::ephemeral_message(
+                &message,
+                &destination.channel_id,
+                destination.thread_ts.as_deref(),
+                &user_id,
+                &text,
+                &response,
+            )
+            .map_err(policy_error)?;
+            Python::attach(|py| convert::to_message(py, &sent))
+        })
+    }
+    /// Delete a message this app sent (`chat.delete`).
+    fn delete(&self, py: Python<'_>, message: Object) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        let request =
+            interaction::delete_request(&from_message(&message)?, self._workspace_id.as_deref())
+                .map_err(policy_error)?;
+        host::coroutine(py, async move {
+            sdk_call(&web, "chat_delete", request).await?;
+            Ok(none())
+        })
+    }
+    /// Open a modal with an interaction's `trigger_id`, which expires three seconds
+    /// after Slack sends it. Returns the opened view.
+    fn open_view(
+        &self,
+        py: Python<'_>,
+        trigger_id: &str,
+        view: &Bound<'_, PyAny>,
+    ) -> PyResult<Object> {
+        let request = interaction::open_view_request(trigger_id, &convert::to_json(view)?)
+            .map_err(policy_error)?;
+        self.view_call(py, "views_open", request)
+    }
+    /// Push a view onto an open modal with the `trigger_id` of an interaction in it.
+    fn push_view(
+        &self,
+        py: Python<'_>,
+        trigger_id: &str,
+        view: &Bound<'_, PyAny>,
+    ) -> PyResult<Object> {
+        let request = interaction::open_view_request(trigger_id, &convert::to_json(view)?)
+            .map_err(policy_error)?;
+        self.view_call(py, "views_push", request)
+    }
+    /// Replace a view named by `view_id` or `external_id`; `hash` guards against races.
+    #[pyo3(signature=(view,*,view_id=None,external_id=None,hash=None))]
+    fn update_view(
+        &self,
+        py: Python<'_>,
+        view: &Bound<'_, PyAny>,
+        view_id: Option<String>,
+        external_id: Option<String>,
+        hash: Option<String>,
+    ) -> PyResult<Object> {
+        let target = match (view_id, external_id) {
+            (Some(id), None) => ViewTarget::Id(id),
+            (None, Some(id)) => ViewTarget::External(id),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "Pass exactly one of view_id or external_id",
+                ))
+            }
+        };
+        let request =
+            interaction::update_view_request(&convert::to_json(view)?, &target, hash.as_deref())
+                .map_err(policy_error)?;
+        self.view_call(py, "views_update", request)
+    }
+    /// Publish a user's App Home tab.
+    #[pyo3(signature=(user_id,view,*,hash=None))]
+    fn publish_home(
+        &self,
+        py: Python<'_>,
+        user_id: &str,
+        view: &Bound<'_, PyAny>,
+        hash: Option<String>,
+    ) -> PyResult<Object> {
+        let request =
+            interaction::publish_home_request(user_id, &convert::to_json(view)?, hash.as_deref())
+                .map_err(policy_error)?;
+        self.view_call(py, "views_publish", request)
+    }
+    /// Show task and plan updates with a streamed answer. A stream started with them
+    /// uses Slack's chunks; if Slack refuses them, the answer streams as plain text.
+    fn update_stream_tasks(
+        &self,
+        py: Python<'_>,
+        source: Object,
+        stream: Object,
+        updates: &Bound<'_, PyAny>,
+    ) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        let message = from_message(&source)?;
+        let destination = self.destination(&message, true)?;
+        let streams = web.bind(py).hasattr("api_call")?;
+        let updates: Vec<agentchat_core::StreamUpdate> =
+            serde_json::from_value(convert::to_json(updates)?)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let handle = (!stream.is_none(py)).then(|| value(&stream)).transpose()?;
+        host::coroutine(py, async move {
+            let Some(handle) = handle else {
+                let Some(thread) = destination.thread_ts.filter(|_| streams) else {
+                    return j(json!({"post": true}));
+                };
+                let request = policy::stream_start_tasks_request(
+                    &destination.channel_id,
+                    &thread,
+                    &message,
+                    &updates,
+                );
+                return match slack_attempt(&web, "chat.startStream", request).await? {
+                    Ok(response) => {
+                        MessageReceipt::confirmed_timestamp(&response, DeliveryKind::Stream)
+                            .map_err(policy_error)?;
+                        j(policy::chunk_stream_handle(
+                            &destination.channel_id,
+                            &response["ts"],
+                        ))
+                    }
+                    // Nothing was started; the answer starts as plain text with its first text.
+                    Err(code) if policy::retry_without_chunks(&code) => {
+                        log_warning(MODULE, "Slack refused task updates; streaming plain text")?;
+                        j(json!({"defer": true}))
+                    }
+                    Err(code) => Err(PyRuntimeError::new_err(format!(
+                        "Slack chat.startStream could not be confirmed ({code})"
+                    ))),
+                };
+            };
+            let Some(request) = policy::stream_tasks_request(&handle, &updates) else {
+                return Ok(stream);
+            };
+            // Task updates are secondary: a refused update never fails the answer.
+            match slack_attempt(&web, "chat.appendStream", request).await {
+                Ok(Ok(_)) => Ok(stream),
+                _ => {
+                    log_warning(
+                        MODULE,
+                        "Slack refused task updates; the answer continues without them",
+                    )?;
+                    j(policy::without_tasks(&handle))
+                }
+            }
         })
     }
     fn _delivery_destination(
@@ -758,18 +1145,25 @@ impl Slack {
         })
     }
     fn append_stream(
-        &self,
+        slf: Py<Self>,
         py: Python<'_>,
         source: Object,
         stream: Object,
         text: String,
     ) -> PyResult<Object> {
-        let web = self._web_client.clone_ref(py);
-        self.destination(&from_message(&source)?, true)?;
+        let web = slf.borrow(py)._web_client.clone_ref(py);
+        slf.borrow(py).destination(&from_message(&source)?, true)?;
         host::coroutine(py, async move {
             let handle = value(&stream)?;
             if handle["post"] == true {
                 return Ok(stream);
+            }
+            if handle["defer"] == true {
+                if text.is_empty() {
+                    return Ok(stream);
+                }
+                let text = j(json!(text))?;
+                return acall(&slf.into_any(), "start_stream", vec![source, text], None).await;
             }
             let (payload, next) =
                 policy::stream_request(&handle, &text, false).map_err(policy_error)?;
@@ -792,7 +1186,7 @@ impl Slack {
         drop(this);
         host::coroutine(py, async move {
             let handle = value(&stream)?;
-            if handle["post"] == true {
+            if handle["post"] == true || handle["defer"] == true {
                 let text = j(json!(text))?;
                 return acall(&slf.into_any(), "reply", vec![source, text], None).await;
             }
@@ -914,6 +1308,8 @@ impl Slack {
             visit.call(&state._auth_task)?;
             visit.call(&state._close_task)?;
             visit.call(&state._threads)?;
+            visit.call(&state._routes)?;
+            visit.call(&state._late)?;
         }
         Ok(())
     }
@@ -928,6 +1324,98 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 impl Slack {
+    fn view_call(
+        &self,
+        py: Python<'_>,
+        method: &'static str,
+        request: serde_json::Value,
+    ) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        host::coroutine(py, async move {
+            let response = sdk_call(&web, method, request).await?;
+            let view = interaction::view_of(&response).map_err(policy_error)?;
+            j(view)
+        })
+    }
+    /// Run the handler for an application payload. With `deadline`, wait at most
+    /// the acknowledgement deadline for its answer; a slower handler keeps running.
+    async fn dispatch(slf: &Py<Self>, payload: Object, deadline: bool) -> PyResult<Object> {
+        let route = interaction::route(&value(&payload)?);
+        let pending = Python::attach(|py| -> PyResult<Option<Object>> {
+            let Some(handler) = slf.borrow(py).find(py, &route)? else {
+                return Ok(None);
+            };
+            let pending = handler.bind(py).call1((payload.bind(py),))?;
+            if !deadline {
+                return Ok(Some(pending.unbind()));
+            }
+            Ok(Some(
+                py.import("asyncio")?
+                    .call_method1("ensure_future", (pending,))?
+                    .unbind(),
+            ))
+        })?;
+        let Some(pending) = pending else {
+            return Ok(none());
+        };
+        if !deadline {
+            return host::await_py(pending).await;
+        }
+        let waiting = Python::attach(|py| -> PyResult<Object> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("timeout", interaction::ACK_DEADLINE.as_secs_f64())?;
+            Ok(py
+                .import("asyncio")?
+                .call_method("wait", ((pending.bind(py),),), Some(&kwargs))?
+                .unbind())
+        })?;
+        host::await_py(waiting).await?;
+        Python::attach(|py| {
+            let task = pending.bind(py);
+            if task.call_method0("done")?.is_truthy()? {
+                return Ok(task.call_method0("result")?.unbind());
+            }
+            log_warning(MODULE, "Slack handler missed the acknowledgement deadline")?;
+            let this = slf.borrow(py);
+            this._late.bind(py).add(task)?;
+            task.call_method1("add_done_callback", (slf.bind(py).getattr("_late_done")?,))?;
+            Ok(py.None())
+        })
+    }
+    /// The first handler registered for `route`, else the raw handler.
+    fn find(&self, py: Python<'_>, route: &Route) -> PyResult<Option<Object>> {
+        let (kind, keys): (&str, Vec<&str>) = match route {
+            Route::Event { event_type } => ("event", vec![event_type.as_str()]),
+            Route::Action { action_ids } => {
+                ("action", action_ids.iter().map(String::as_str).collect())
+            }
+            Route::View { callback_id } => ("view", vec![callback_id.as_str()]),
+            Route::Command { command } => ("command", vec![command.as_str()]),
+            Route::Other => ("other", vec![]),
+        };
+        let mut raw = None;
+        for entry in self._routes.bind(py).iter() {
+            let (entry_kind, key, handler): (String, Bound<'_, PyAny>, Bound<'_, PyAny>) =
+                entry.extract()?;
+            if entry_kind == "raw" {
+                raw = Some(handler.unbind());
+                continue;
+            }
+            if entry_kind != kind {
+                continue;
+            }
+            for value in &keys {
+                let matched = match key.extract::<String>() {
+                    Ok(exact) => exact == *value,
+                    Err(_) => !key.call_method1("search", (*value,))?.is_none(),
+                };
+                if matched {
+                    return Ok(Some(handler.unbind()));
+                }
+            }
+        }
+        Ok(raw)
+    }
     #[allow(clippy::too_many_arguments)]
     fn build(
         py: Python<'_>,
@@ -940,6 +1428,7 @@ impl Slack {
         bot_user_id: Option<String>,
         thread_subscriptions: Option<Object>,
         max_pending_events: i64,
+        agent_sessions: bool,
     ) -> PyResult<Self> {
         if app_token.is_none() == event_source.is_none() {
             return Err(PyValueError::new_err(
@@ -991,6 +1480,9 @@ impl Slack {
                     Some(value) => value,
                     None => Py::new(py, MemoryThreadSubscriptions::build())?.into_any(),
                 },
+                _agent_sessions: agent_sessions,
+                _routes: PyList::empty(py).unbind(),
+                _late: PySet::empty(py)?.unbind(),
             })),
         })
     }

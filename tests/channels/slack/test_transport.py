@@ -85,7 +85,7 @@ async def test_socket_acknowledges_without_waiting_for_handlers_and_drains_on_cl
         assert socket.acknowledgements == ["one", "two"]
         assert not received
         await socket.emit("overflow", "3.0")
-        await socket.emit("unsupported", request_type="slash_commands")
+        await socket.emit("unsupported", request_type="hello")
         assert socket.acknowledgements == ["one", "two"]
 
         closing = asyncio.create_task(source.close())

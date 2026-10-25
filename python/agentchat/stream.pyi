@@ -1,5 +1,6 @@
 # Public compatibility signatures; update with the corresponding Rust binding API.
 from types import TracebackType
+from typing import Literal
 
 from agentchat.models import Message
 
@@ -9,6 +10,12 @@ class AnswerStream:
     @property
     def messages(self) -> tuple[Message, ...]: ...
     async def append(self, text: str) -> None: ...
+    async def task(
+        self, id: str, title: str,
+        status: Literal["pending", "in_progress", "complete", "error"] = ..., *,
+        details: str | None = ..., output: str | None = ...,
+    ) -> None: ...
+    async def plan(self, title: str) -> None: ...
     async def finish(self) -> Message | None: ...
     async def __aenter__(self) -> AnswerStream: ...
     async def __aexit__(

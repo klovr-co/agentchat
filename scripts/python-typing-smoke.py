@@ -4,8 +4,9 @@ Run with MYPYPATH=python mypy --ignore-missing-imports --follow-imports silent
 scripts/python-typing-smoke.py, using the project environment's Python executable.
 """
 
+import re
 from collections.abc import Awaitable, Callable, Mapping
-from typing import assert_type
+from typing import Any, assert_type
 
 from agentchat import AgentChat, Conversation, Message, MessageContext, Sender
 from agentchat.activity import WorkingStatus
@@ -44,6 +45,23 @@ async def check_api(
     async with app.state.lock(context.conversation.id):
         assert_type(await app.state.history(context.conversation.id), tuple[Message, ...])
     assert_type(await slack.get_user("U123"), SlackUser)
+    assert_type(await context.reply_ephemeral("only you"), Message)
+    assert_type(await app.send_ephemeral(slack, message, "U123", "only you"), Message)
+    assert_type(await app.delete(slack, message), None)
+    assert_type(await slack.open_view("1.2.3", {"type": "modal"}), dict[str, Any])
+    assert_type(await slack.publish_home("U123", {"type": "home"}), dict[str, Any])
+
+    @slack.on_view(re.compile("^settings"))
+    async def on_view(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        return {"response_action": "clear"}
+
+    @slack.on_raw
+    async def on_raw(payload: Mapping[str, Any]) -> None:
+        return None
+
+    async with context.stream() as reply:
+        assert_type(await reply.task("t1", "Search", "complete", details="done"), None)
+        assert_type(await reply.plan("Plan"), None)
     assert_type(await telegram.reply(message, "hello"), Message)
     assert_type(await whatsapp.reply(message, "hello"), Message)
     assert_type(await ycloud.reply(message, "hello", external_id="outbox-1"), Message)

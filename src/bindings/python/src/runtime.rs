@@ -367,6 +367,58 @@ impl AgentChat {
             .await
         })
     }
+    /// Post a notice in `source`'s conversation that only `user_id` can see. It is
+    /// not added to history. Channels without private notices raise `TypeError`;
+    /// the notice is never posted publicly instead.
+    #[pyo3(signature=(channel,source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        &self,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        user_id: Object,
+        text: Object,
+        blocks: Option<Object>,
+    ) -> PyResult<Object> {
+        let blocks = blocks.unwrap_or_else(|| py.None());
+        coroutine(py, async move {
+            Python::attach(|py| -> PyResult<()> {
+                if !capability(py, channel.bind(py), "EphemeralChannel")? {
+                    return Err(PyTypeError::new_err(
+                        "This channel does not support ephemeral messages",
+                    ));
+                }
+                if user_id.bind(py).extract::<String>()?.trim().is_empty() {
+                    return Err(PyValueError::new_err(
+                        "An ephemeral message needs a recipient",
+                    ));
+                }
+                Ok(())
+            })?;
+            call(
+                channel,
+                "send_ephemeral",
+                vec![source, user_id, text],
+                vec![("blocks", blocks)],
+            )
+            .await
+        })
+    }
+    /// Delete a message this application sent. History keeps it. Channels that
+    /// cannot delete raise `TypeError`.
+    fn delete(&self, py: Python<'_>, channel: Object, message: Object) -> PyResult<Object> {
+        coroutine(py, async move {
+            Python::attach(|py| -> PyResult<()> {
+                if !capability(py, channel.bind(py), "DeletingChannel")? {
+                    return Err(PyTypeError::new_err(
+                        "This channel does not support deleting messages",
+                    ));
+                }
+                Ok(())
+            })?;
+            call(channel, "delete", vec![message], vec![]).await
+        })
+    }
     #[pyo3(signature=(channel,source,message,*,origin="web"))]
     fn mirror(
         slf: Py<Self>,
@@ -513,10 +565,11 @@ enum Arrival {
     Asking(Py<RunningTurn>),
 }
 async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Object> {
-    let (state, handler, id, conversation, press) = Python::attach(|py| -> PyResult<_> {
+    let (state, handler, id, conversation, press, stop) = Python::attach(|py| -> PyResult<_> {
         let press = prompts::answer_of(message.bind(py))?;
+        let stop = prompts::stop_request(message.bind(py))?;
         let handler = app.bind(py).getattr("_handler")?;
-        if handler.is_none() && press.is_none() {
+        if handler.is_none() && press.is_none() && !stop {
             return Err(PyRuntimeError::new_err(
                 "Register a message handler with @app.on_message",
             ));
@@ -527,6 +580,7 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
             message.bind(py).getattr("id")?.unbind(),
             message.bind(py).getattr("conversation_id")?.unbind(),
             press,
+            stop,
         ))
     })?;
     let (busy, running, registry) = native_app(&app)?;
@@ -537,6 +591,24 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
     // A button press answers a prompt; it never starts or joins a turn.
     if let Some((prompt, choice)) = press {
         prompts::resolve(registry, copy(&state), message, prompt, choice).await?;
+        return Ok(none());
+    }
+    // So does a provider's own stop control, which stops only its starter's turn.
+    if stop {
+        Python::attach(|py| -> PyResult<()> {
+            let sender = message
+                .bind(py)
+                .getattr("sender")?
+                .getattr("id")?
+                .extract::<String>()?;
+            if let Some(turn) = running.get(py, &conversation)? {
+                let turn = turn.borrow(py);
+                if turn.starter == sender {
+                    turn.request_stop(py)?;
+                }
+            }
+            Ok(())
+        })?;
         return Ok(none());
     }
     // Decide before awaiting anything, so the running turn cannot finish in between.
@@ -611,8 +683,14 @@ async fn run_turns(
     let mut appended = false;
     let mut first_error = None;
     loop {
-        let turn =
-            Python::attach(|py| running.start(py, conversation, std::mem::take(&mut waiting)))?;
+        let turn = Python::attach(|py| -> PyResult<_> {
+            let starter = current
+                .bind(py)
+                .getattr("sender")?
+                .getattr("id")?
+                .extract::<String>()?;
+            running.start(py, conversation, std::mem::take(&mut waiting), starter)
+        })?;
         let result = run_turn(app, channel, &current, state, handler, &turn, appended).await;
         let (mut unread, owned) = Python::attach(|py| -> PyResult<_> {
             let unread = running.finish(py, conversation, &turn)?;
@@ -921,6 +999,27 @@ impl MessageContext {
     }
     fn set_status(&self, py: Python<'_>, status: Object) -> PyResult<Object> {
         self.forward(py, "set_status", vec![status], vec![])
+    }
+    /// Post a notice in this conversation that only the sender (or `user_id`) can
+    /// see; see `AgentChat.send_ephemeral`.
+    #[pyo3(signature=(text,*,blocks=None,user_id=None))]
+    fn reply_ephemeral(
+        &self,
+        py: Python<'_>,
+        text: Object,
+        blocks: Option<Object>,
+        user_id: Option<Object>,
+    ) -> PyResult<Object> {
+        let user_id = match user_id {
+            Some(user_id) => user_id,
+            None => self.sender.bind(py).getattr("id")?.unbind(),
+        };
+        self.forward(
+            py,
+            "send_ephemeral",
+            vec![user_id, text],
+            vec![("blocks", blocks.unwrap_or_else(|| py.None()))],
+        )
     }
     #[pyo3(signature=(attachment,*,max_bytes=10*1024*1024))]
     fn download_attachment(

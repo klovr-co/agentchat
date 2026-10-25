@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 from agentchat.models import (
@@ -92,6 +92,44 @@ class StreamingChannel(Protocol):
     async def append_stream(self, source: Message, stream: object, text: str) -> object: ...
 
     async def stop_stream(self, source: Message, stream: object, text: str) -> Message: ...
+
+
+@runtime_checkable
+class TaskStreamingChannel(StreamingChannel, Protocol):
+    """Optional task and plan progress shown with a streamed answer.
+
+    `update_stream_tasks` receives the unsent updates in order, each a mapping:
+    `{"type": "plan", "title": ...}` or `{"type": "task", "id": ..., "title": ...,
+    "status": "pending" | "in_progress" | "complete" | "error", "details": ...,
+    "output": ...}`. With `stream` None it starts the stream with them; otherwise it
+    adds them. It returns the handle to use next and may drop updates its stream
+    can no longer show. Channels without it ignore `AnswerStream.task` and `plan`.
+    """
+
+    async def update_stream_tasks(
+        self, source: Message, stream: object | None, updates: Sequence[Mapping[str, object]],
+    ) -> object: ...
+
+
+@runtime_checkable
+class EphemeralChannel(Protocol):
+    """Optional notices in the source conversation that only one person can see.
+
+    A channel without truly private notices must not implement this; AgentChat
+    then raises `TypeError` rather than posting publicly.
+    """
+
+    async def send_ephemeral(
+        self, source: Message, user_id: str, text: str, *,
+        blocks: Sequence[Mapping[str, object]] | None = None,
+    ) -> Message: ...
+
+
+@runtime_checkable
+class DeletingChannel(Protocol):
+    """Optional deletion of a message this application sent."""
+
+    async def delete(self, message: Message) -> None: ...
 
 
 @runtime_checkable
