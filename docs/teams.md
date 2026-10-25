@@ -69,6 +69,12 @@ activity envelope below Teams' message limit. Split larger answers into separate
 replies. Incoming file/card metadata is retained, but download, upload, card
 actions, rich replies, and native-history capabilities are not implemented here.
 
+## Typing indicator
+
+`set_status(source, "thinking")` sends a `typing` activity to the source
+conversation and repeats it every 3 seconds, because Teams clears it quickly.
+`set_status(source, "")` stops it; Teams shows no status text.
+
 ## Troubleshooting and maintenance
 
 | Symptom | Check |

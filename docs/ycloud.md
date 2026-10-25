@@ -166,6 +166,18 @@ key or the webhook secret.
 `131047` can also arrive later as a `failed` status with `error_kind ==
 "window_expired"`. The same mapping applies to status events.
 
+## Typing indicator and prompts
+
+`set_status(source, "thinking")` calls `POST /v2/whatsapp/inboundMessages/{id}/typing`
+for the source message every 20 seconds until `set_status(source, "")`, the
+reply, `close()`, or 120 seconds. WhatsApp shows "typing…" without text and marks
+that message, and earlier ones, as read.
+
+`context.ask()` sends the question with `sendDirectly` as an interactive reply:
+up to three reply buttons, otherwise a list of up to ten rows. A press arrives as
+an inbound `interactive` message and answers the prompt instead of starting a
+turn. See [Live controls](live-controls.md).
+
 ## Media download
 
 ```python

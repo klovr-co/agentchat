@@ -66,6 +66,21 @@ receiver before serving requests. This exposes the same verification and signed
 webhook handlers. Call `await whatsapp.close()` at shutdown; do not also call
 `whatsapp.run()`. See [shared usage and delivery semantics](providers.md).
 
+## Prompts
+
+`context.ask()` sends the question as an interactive reply: up to three reply
+buttons with titles of 20 characters, otherwise a list of up to ten rows.
+`prompt_style="reactions"` asks for a reaction with a listed emoji instead. See
+[Live controls](live-controls.md).
+
+## Typing indicator
+
+`set_status(source, "thinking")` shows "typing…" to the sender and repeats it
+every 20 seconds, because WhatsApp clears it after 25 seconds or when the reply
+arrives. WhatsApp ties the indicator to the incoming message, so it also marks
+that message as read. `set_status(source, "")` stops refreshing; WhatsApp shows
+no status text.
+
 ## Production setup and troubleshooting
 
 Replace Meta's temporary token with a system-user token that has access to the

@@ -187,6 +187,16 @@ async def respond(context: MessageContext) -> str:
     return content
 ```
 
+## Live status, streaming, buttons, and busy conversations
+
+`context.working()` shows that the agent is busy, `context.stream()` shows the
+answer while it is written, `context.ask()` asks for an approval with buttons,
+and `context.offer_stop()` adds a Stop button. A message that arrives while its
+conversation's handler is running is steered into it by default
+(`context.steered()`); messages the handler leaves unread run afterwards. Earlier
+versions made such messages wait for the next turn; pass
+`AgentChat(busy="queue")` to keep that. See [Live controls](docs/live-controls.md).
+
 ## Supported channels
 
 | Channel | Connection | Install extra | Setup |

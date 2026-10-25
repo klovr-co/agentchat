@@ -89,11 +89,21 @@ Telegram also implements `set_status()` (the typing indicator), `reply_rich()`
 (native reply markup such as inline keyboards), `upload_files()`, and
 `download_attachment()`. It does not implement native history or mirroring.
 
+Discord, Teams, Telegram, WhatsApp, and YCloud also support streamed answers,
+prompt buttons, and Stop/Queue/Steer; see [Live controls](live-controls.md).
+
+Discord, Teams, WhatsApp, YCloud, and iMessage implement `set_status()` as their
+typing indicator. iMessage needs the BlueBubbles Private API and returns `False`
+without it.
+These providers show no status text and clear the indicator after a few
+seconds, so the adapter sends it again until `set_status(source, "")`, the
+reply, `close()`, or `TYPING_EXPIRY` (120 seconds) ends it. `context.working()`
+uses this for the whole handler.
+
 History uses the application's local `State`; default `MemoryState` is lost on
 restart. Native history, working indicators, rich replies, file transfers, and
-cross-surface mirroring remain optional capabilities. On the new adapters,
-`set_status()` returns `False`; unsupported rich/file/mirror operations raise
-`TypeError`. Slack retains its existing capabilities. Applications choose text
+cross-surface mirroring remain optional capabilities. Unsupported
+rich/file/mirror operations raise `TypeError`. Slack retains its existing capabilities. Applications choose text
 or link fallbacks explicitly rather than passing Slack Block Kit to another provider.
 
 Long responses raise a validation error at the provider's documented limit;

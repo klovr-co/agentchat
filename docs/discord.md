@@ -57,6 +57,15 @@ The gateway reconnects through discord.py. Replies use a separate, single-attemp
 HTTP request, including on HTTP 429 or 5xx; errors propagate. The application
 owns rate-limit scheduling and recovery of uncertain sends.
 
+## Typing indicator
+
+`set_status(source, "thinking")` shows "Bot is typing…" in the source channel
+and sends it again every 8 seconds, because Discord clears it after about ten.
+`set_status(source, "")` stops it; Discord shows no status text. A custom
+`send_client` without `trigger_typing(channel_id)` makes `set_status()` return
+`False`. Each refresh is one `POST /channels/{id}/typing`, which counts toward
+Discord's rate limits.
+
 ## Troubleshooting and maintenance
 
 | Symptom | Check |
