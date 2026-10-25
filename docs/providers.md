@@ -92,6 +92,11 @@ Telegram also implements `set_status()` (the typing indicator), `reply_rich()`
 Discord, Teams, Telegram, WhatsApp, and YCloud also support streamed answers,
 prompt buttons, and Stop/Queue/Steer; see [Live controls](live-controls.md).
 
+WhatsApp and YCloud implement `reply_rich()` for one interactive message (buttons,
+a list, a CTA URL or a Flow). Every provider takes handlers for its other events,
+presses, forms and commands; private notices, deleting messages and task progress
+depend on the provider. See [App features](app-features.md).
+
 Discord, Teams, WhatsApp, YCloud, and iMessage implement `set_status()` as their
 typing indicator. iMessage needs the BlueBubbles Private API and returns `False`
 without it.

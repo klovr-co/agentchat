@@ -211,6 +211,12 @@ modals and App Home (`slack.open_view()`, `push_view()`, `update_view()`,
 [Slack app features](docs/slack.md#slack-app-features) and
 [Moving from Slack Bolt](docs/slack.md#moving-from-slack-bolt).
 
+Telegram, Discord, Teams, WhatsApp, YCloud and iMessage take the same handlers
+and use their own equivalents: Telegram ephemeral messages and draft stop
+buttons, Discord interaction responses and modals, Teams targeted messages,
+dialogs and stream Stop, WhatsApp Flows, and fallbacks where a provider has
+none. See [App features](docs/app-features.md).
+
 ## Supported channels
 
 | Channel | Connection | Install extra | Setup |

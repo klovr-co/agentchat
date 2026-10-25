@@ -75,6 +75,10 @@ actions, rich replies, and native-history capabilities are not implemented here.
 conversation and repeats it every 3 seconds, because Teams clears it quickly.
 `set_status(source, "")` stops it; Teams shows no status text.
 
+## App features
+
+Register handlers for other activities (such as `installationUpdate`), card actions, dialogs and `/commands`; an invoke handler's return value is the invoke response. Teams also sends targeted (private) messages, deletes messages, shows task progress, and stops the turn when someone presses Stop on a streamed answer. See [App features](app-features.md).
+
 ## Troubleshooting and maintenance
 
 | Symptom | Check |

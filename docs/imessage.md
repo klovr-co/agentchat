@@ -83,6 +83,10 @@ and sanitizes REST errors. Use TLS remotely and exclude query strings from your
 proxy access logs. Updating the server password requires updating the environment
 and restarting the adapter.
 
+## App features
+
+Register handlers for BlueBubbles socket events (such as `updated-message`) and `/commands`. `IMessage(stop_keyword="stop")` lets a message that is exactly the keyword stop the sender's running turn. See [App features](app-features.md).
+
 ## Troubleshooting
 
 | Symptom | Check |

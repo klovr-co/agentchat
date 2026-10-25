@@ -1,15 +1,18 @@
 # Public compatibility signatures; update with the corresponding Rust binding API.
-from collections.abc import Awaitable, Callable, Mapping
-from typing import ClassVar, NamedTuple
+import re
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import ClassVar, NamedTuple, TypeVar
 
 from aiohttp import web
 
-from agentchat.channels.base import MessageReceiver
-from agentchat.models import Answer, DownloadedFile, Message, Prompt
+from agentchat.channels.base import AppHandler, MessageReceiver
+from agentchat.models import Answer, DownloadedFile, Message, Prompt, RichReply
 
 API_ROOT: str
 TYPING_INTERVAL: float
 TYPING_EXPIRY: float
+
+_Handler = TypeVar("_Handler", bound=AppHandler)
 
 class WhatsAppApiError(NamedTuple):
     code: str | None
@@ -91,6 +94,16 @@ class YCloud:
     @classmethod
     def from_env(cls) -> YCloud: ...
     def bind(self, receiver: MessageReceiver) -> None: ...
+    def on_event(self, event_type: str) -> Callable[[_Handler], _Handler]: ...
+    def on_action(self, action_id: str | re.Pattern[str]) -> Callable[[_Handler], _Handler]: ...
+    def on_view(self, callback_id: str | re.Pattern[str]) -> Callable[[_Handler], _Handler]: ...
+    def on_command(self, command: str) -> Callable[[_Handler], _Handler]: ...
+    def on_raw(self, handler: _Handler) -> _Handler: ...
+    async def send_ephemeral(
+        self, source: Message, user_id: str, text: str, *,
+        blocks: Sequence[Mapping[str, object]] | None = ...,
+    ) -> Message: ...
+    async def reply_rich(self, source: Message, content: RichReply) -> Message: ...
     def bind_events(self, handler: YCloudEventHandler) -> None: ...
     def create_app(self) -> web.Application: ...
     async def run(self) -> None: ...

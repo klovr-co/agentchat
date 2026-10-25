@@ -81,6 +81,10 @@ arrives. WhatsApp ties the indicator to the incoming message, so it also marks
 that message as read. `set_status(source, "")` stops refreshing; WhatsApp shows
 no status text.
 
+## App features
+
+Register handlers for delivery statuses, reactions, button and list replies, Flow responses and `/commands`. `reply_rich` sends any interactive message, including Flows. See [App features](app-features.md).
+
 ## Production setup and troubleshooting
 
 Replace Meta's temporary token with a system-user token that has access to the

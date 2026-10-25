@@ -66,6 +66,10 @@ and sends it again every 8 seconds, because Discord clears it after about ten.
 `False`. Each refresh is one `POST /channels/{id}/typing`, which counts toward
 Discord's rate limits.
 
+## App features
+
+Register handlers for gateway events, component and modal interactions, and slash commands; their return value is the interaction response, which can be private or open a modal. Discord also deletes messages and shows task progress. See [App features](app-features.md).
+
 ## Troubleshooting and maintenance
 
 | Symptom | Check |

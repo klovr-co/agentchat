@@ -232,16 +232,15 @@ added to conversation history. Slack delivers them only if the person is active 
 Slack and a member of the channel, does not keep them across reloads or devices,
 and shows one in a thread only when the thread is already active. Treat them as
 notices, not as the only copy of something important. Failures raise; a notice
-is never posted publicly instead. Channels without private notices raise
-`TypeError`: Discord only has ephemeral responses to interactions, and Teams and
-the other channels have none, so only Slack supports this.
+is never posted publicly instead. Other channels use their own private notices
+or fail; see [App features](app-features.md#private-notices).
 
 ### Deleting messages
 
 `await app.delete(slack, message)` deletes a message the app sent, such as a
 temporary "Working…" reply, with `chat.delete`. History keeps it. Ephemeral
-notices cannot be deleted through the Web API and raise `ValueError`. Other
-channels raise `TypeError` for now.
+notices cannot be deleted through the Web API and raise `ValueError`. For other
+channels see [App features](app-features.md#deleting-messages).
 
 ### Agent sessions and the native stop button
 

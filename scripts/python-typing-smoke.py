@@ -59,6 +59,18 @@ async def check_api(
     async def on_raw(payload: Mapping[str, Any]) -> None:
         return None
 
+    @telegram.on_action(re.compile("^retry"))
+    async def on_press(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        return {"text": "Retrying"}
+
+    @discord.on_command("/deploy")
+    async def on_deploy(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        return {"type": 4, "data": {"content": "Deploying", "flags": 64}}
+
+    assert_type(await teams.send_ephemeral(message, "29:user", "only you"), Message)
+    assert_type(await discord.delete(message), None)
+    assert_type(await whatsapp.reply_rich(message, RichReply(text="Form", blocks=())), Message)
+
     async with context.stream() as reply:
         assert_type(await reply.task("t1", "Search", "complete", details="done"), None)
         assert_type(await reply.plan("Plan"), None)

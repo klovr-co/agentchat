@@ -120,6 +120,10 @@ Telegram implements the optional capabilities:
   `title` as the caption. The Bot API accepts uploads up to 50 MB. If a later file
   fails, earlier files were already delivered.
 
+## App features
+
+Register handlers for other updates (such as `my_chat_member`), inline-button presses and `/commands`. Telegram also sends private notices in groups, deletes messages, shows task progress, and can stream drafts with its stop button (`stream_drafts=True`). See [App features](app-features.md).
+
 ## Troubleshooting
 
 Store the token as a secret. Revoke and regenerate it with BotFather's `/revoke`

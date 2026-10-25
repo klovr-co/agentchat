@@ -213,6 +213,10 @@ and reactions are free. YCloud's pages describe the charge after the allowance a
 the *service* rate; they do not say it equals the Utility rate. Check
 [YCloud pricing](https://www.ycloud.com/pricing) for the rates in your market.
 
+## App features
+
+Register handlers for webhook events, button and list replies, Flow responses and `/commands`; `bind_events` keeps working alongside. `reply_rich` sends any interactive message, including Flows. See [App features](app-features.md).
+
 ## Hosting and troubleshooting
 
 For an existing aiohttp server, host `ycloud.create_app()` yourself and bind the

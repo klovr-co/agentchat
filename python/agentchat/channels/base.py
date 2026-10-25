@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from agentchat.models import (
     Answer,
@@ -15,6 +15,10 @@ from agentchat.models import (
 )
 
 MessageReceiver = Callable[["Channel", Message], Awaitable[None]]
+AppPayload = Mapping[str, Any]
+"""A raw provider payload that AgentChat does not turn into a message."""
+AppHandler = Callable[[AppPayload], Awaitable[Mapping[str, Any] | None]]
+"""Handles an `AppPayload`; where the provider takes an answer, the result is it."""
 
 
 class Channel(Protocol):
