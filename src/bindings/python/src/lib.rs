@@ -12,12 +12,15 @@ use pyo3::types::{PyDict, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
 mod activity;
+mod control;
 mod convert;
 mod delivery;
 mod host;
 mod integrations;
+mod prompts;
 mod runtime;
 mod state;
+mod stream;
 mod providers {
     pub mod discord;
     pub mod imessage;
@@ -29,6 +32,7 @@ mod providers {
     pub mod teams;
     pub mod telegram;
     pub mod transport;
+    pub mod typing;
     pub mod whatsapp;
     pub mod ycloud;
 }
@@ -182,6 +186,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     state::register(module)?;
     integrations::register(module)?;
     activity::register(module)?;
+    control::register(module)?;
+    stream::register(module)?;
+    prompts::register(module)?;
     runtime::register(module)?;
     providers::slack::register(module)?;
     providers::slack_files::register(module)?;
@@ -191,6 +198,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     providers::imessage::register(module)?;
     providers::teams::register(module)?;
     providers::telegram::register(module)?;
+    providers::typing::register(module)?;
     providers::whatsapp::register(module)?;
     providers::ycloud::register(module)?;
     module.add_class::<Effect>()?;

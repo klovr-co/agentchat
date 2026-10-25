@@ -190,6 +190,31 @@ impl Destination {
 pub fn text_request(chat: &str, content: &str, temporary_id: &str) -> Value {
     json!({"chatGuid":chat,"message":content,"method":"apple-script","tempGuid":temporary_id})
 }
+/// Seconds between typing refreshes; the server stops typing after about ten.
+pub const TYPING_INTERVAL: f64 = 5.0;
+/// Stop refreshing a forgotten indicator after this many seconds.
+pub const TYPING_EXPIRY: f64 = 120.0;
+
+/// `POST` here shows "typing…" in the chat. It needs the server's Private API.
+/// `DELETE` on the same route restarts typing on current servers, so it is not used.
+pub fn typing_path(chat: &str) -> String {
+    format!("/api/v1/chat/{}/typing", quote(chat))
+}
+
+/// The socket event that clears "typing…" for `typing_event_payload(chat)`.
+pub const STOP_TYPING_EVENT: &str = "stopped-typing";
+
+pub fn typing_event_payload(chat: &str) -> Value {
+    json!({"chatGuid": chat})
+}
+
+/// Whether a failed typing request means the server cannot show typing at all:
+/// the Private API is off or its helper is not connected (an "iMessage Error"),
+/// or the server predates the route.
+pub fn typing_unavailable(status: u16, response: &Value) -> bool {
+    status == 404 || (status == 500 && response["error"]["type"] == "iMessage Error")
+}
+
 pub fn receipt(response: &Value) -> Result<&str, &'static str> {
     let data = &response["data"];
     if data
@@ -215,6 +240,22 @@ mod tests {
         );
         assert!(Server::parse("http://remote.test").is_err());
         assert!(Server::parse("https://x.test/path").is_err());
+    }
+    #[test]
+    fn typing_needs_the_private_api() {
+        assert_eq!(
+            typing_path("iMessage;-;+1555"),
+            "/api/v1/chat/iMessage%3B-%3B%2B1555/typing"
+        );
+        let disabled = json!({"status": 500, "error": {"type": "iMessage Error",
+            "message": "iMessage Private API is not enabled!"}});
+        assert!(typing_unavailable(500, &disabled));
+        assert!(typing_unavailable(404, &Value::Null));
+        assert!(!typing_unavailable(
+            500,
+            &json!({"error": {"type": "Server Error"}})
+        ));
+        assert!(!typing_unavailable(401, &Value::Null));
     }
     #[test]
     fn encoding() {

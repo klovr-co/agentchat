@@ -167,6 +167,9 @@ pub fn normalize(payload: &Value, phone: &str) -> Vec<Message> {
     };
     let mut metadata = metadata(phone, id, kind, event, content.media);
     metadata.insert("from".into(), json!(sender));
+    if let Some(answer) = crate::whatsapp::reply_answer(event) {
+        metadata.insert(agentchat_core::ANSWER_METADATA.into(), answer);
+    }
     vec![Message {
         id: format!("ycloud:{phone}:{id}").into(),
         conversation_id: format!("ycloud:{phone}:{sender}").into(),
@@ -394,6 +397,23 @@ pub fn text_payload(
         json!({"from":sender,"to":recipient,"type":"text","text":{"body":content,"preview_url":false},"context":{"message_id":id}}),
         external_id,
     )
+}
+/// A prompt as an interactive reply to the source message, sent directly.
+pub fn prompt_payload(
+    sender: &str,
+    recipient: &str,
+    id: &str,
+    text: &str,
+    prompt: &str,
+    choices: &[(String, String)],
+) -> Result<Value, &'static str> {
+    Ok(json!({
+        "from": sender,
+        "to": recipient,
+        "type": "interactive",
+        "interactive": crate::whatsapp::prompt_interactive(text, prompt, choices)?,
+        "context": {"message_id": id},
+    }))
 }
 pub fn template_payload(
     sender: &str,

@@ -264,7 +264,9 @@ impl SocketMode {
         coroutine(py, async move {
             let acknowledged = Python::attach(|py| -> PyResult<_> {
                 let this = slf.borrow(py);
-                if request.bind(py).getattr("type")?.extract::<String>()? != "events_api"
+                let kind = request.bind(py).getattr("type")?.extract::<String>()?;
+                // Events, and interactions such as presses on prompt buttons.
+                if !matches!(kind.as_str(), "events_api" | "interactive")
                     || this.is_closed(py)?
                     || this.tasks.bind(py).len() >= this.max_pending_events
                 {

@@ -1,4 +1,6 @@
+use crate::control::{messages_tuple, Busy, Running, RunningTurn};
 use crate::host::{await_py, coroutine};
+use crate::prompts::{self, Prompts};
 use agentchat_core::{HistoryLimit, Turn, TurnEffect, TurnResult};
 use pyo3::{
     exceptions::{PyRuntimeError, PyTypeError, PyValueError},
@@ -60,6 +62,23 @@ pub struct AgentChat {
     channels: Option<Object>,
     state: Option<Object>,
     handler: Option<Object>,
+    busy: Busy,
+    running: Option<Py<PyDict>>,
+    prompts: Option<Py<PyDict>>,
+}
+impl AgentChat {
+    fn running(&self, py: Python<'_>) -> PyResult<Running> {
+        self.running
+            .as_ref()
+            .map(|running| Running(running.clone_ref(py)))
+            .ok_or_else(|| PyRuntimeError::new_err("AgentChat is uninitialized"))
+    }
+    fn prompts(&self, py: Python<'_>) -> PyResult<Prompts> {
+        self.prompts
+            .as_ref()
+            .map(|prompts| Prompts(prompts.clone_ref(py)))
+            .ok_or_else(|| PyRuntimeError::new_err("AgentChat is uninitialized"))
+    }
 }
 #[pymethods]
 impl AgentChat {
@@ -70,17 +89,22 @@ impl AgentChat {
             channels: None,
             state: None,
             handler: None,
+            busy: Busy::Steer,
+            running: None,
+            prompts: None,
         }
     }
-    #[pyo3(signature=(*,channels,state=None,backend=None))]
+    #[pyo3(signature=(*,channels,state=None,backend=None,busy="steer"))]
     fn initialize(
         slf: Py<Self>,
         py: Python<'_>,
         channels: &Bound<'_, PyAny>,
         state: Option<Object>,
         backend: Option<&str>,
+        busy: &str,
     ) -> PyResult<()> {
         crate::state::backend(backend)?;
+        let busy = Busy::parse(busy)?;
         let channels = PyTuple::new(py, channels.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
         if channels.is_empty() {
             return Err(PyValueError::new_err(
@@ -96,6 +120,9 @@ impl AgentChat {
             this.channels = Some(channels.clone().unbind().into_any());
             this.state = Some(state);
             this.handler = None;
+            this.busy = busy;
+            this.running = Some(PyDict::new(py).unbind());
+            this.prompts = Some(PyDict::new(py).unbind());
         }
         let receiver = slf.bind(py).getattr("_receive")?;
         for channel in channels.iter() {
@@ -128,6 +155,66 @@ impl AgentChat {
     #[getter]
     fn backend(&self) -> &'static str {
         "rust"
+    }
+    /// What a message does while its conversation's handler runs: steer, queue, or reject.
+    #[getter]
+    fn busy(&self) -> &'static str {
+        self.busy.name()
+    }
+    /// Show `text` with one button per choice and wait for an allowed person to press
+    /// one. Raises TypeError on channels without buttons and TimeoutError when
+    /// nobody answers, so an unanswered approval is never taken as a yes.
+    #[pyo3(signature=(channel,source,text,choices,*,timeout=600.0,allowed=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn ask(
+        slf: Py<Self>,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        text: String,
+        choices: Object,
+        timeout: f64,
+        allowed: Option<Object>,
+    ) -> PyResult<Object> {
+        let registry = slf.borrow(py).prompts(py)?;
+        coroutine(
+            py,
+            prompts::ask(registry, channel, source, text, choices, timeout, allowed),
+        )
+    }
+    /// Show a Stop button for the conversation's running handler; returns the shown
+    /// message, or None on channels without buttons. It goes away when the turn ends.
+    #[pyo3(signature=(channel,source,*,text="Working on it…".to_owned(),label="Stop".to_owned(),allowed=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn offer_stop(
+        slf: Py<Self>,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        text: String,
+        label: String,
+        allowed: Option<Object>,
+    ) -> PyResult<Object> {
+        let this = slf.borrow(py);
+        let conversation = source.bind(py).getattr("conversation_id")?.unbind();
+        let turn = this.running(py)?.get(py, &conversation)?.ok_or_else(|| {
+            PyRuntimeError::new_err("No handler is running for this conversation")
+        })?;
+        let registry = this.prompts(py)?;
+        coroutine(
+            py,
+            prompts::offer_stop(registry, channel, source, turn, text, label, allowed),
+        )
+    }
+    /// Ask the conversation's running handler to stop; False when none is running.
+    fn stop(&self, py: Python<'_>, conversation_id: Object) -> PyResult<bool> {
+        match self.running(py)?.get(py, &conversation_id)? {
+            Some(turn) => {
+                turn.borrow(py).request_stop(py)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
     #[getter(_handler)]
     fn handler(&self, py: Python<'_>) -> Object {
@@ -317,6 +404,19 @@ impl AgentChat {
             Ok(response)
         })
     }
+    /// Show an answer in `source`'s conversation while it is written.
+    #[pyo3(signature=(channel,source,*,interval=None))]
+    fn stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        interval: Option<f64>,
+    ) -> PyResult<Object> {
+        let stream =
+            crate::stream::AnswerStream::create(py, slf.into_any(), channel, source, interval)?;
+        Ok(Py::new(py, stream)?.into_any())
+    }
     #[pyo3(signature=(channel,source,status="is working…",*,refresh_interval=60.0))]
     fn working(
         slf: Py<Self>,
@@ -350,12 +450,16 @@ impl AgentChat {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.channels)?;
         visit.call(&self.state)?;
-        visit.call(&self.handler)
+        visit.call(&self.handler)?;
+        visit.call(&self.running)?;
+        visit.call(&self.prompts)
     }
     fn __clear__(&mut self) {
         self.channels = None;
         self.state = None;
         self.handler = None;
+        self.running = None;
+        self.prompts = None;
     }
 }
 fn send_reply(
@@ -389,10 +493,30 @@ fn send_reply(
         Ok(response)
     })
 }
+fn cancelled(error: &PyErr) -> bool {
+    Python::attach(|py| {
+        py.import("asyncio")
+            .and_then(|m| m.getattr("CancelledError"))
+            .is_ok_and(|c| error.matches(py, &c).unwrap_or(false))
+    })
+}
+fn native_app(app: &Object) -> PyResult<(Busy, Running, Prompts)> {
+    Python::attach(|py| {
+        let native = app.bind(py).cast::<AgentChat>()?.borrow();
+        Ok((native.busy, native.running(py)?, native.prompts(py)?))
+    })
+}
+enum Arrival {
+    Run,
+    Steered,
+    Rejected,
+    Asking(Py<RunningTurn>),
+}
 async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Object> {
-    let (state, handler, id, conversation) = Python::attach(|py| -> PyResult<_> {
+    let (state, handler, id, conversation, press) = Python::attach(|py| -> PyResult<_> {
+        let press = prompts::answer_of(message.bind(py))?;
         let handler = app.bind(py).getattr("_handler")?;
-        if handler.is_none() {
+        if handler.is_none() && press.is_none() {
             return Err(PyRuntimeError::new_err(
                 "Register a message handler with @app.on_message",
             ));
@@ -402,74 +526,173 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
             handler.unbind(),
             message.bind(py).getattr("id")?.unbind(),
             message.bind(py).getattr("conversation_id")?.unbind(),
+            press,
         ))
     })?;
-    let mut turn = Turn::new();
-    let mut scope = None;
-    let result: PyResult<Object> = async {
-        loop {
-            let result = match turn.effect() {
-                TurnEffect::Claim => {
-                    let claimed = call(copy(&state), "claim", vec![copy(&id)], vec![]).await?;
-                    TurnResult::Claimed(Python::attach(|py| claimed.bind(py).is_truthy())?)
-                }
-                TurnEffect::AcquireConversation => {
-                    let lock = Python::attach(|py| {
-                        state
-                            .bind(py)
-                            .call_method1("lock", (conversation.bind(py),))
-                            .map(Bound::unbind)
-                    })?;
-                    call(copy(&lock), "__aenter__", vec![], vec![]).await?;
-                    scope = Some(lock);
-                    TurnResult::ConversationAcquired
-                }
-                TurnEffect::AppendIncoming => {
-                    call(copy(&state), "append", vec![copy(&message)], vec![]).await?;
-                    TurnResult::IncomingAppended
-                }
-                TurnEffect::InvokeHandler => {
-                    let pending = Python::attach(|py| -> PyResult<_> {
-                        let context = Py::new(
-                            py,
-                            MessageContext::create(py, copy(&app), copy(&channel), copy(&message))?,
-                        )?;
-                        Ok(handler.bind(py).call1((context,))?.unbind())
-                    })?;
-                    let answer = await_py(pending).await?;
-                    TurnResult::HandlerCompleted(Python::attach(|py| {
-                        answer.bind(py).extract::<Option<String>>()
-                    })?)
-                }
-                TurnEffect::SendReply(text) => {
-                    let text = Python::attach(|py| {
-                        text.clone()
-                            .into_pyobject(py)
-                            .map(|v| v.unbind().into_any())
-                    })?;
-                    call(
-                        copy(&app),
-                        "reply",
-                        vec![copy(&channel), copy(&message), text],
-                        vec![],
-                    )
-                    .await?;
-                    TurnResult::ReplySent
-                }
-                TurnEffect::AppendReply => TurnResult::ReplyAppended,
-                TurnEffect::Complete => break Ok(none()),
-            };
-            turn.resolve(result)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
+    let (busy, running, registry) = native_app(&app)?;
+    let claimed = call(copy(&state), "claim", vec![copy(&id)], vec![]).await?;
+    if !Python::attach(|py| claimed.bind(py).is_truthy())? {
+        return Ok(none());
     }
-    .await;
-    if let Some(scope) = scope {
-        if exit_scope(scope, result.as_ref().err()).await? {
+    // A button press answers a prompt; it never starts or joins a turn.
+    if let Some((prompt, choice)) = press {
+        prompts::resolve(registry, copy(&state), message, prompt, choice).await?;
+        return Ok(none());
+    }
+    // Decide before awaiting anything, so the running turn cannot finish in between.
+    let arrival = Python::attach(|py| -> PyResult<Arrival> {
+        let Some(turn) = running.get(py, &conversation)? else {
+            return Ok(Arrival::Run);
+        };
+        let asks = busy == Busy::Ask
+            && channel.bind(py).is_instance(
+                &py.import("agentchat.channels.base")?
+                    .getattr("InteractiveChannel")?,
+            )?;
+        match busy {
+            Busy::Queue => Ok(Arrival::Run),
+            Busy::Ask if asks => Ok(Arrival::Asking(turn)),
+            Busy::Steer | Busy::Ask => {
+                turn.borrow(py).steer(py, message.bind(py))?;
+                Ok(Arrival::Steered)
+            }
+            Busy::Reject => Ok(Arrival::Rejected),
+        }
+    })?;
+    match arrival {
+        Arrival::Steered => {
+            call(copy(&state), "append", vec![copy(&message)], vec![]).await?;
             return Ok(none());
         }
+        Arrival::Rejected => return Ok(none()),
+        Arrival::Asking(turn) => {
+            prompts::offer_busy(registry, channel, message, turn).await?;
+            return Ok(none());
+        }
+        Arrival::Run => {}
+    }
+    let lock = Python::attach(|py| {
+        state
+            .bind(py)
+            .call_method1("lock", (conversation.bind(py),))
+            .map(Bound::unbind)
+    })?;
+    call(copy(&lock), "__aenter__", vec![], vec![]).await?;
+    let result = run_turns(
+        &app,
+        &channel,
+        message,
+        &state,
+        &handler,
+        &conversation,
+        &running,
+        &registry,
+    )
+    .await;
+    if exit_scope(lock, result.as_ref().err()).await? {
+        return Ok(none());
     }
     result
+}
+/// Run `message`, then any steered messages its handler left unread, one turn each.
+#[allow(clippy::too_many_arguments)]
+async fn run_turns(
+    app: &Object,
+    channel: &Object,
+    message: Object,
+    state: &Object,
+    handler: &Object,
+    conversation: &Object,
+    running: &Running,
+    registry: &Prompts,
+) -> PyResult<Object> {
+    let mut current = message;
+    let mut waiting = Vec::new();
+    let mut appended = false;
+    let mut first_error = None;
+    loop {
+        let turn =
+            Python::attach(|py| running.start(py, conversation, std::mem::take(&mut waiting)))?;
+        let result = run_turn(app, channel, &current, state, handler, &turn, appended).await;
+        let (mut unread, owned) = Python::attach(|py| -> PyResult<_> {
+            let unread = running.finish(py, conversation, &turn)?;
+            Ok((unread, prompts::take_owned(py, registry, &turn)?))
+        })?;
+        unread.extend(prompts::close_owned(state, owned).await?);
+        if let Err(error) = result {
+            if cancelled(&error) {
+                return Err(error);
+            }
+            first_error.get_or_insert(error);
+        }
+        let mut unread = unread.into_iter();
+        let Some(next) = unread.next() else { break };
+        current = next;
+        waiting = unread.collect();
+        appended = true;
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(none()),
+    }
+}
+async fn run_turn(
+    app: &Object,
+    channel: &Object,
+    message: &Object,
+    state: &Object,
+    handler: &Object,
+    running: &Py<RunningTurn>,
+    appended: bool,
+) -> PyResult<()> {
+    let mut turn = Turn::new();
+    // The message was claimed before the lock was taken.
+    turn.resolve(TurnResult::Claimed(true))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    loop {
+        let result = match turn.effect() {
+            TurnEffect::Claim => TurnResult::Claimed(true),
+            TurnEffect::AcquireConversation => TurnResult::ConversationAcquired,
+            TurnEffect::AppendIncoming => {
+                if !appended {
+                    call(copy(state), "append", vec![copy(message)], vec![]).await?;
+                }
+                TurnResult::IncomingAppended
+            }
+            TurnEffect::InvokeHandler => {
+                let pending = Python::attach(|py| -> PyResult<_> {
+                    let mut context =
+                        MessageContext::create(py, copy(app), copy(channel), copy(message))?;
+                    context.turn = Some(running.clone_ref(py));
+                    let context = Py::new(py, context)?;
+                    Ok(handler.bind(py).call1((context,))?.unbind())
+                })?;
+                let answer = await_py(pending).await?;
+                TurnResult::HandlerCompleted(Python::attach(|py| {
+                    answer.bind(py).extract::<Option<String>>()
+                })?)
+            }
+            TurnEffect::SendReply(text) => {
+                let text = Python::attach(|py| {
+                    text.clone()
+                        .into_pyobject(py)
+                        .map(|v| v.unbind().into_any())
+                })?;
+                call(
+                    copy(app),
+                    "reply",
+                    vec![copy(channel), copy(message), text],
+                    vec![],
+                )
+                .await?;
+                TurnResult::ReplySent
+            }
+            TurnEffect::AppendReply => TurnResult::ReplyAppended,
+            TurnEffect::Complete => return Ok(()),
+        };
+        turn.resolve(result)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
 }
 #[pyclass(dict, subclass, weakref, module = "agentchat._native")]
 pub struct Conversation {
@@ -549,6 +772,7 @@ impl Conversation {
 #[pyclass(dict, subclass, weakref, module = "agentchat._native")]
 pub struct MessageContext {
     inner: Option<Box<MessageContextState>>,
+    turn: Option<Py<RunningTurn>>,
 }
 pub struct MessageContextState {
     message: Object,
@@ -576,6 +800,7 @@ impl std::ops::DerefMut for MessageContext {
 impl MessageContext {
     fn create(py: Python<'_>, app: Object, channel: Object, message: Object) -> PyResult<Self> {
         Ok(Self {
+            turn: None,
             inner: Some(Box::new(MessageContextState {
                 sender: message.bind(py).getattr("sender")?.unbind(),
                 conversation: Py::new(
@@ -620,7 +845,10 @@ impl MessageContext {
         _args: &Bound<'_, pyo3::types::PyTuple>,
         _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            turn: None,
+        }
     }
     fn initialize(
         &mut self,
@@ -723,7 +951,83 @@ impl MessageContext {
             )],
         )
     }
+    /// Ask the sender (by default) to press a button; see `AgentChat.ask`.
+    #[pyo3(signature=(text,choices,*,timeout=600.0,allowed=None))]
+    fn ask(
+        &self,
+        py: Python<'_>,
+        text: Object,
+        choices: Object,
+        timeout: f64,
+        allowed: Option<Object>,
+    ) -> PyResult<Object> {
+        self.forward(
+            py,
+            "ask",
+            vec![text, choices],
+            vec![
+                ("timeout", timeout.into_pyobject(py)?.into_any().unbind()),
+                ("allowed", allowed.unwrap_or_else(|| py.None())),
+            ],
+        )
+    }
+    /// Show a Stop button for this turn; see `AgentChat.offer_stop`.
+    #[pyo3(signature=(*,text="Working on it…".to_owned(),label="Stop".to_owned(),allowed=None))]
+    fn offer_stop(
+        &self,
+        py: Python<'_>,
+        text: String,
+        label: String,
+        allowed: Option<Object>,
+    ) -> PyResult<Object> {
+        self.forward(
+            py,
+            "offer_stop",
+            vec![],
+            vec![
+                ("text", text.into_pyobject(py)?.into_any().unbind()),
+                ("label", label.into_pyobject(py)?.into_any().unbind()),
+                ("allowed", allowed.unwrap_or_else(|| py.None())),
+            ],
+        )
+    }
+    /// Show the answer while it is written; see `AgentChat.stream`.
+    #[pyo3(signature=(*,interval=None))]
+    fn stream(&self, py: Python<'_>, interval: Option<f64>) -> PyResult<Object> {
+        let interval = match interval {
+            Some(v) => v.into_pyobject(py)?.into_any().unbind(),
+            None => py.None(),
+        };
+        self.forward(py, "stream", vec![], vec![("interval", interval)])
+    }
+    /// True once someone asked this turn to stop, for example with `app.stop()`.
+    #[getter]
+    fn stopped(&self, py: Python<'_>) -> PyResult<bool> {
+        match &self.turn {
+            Some(turn) => turn.borrow(py).stopped(py),
+            None => Ok(false),
+        }
+    }
+    /// Wait until someone asks this turn to stop.
+    fn wait_stopped(&self, py: Python<'_>) -> PyResult<Object> {
+        match &self.turn {
+            Some(turn) => turn.borrow(py).wait_stopped(py),
+            None => Err(PyRuntimeError::new_err(
+                "Only a context from AgentChat can be stopped",
+            )),
+        }
+    }
+    /// Messages sent to this conversation since the handler started or last asked.
+    /// Each is returned once; any left unread run as their own turns afterwards.
+    fn steered(&self, py: Python<'_>) -> PyResult<Object> {
+        let messages = match &self.turn {
+            Some(turn) => turn.borrow(py).take(py)?,
+            None => Vec::new(),
+        };
+        messages_tuple(py, messages)
+    }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.turn)?;
         let Some(state) = &self.inner else {
             return Ok(());
         };
@@ -737,6 +1041,7 @@ impl MessageContext {
 
     fn __clear__(&mut self) {
         self.inner = None;
+        self.turn = None;
     }
 
     #[getter(message)]

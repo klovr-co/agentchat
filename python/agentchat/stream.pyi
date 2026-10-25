@@ -1,0 +1,19 @@
+# Public compatibility signatures; update with the corresponding Rust binding API.
+from types import TracebackType
+
+from agentchat.models import Message
+
+class AnswerStream:
+    @property
+    def text(self) -> str: ...
+    @property
+    def messages(self) -> tuple[Message, ...]: ...
+    async def append(self, text: str) -> None: ...
+    async def finish(self) -> Message | None: ...
+    async def __aenter__(self) -> AnswerStream: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...

@@ -42,6 +42,7 @@ def harness(request):
         client = DiscordClient(receipt)
         channel = Discord(bot_token="fake", client=client, send_client=client, **options)
         source = discord_message(discord_event(), bot_id=99)
+        capabilities = {StatusChannel}
     elif request.param == "teams":
         adapter, _, _ = teams_adapter(receipt)
         channel = Teams(
@@ -53,6 +54,7 @@ def harness(request):
             **options,
         )
         source = teams_message(teams_event(), app_id=APP_ID, tenant_id=TENANT_ID)
+        capabilities = {StatusChannel}
     elif request.param == "imessage":
         channel = IMessage(
             server_url="http://localhost:1234",
@@ -63,6 +65,7 @@ def harness(request):
             **options,
         )
         source = imessage_message(imessage_event(), instance_id="test")
+        capabilities = {StatusChannel}
     elif request.param == "telegram":
         channel = Telegram(bot_token="99:fake", client=TelegramClient(receipt), **options)
         source = telegram_message(telegram_update(), bot_id=99, bot_username="agentchat_bot")
@@ -77,6 +80,7 @@ def harness(request):
         )
         channel._session = YCloudSession(receipt)
         source = ycloud_messages(ycloud_event(), phone_number="+15550001111")[0]
+        capabilities = {StatusChannel}
     else:
         channel = WhatsApp(
             phone_number_id="123",
@@ -88,6 +92,7 @@ def harness(request):
         )
         channel._session = WhatsAppSession(receipt)
         source = whatsapp_messages(whatsapp_event(), phone_number_id="123")[0]
+        capabilities = {StatusChannel}
     return SimpleNamespace(
         channel=channel, source=source, receipt=receipt, capabilities=capabilities,
     )

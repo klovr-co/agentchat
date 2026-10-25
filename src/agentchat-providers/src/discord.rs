@@ -39,15 +39,7 @@ pub fn normalize(event: Event, bot_id: u64) -> Option<Message> {
     }
     Some(Message {
         id: format!("discord:{bot_id}:{}:{}", event.channel_id, event.id).into(),
-        conversation_id: format!(
-            "discord:{bot_id}:{}:{}",
-            event
-                .guild_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "dm".into()),
-            event.channel_id,
-        )
-        .into(),
+        conversation_id: conversation(bot_id, event.guild_id, event.channel_id).into(),
         channel: "discord".into(),
         sender: Sender {
             id: event.author_id.to_string(),
@@ -67,6 +59,61 @@ pub fn normalize(event: Event, bot_id: u64) -> Option<Message> {
         thread_id: event.is_thread.then(|| event.channel_id.to_string()),
         addressed: true,
         attachments: event.attachments,
+    })
+}
+/// A button press, from a Discord component interaction.
+#[derive(Debug, Clone)]
+pub struct Press {
+    pub id: u64,
+    pub channel_id: u64,
+    pub guild_id: Option<u64>,
+    pub user_id: u64,
+    pub display_name: Option<String>,
+    pub user_bot: bool,
+    pub custom_id: String,
+    pub message_id: u64,
+    pub is_thread: bool,
+}
+fn conversation(bot_id: u64, guild_id: Option<u64>, channel_id: u64) -> String {
+    format!(
+        "discord:{bot_id}:{}:{channel_id}",
+        guild_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "dm".into()),
+    )
+}
+/// A press on one of this bot's prompt buttons, as a message in the prompt's
+/// conversation; None for anything else.
+pub fn normalize_press(press: Press, bot_id: u64) -> Option<Message> {
+    if press.user_bot || press.user_id == bot_id {
+        return None;
+    }
+    let answer = agentchat_core::answer_metadata(&press.custom_id)?;
+    let mut metadata = json!({
+        "bot_id": bot_id,
+        "channel_id": press.channel_id,
+        "guild_id": press.guild_id,
+        "message_id": press.message_id,
+    });
+    metadata[agentchat_core::ANSWER_METADATA] = answer;
+    Some(Message {
+        id: format!(
+            "discord:{bot_id}:{}:interaction:{}",
+            press.channel_id, press.id
+        )
+        .into(),
+        conversation_id: conversation(bot_id, press.guild_id, press.channel_id).into(),
+        channel: "discord".into(),
+        sender: Sender {
+            id: press.user_id.to_string(),
+            display_name: press.display_name,
+        },
+        text: String::new(),
+        role: Role::User,
+        metadata: metadata.as_object().unwrap().clone(),
+        thread_id: press.is_thread.then(|| press.channel_id.to_string()),
+        addressed: true,
+        attachments: vec![],
     })
 }
 pub fn text_payload(content: &str) -> Result<&str, &'static str> {
@@ -111,6 +158,42 @@ impl Destination {
             reference["guild_id"] = guild.to_string().into();
         }
         json!({"content":content,"message_reference":reference,"allowed_mentions":{"parse":[],"replied_user":false}})
+    }
+    /// An edit replacing a sent message's text; `components: []` removes its buttons.
+    pub fn edit_payload(content: &str, remove_buttons: bool) -> Value {
+        let mut payload =
+            json!({"content":content,"allowed_mentions":{"parse":[],"replied_user":false}});
+        if remove_buttons {
+            payload["components"] = json!([]);
+        }
+        payload
+    }
+    /// A prompt as a reply with buttons, five to a row.
+    pub fn prompt_payload(
+        &self,
+        text: &str,
+        prompt: &str,
+        choices: &[(String, String, String)],
+    ) -> Result<Value, &'static str> {
+        let mut payload = self.payload(text_payload(text)?);
+        let buttons = choices
+            .iter()
+            .map(|(id, label, style)| {
+                let style = match style.as_str() {
+                    "primary" => 1,
+                    "danger" => 4,
+                    _ => 2,
+                };
+                agentchat_core::prompt_token(prompt, id)
+                    .map(|token| json!({"type": 2, "style": style, "label": label, "custom_id": token}))
+                    .map_err(|_| "Invalid prompt or choice ID")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        payload["components"] = buttons
+            .chunks(5)
+            .map(|row| json!({"type": 1, "components": row}))
+            .collect();
+        Ok(payload)
     }
     pub fn confirmed_reply(
         &self,

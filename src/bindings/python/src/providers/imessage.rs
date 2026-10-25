@@ -82,6 +82,7 @@ pub struct IMessageState {
     _allowed_chats: Object,
     _close_lock: Object,
     _closed: bool,
+    _typing: Object,
 }
 impl std::ops::Deref for IMessage {
     type Target = IMessageState;
@@ -225,6 +226,7 @@ impl IMessage {
             visit.call(&state._delivery)?;
             visit.call(&state._allowed_chats)?;
             visit.call(&state._close_lock)?;
+            visit.call(&state._typing)?;
         }
         Ok(())
     }
@@ -302,6 +304,12 @@ impl IMessage {
             _allowed_chats: allowed,
             _close_lock: py.import("asyncio")?.getattr("Lock")?.call0()?.unbind(),
             _closed: false,
+            _typing: super::typing::keeper(
+                py,
+                "agentchat.channels.imessage.adapter",
+                policy::TYPING_INTERVAL,
+                policy::TYPING_EXPIRY,
+            )?,
         }));
         let callback = host::callback(py, slf.bind(py).getattr("_on_message")?.unbind())?;
         slf.borrow(py)
@@ -412,6 +420,10 @@ impl IMessage {
                     ]))
                 })?;
                 let mut result = Ok(());
+                if objects.is_some() {
+                    let keeper = Python::attach(|py| slf.borrow(py)._typing.clone_ref(py));
+                    result = call(keeper, "close", vec![], vec![]).await.map(|_| ());
+                }
                 if let Some(objects) = objects {
                     for (index, object) in objects.into_iter().enumerate() {
                         let next = call(
@@ -470,24 +482,7 @@ impl IMessage {
                 let content = imessage_text_payload(content.bind(py))?;
                 let source = convert::from_message(source.bind(py))?;
                 let this = slf.borrow(py);
-                let allowed = if this._allowed_chats.is_none(py) {
-                    None
-                } else {
-                    Some(
-                        this._allowed_chats
-                            .bind(py)
-                            .try_iter()?
-                            .map(|v| v?.extract::<String>())
-                            .collect::<PyResult<Vec<_>>>()?,
-                    )
-                };
-                let dest = policy::Destination::from_source(
-                    &source,
-                    &this._instance_id,
-                    allowed.as_deref(),
-                )
-                .map_err(PyValueError::new_err)?;
-                this._delivery.bind(py).call_method0("check_reply")?;
+                let dest = this.destination(py, &source)?;
                 Ok::<_, PyErr>((source, content, dest, this._client.clone_ref(py)))
             })?;
             let args = Python::attach(|py| {
@@ -515,7 +510,118 @@ impl IMessage {
             })
         })
     }
+    /// Show "typing…" in the source chat until cleared with "" or the keeper expires.
+    /// iMessage shows no status text. Returns False when the BlueBubbles server
+    /// cannot show typing (its Private API is off) or the client has no typing.
+    fn set_status(slf: Py<Self>, py: Python<'_>, source: Object, status: String) -> Output {
+        host::coroutine(py, async move {
+            let (chat, client, keeper, socket) = Python::attach(|py| {
+                let message = convert::from_message(source.bind(py))?;
+                let this = slf.borrow(py);
+                let destination = this.destination(py, &message)?;
+                Ok::<_, PyErr>((
+                    destination.chat_guid,
+                    this._client.clone_ref(py),
+                    this._typing.clone_ref(py),
+                    this._socket.clone_ref(py),
+                ))
+            })?;
+            let (key, typing) = Python::attach(|py| {
+                Ok::<_, PyErr>((
+                    chat.clone().into_pyobject(py)?.into_any().unbind(),
+                    client.bind(py).hasattr("start_typing")?,
+                ))
+            })?;
+            let answer = |value: bool| {
+                Python::attach(|py| Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()))
+            };
+            if !typing {
+                return answer(status.is_empty());
+            }
+            if status.is_empty() {
+                Python::attach(|py| {
+                    keeper
+                        .bind(py)
+                        .call_method1("stop", (key.bind(py),))
+                        .map(drop)
+                })?;
+                stop_typing(socket, &chat).await;
+                return answer(true);
+            }
+            let first = call(copy(&client), "start_typing", vec![copy(&key)], vec![]).await?;
+            if !Python::attach(|py| first.bind(py).is_truthy())? {
+                Python::attach(|py| {
+                    keeper
+                        .bind(py)
+                        .call_method1("stop", (key.bind(py),))
+                        .map(drop)
+                })?;
+                return answer(false);
+            }
+            Python::attach(|py| {
+                let send = py
+                    .import("functools")?
+                    .getattr("partial")?
+                    .call1((client.bind(py).getattr("start_typing")?, key.bind(py)))?;
+                keeper.bind(py).call_method1("keep", (key.bind(py), send))?;
+                Ok::<_, PyErr>(())
+            })?;
+            answer(true)
+        })
+    }
 }
+
+impl IMessage {
+    /// The chat a source message belongs to, if this adapter may reply there.
+    fn destination(
+        &self,
+        py: Python<'_>,
+        source: &agentchat_core::Message,
+    ) -> PyResult<policy::Destination> {
+        let allowed = if self._allowed_chats.is_none(py) {
+            None
+        } else {
+            Some(
+                self._allowed_chats
+                    .bind(py)
+                    .try_iter()?
+                    .map(|v| v?.extract::<String>())
+                    .collect::<PyResult<Vec<_>>>()?,
+            )
+        };
+        let destination =
+            policy::Destination::from_source(source, &self._instance_id, allowed.as_deref())
+                .map_err(PyValueError::new_err)?;
+        self._delivery.bind(py).call_method0("check_reply")?;
+        Ok(destination)
+    }
+}
+
+/// Clear "typing…" over the socket; the REST route for this restarts typing on
+/// current servers. Best effort: the reply or the server's timeout also clears it.
+async fn stop_typing(socket: Object, chat: &str) {
+    let emitted = Python::attach(|py| -> PyResult<Option<Object>> {
+        let socket = socket.bind(py);
+        if !socket.hasattr("emit")?
+            || !socket
+                .getattr("connected")
+                .and_then(|c| c.is_truthy())
+                .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let payload = convert::from_json(py, &policy::typing_event_payload(chat))?;
+        Ok(Some(
+            socket
+                .call_method1("emit", (policy::STOP_TYPING_EVENT, payload))?
+                .unbind(),
+        ))
+    });
+    if let Ok(Some(pending)) = emitted {
+        let _ = host::await_py(pending).await;
+    }
+}
+
 #[pyclass(
     dict,
     weakref,
@@ -608,86 +714,43 @@ impl BlueBubblesClient {
     ) -> Output {
         let kwargs = kwargs.map(|v| v.clone().unbind());
         host::coroutine(py, async move {
-            let result = async {
-                let context = Python::attach(|py| {
-                    let mut this = slf.borrow_mut(py);
-                    if this._closed {
-                        return Err(PyRuntimeError::new_err("BlueBubbles client is closed"));
-                    }
-                    if this._session.is_none(py) {
-                        let aio = py.import("aiohttp")?;
-                        let kw = PyDict::new(py);
-                        kw.set_item("total", 60)?;
-                        let timeout = aio.getattr("ClientTimeout")?.call((), Some(&kw))?;
-                        let kw = PyDict::new(py);
-                        kw.set_item("timeout", timeout)?;
-                        this._session = aio.getattr("ClientSession")?.call((), Some(&kw))?.unbind();
-                    }
-                    let kw = match kwargs {
-                        Some(v) => v.bind(py).copy()?,
-                        None => PyDict::new(py),
-                    };
-                    let params = PyDict::new(py);
-                    params.set_item("password", &this._password)?;
-                    kw.set_item("params", params)?;
-                    kw.set_item("allow_redirects", false)?;
-                    Ok(this
-                        ._session
-                        .bind(py)
-                        .call_method(
-                            "request",
-                            (method, format!("{}{path}", this.server_url)),
-                            Some(&kw),
-                        )?
-                        .unbind())
-                })?;
-                let response = call(copy(&context), "__aenter__", vec![], vec![]).await?;
-                let result = async {
-                    Python::attach(|py| {
-                        let status = response.bind(py).getattr("status")?.extract::<u16>()?;
-                        if !(200..300).contains(&status) {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "BlueBubbles request failed (HTTP {status})"
-                            )));
-                        }
-                        Ok(())
-                    })?;
-                    let data = call(response, "json", vec![], vec![]).await?;
-                    Python::attach(|py| {
-                        let value = convert::to_json(data.bind(py))?;
-                        if !value.is_object()
-                            || value.get("status").and_then(serde_json::Value::as_u64) != Some(200)
-                        {
-                            return Err(PyRuntimeError::new_err(
-                                "BlueBubbles returned an invalid response",
-                            ));
-                        }
-                        Ok(data)
-                    })
+            let (status, data) = exchange(slf, method, path, kwargs).await?;
+            Python::attach(|py| {
+                if !(200..300).contains(&status) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "BlueBubbles request failed (HTTP {status})"
+                    )));
                 }
-                .await;
-                exit_scope(context, result.as_ref().err()).await?;
-                result
-            }
-            .await;
-            result.map_err(|e| {
-                Python::attach(|py| {
-                    let network = py
-                        .import("aiohttp")
-                        .and_then(|m| m.getattr("ClientError"))
-                        .ok()
-                        .is_some_and(|t| e.is_instance(py, &t));
-                    if network
-                        || e.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py)
-                        || e.is_instance_of::<PyValueError>(py)
-                    {
-                        PyRuntimeError::new_err(
-                            "BlueBubbles request failed; delivery may be uncertain",
-                        )
-                    } else {
-                        e
-                    }
-                })
+                let value = convert::to_json(data.bind(py))?;
+                if !value.is_object()
+                    || value.get("status").and_then(serde_json::Value::as_u64) != Some(200)
+                {
+                    return Err(PyRuntimeError::new_err(
+                        "BlueBubbles returned an invalid response",
+                    ));
+                }
+                Ok(data)
+            })
+        })
+    }
+    /// Show "typing…" in a chat. Returns False when the server cannot: its Private
+    /// API is off or not connected.
+    fn start_typing(slf: Py<Self>, py: Python<'_>, chat_guid: String) -> Output {
+        host::coroutine(py, async move {
+            let path = policy::typing_path(&chat_guid);
+            let (status, data) = exchange(slf, "POST".into(), path, None).await?;
+            Python::attach(|py| {
+                let value = convert::to_json(data.bind(py))?;
+                let shown = if (200..300).contains(&status) {
+                    true
+                } else if policy::typing_unavailable(status, &value) {
+                    false
+                } else {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "BlueBubbles request failed (HTTP {status})"
+                    )));
+                };
+                Ok(shown.into_pyobject(py)?.to_owned().into_any().unbind())
             })
         })
     }
@@ -748,6 +811,83 @@ impl BlueBubblesClient {
         })
     }
 }
+/// One BlueBubbles request: its HTTP status and JSON body (None if not JSON).
+async fn exchange(
+    slf: Py<BlueBubblesClient>,
+    method: String,
+    path: String,
+    kwargs: Option<Py<PyDict>>,
+) -> PyResult<(u16, Object)> {
+    let result = async {
+        let context = Python::attach(|py| {
+            let mut this = slf.borrow_mut(py);
+            if this._closed {
+                return Err(PyRuntimeError::new_err("BlueBubbles client is closed"));
+            }
+            if this._session.is_none(py) {
+                let aio = py.import("aiohttp")?;
+                let kw = PyDict::new(py);
+                kw.set_item("total", 60)?;
+                let timeout = aio.getattr("ClientTimeout")?.call((), Some(&kw))?;
+                let kw = PyDict::new(py);
+                kw.set_item("timeout", timeout)?;
+                this._session = aio.getattr("ClientSession")?.call((), Some(&kw))?.unbind();
+            }
+            let kw = match kwargs {
+                Some(v) => v.bind(py).copy()?,
+                None => PyDict::new(py),
+            };
+            let params = PyDict::new(py);
+            params.set_item("password", &this._password)?;
+            kw.set_item("params", params)?;
+            kw.set_item("allow_redirects", false)?;
+            Ok(this
+                ._session
+                .bind(py)
+                .call_method(
+                    "request",
+                    (method, format!("{}{path}", this.server_url)),
+                    Some(&kw),
+                )?
+                .unbind())
+        })?;
+        let response = call(copy(&context), "__aenter__", vec![], vec![]).await?;
+        let result = async {
+            let status =
+                Python::attach(|py| response.bind(py).getattr("status")?.extract::<u16>())?;
+            let data = call(response, "json", vec![], vec![]).await;
+            let data = match data {
+                Ok(data) => data,
+                // Only a successful response must be JSON; errors may be anything.
+                Err(_) if !(200..300).contains(&status) => none(),
+                Err(error) => return Err(error),
+            };
+            Ok((status, data))
+        }
+        .await;
+        exit_scope(context, result.as_ref().err()).await?;
+        result
+    }
+    .await;
+    result.map_err(|e| {
+        Python::attach(|py| {
+            let network = py
+                .import("aiohttp")
+                .and_then(|m| m.getattr("ClientError"))
+                .ok()
+                .is_some_and(|t| e.is_instance(py, &t));
+            if network
+                || e.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py)
+                || e.is_instance_of::<PyValueError>(py)
+            {
+                PyRuntimeError::new_err("BlueBubbles request failed; delivery may be uncertain")
+            } else {
+                e
+            }
+        })
+    })
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IMessage>()?;
     host::register_initialized_class::<BlueBubblesClient>(m)?;

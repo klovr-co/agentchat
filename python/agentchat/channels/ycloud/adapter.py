@@ -81,3 +81,8 @@ class YCloudError(RuntimeError):
             self, description, kind=kind, status=status, code=code,
             whatsapp_code=whatsapp_code, request_id=request_id,
         )
+
+# WhatsApp clears "typing…" after 25 seconds or when the reply arrives.
+TYPING_INTERVAL = 20
+# Stop refreshing a forgotten indicator after this many seconds.
+TYPING_EXPIRY = 120
