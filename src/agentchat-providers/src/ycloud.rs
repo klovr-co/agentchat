@@ -415,6 +415,39 @@ pub fn prompt_payload(
         "context": {"message_id": id},
     }))
 }
+/// Where a webhook event goes when the application has a handler for it: an inbound
+/// message routes like a WhatsApp message (see `whatsapp::route_message`); any other
+/// event type, such as `whatsapp.message.updated`, is an event by type.
+pub fn app_route(payload: &Value, phone: &str) -> Option<agentchat_core::Route> {
+    match payload["type"].as_str()? {
+        "whatsapp.inbound_message.received" => {
+            let event = &payload["whatsappInboundMessage"];
+            if event["to"] != phone {
+                return None;
+            }
+            crate::whatsapp::route_message(event)
+        }
+        kind => Some(agentchat_core::Route::Event {
+            event_type: kind.into(),
+        }),
+    }
+}
+
+/// An `interactive` message (buttons, list, CTA URL or Flow) replying to the source.
+pub fn interactive_payload(
+    sender: &str,
+    recipient: &str,
+    id: &str,
+    interactive: Value,
+    external_id: Option<&str>,
+) -> Result<Value, &'static str> {
+    with_external_id(
+        json!({"from": sender, "to": recipient, "type": "interactive",
+               "interactive": interactive, "context": {"message_id": id}}),
+        external_id,
+    )
+}
+
 pub fn template_payload(
     sender: &str,
     recipient: &str,
@@ -906,5 +939,34 @@ mod tests {
         let (templates, more) = template_page(&page, 100).unwrap();
         assert_eq!(templates[0].body.as_deref(), Some("Hi {{1}}"));
         assert!(!more);
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+    use agentchat_core::Route;
+
+    #[test]
+    fn events_route_by_type_and_messages_like_whatsapp() {
+        let press = json!({"type": "whatsapp.inbound_message.received", "whatsappInboundMessage": {
+            "to": "+1555", "type": "interactive",
+            "interactive": {"type": "button_reply", "button_reply": {"id": "retry"}}}});
+        assert_eq!(
+            app_route(&press, "+1555"),
+            Some(Route::Action {
+                action_ids: vec!["retry".into()]
+            })
+        );
+        assert_eq!(app_route(&press, "+1666"), None);
+        assert_eq!(
+            app_route(&json!({"type": "whatsapp.message.updated"}), "+1555"),
+            Some(Route::Event {
+                event_type: "whatsapp.message.updated".into()
+            })
+        );
+        let payload =
+            interactive_payload("+1555", "+1777", "w1", json!({"type": "flow"}), None).unwrap();
+        assert_eq!(payload["interactive"]["type"], "flow");
     }
 }

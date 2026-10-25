@@ -130,6 +130,30 @@ pub fn normalize(event: &Value, instance_id: &str) -> Option<Message> {
         attachments,
     })
 }
+/// Whether a chat is one-to-one (`iMessage;-;…`) rather than a group (`iMessage;+;…`).
+pub fn is_direct(chat_guid: &str) -> bool {
+    chat_guid.starts_with("iMessage;-;")
+}
+
+/// Whether `text` is exactly the configured stop keyword, ignoring case and spaces.
+pub fn is_stop_keyword(text: &str, keyword: Option<&str>) -> bool {
+    keyword
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .is_some_and(|keyword| text.trim().eq_ignore_ascii_case(keyword))
+}
+
+/// The message as a stop request for its conversation, from its sender.
+pub fn stop_request(message: &Message) -> Message {
+    let mut stop = message.clone();
+    stop.id = format!("{}:stop", message.id).into();
+    stop.text = String::new();
+    stop.attachments.clear();
+    stop.metadata
+        .insert(agentchat_core::STOP_METADATA.into(), json!(true));
+    stop
+}
+
 #[derive(Debug, Clone)]
 pub struct Destination {
     pub instance_id: String,
@@ -228,6 +252,23 @@ pub fn receipt(response: &Value) -> Result<&str, &'static str> {
         .filter(|v| !v.is_empty())
         .ok_or("BlueBubbles did not return a successful message receipt")
 }
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn direct_chats_and_stop_keywords() {
+        assert!(is_direct("iMessage;-;+1555") && !is_direct("iMessage;+;chat1"));
+        assert!(is_stop_keyword(" STOP ", Some("stop")));
+        assert!(!is_stop_keyword("stop now", Some("stop")) && !is_stop_keyword("stop", None));
+        let event = json!({"isFromMe": false, "guid": "g", "handle": {"address": "alice"},
+            "chats": [{"guid": "iMessage;-;alice"}], "text": "stop"});
+        let stop = stop_request(&normalize(&event, "mac").unwrap());
+        assert!(agentchat_core::is_stop_request(&stop));
+        assert_eq!(stop.sender.id, "alice");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

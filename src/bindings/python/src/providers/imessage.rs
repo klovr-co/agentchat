@@ -1,6 +1,6 @@
 //! Native iMessage lifecycle with foreign Socket.IO and HTTP I/O.
 use crate::{
-    convert, host,
+    apps, convert, host,
     runtime::{call, copy, exit_scope, none},
 };
 use agentchat_providers::{imessage as policy, wire::strip};
@@ -238,7 +238,7 @@ impl IMessage {
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self { inner: None }
     }
-    #[pyo3(signature=(*,server_url,password,instance_id=None,allowed_chat_guids=None,client=None,socket_client=None,max_pending_events=64,shutdown_timeout=20.0))]
+    #[pyo3(signature=(*,server_url,password,instance_id=None,allowed_chat_guids=None,client=None,socket_client=None,max_pending_events=64,shutdown_timeout=20.0,stop_keyword=None))]
     #[allow(clippy::too_many_arguments)]
     fn initialize(
         slf: Py<Self>,
@@ -251,6 +251,7 @@ impl IMessage {
         socket_client: Option<Object>,
         max_pending_events: usize,
         shutdown_timeout: f64,
+        stop_keyword: Option<String>,
     ) -> PyResult<()> {
         if strip(&password).is_empty() {
             return Err(PyValueError::new_err("BlueBubbles password is required"));
@@ -316,11 +317,97 @@ impl IMessage {
             ._socket
             .bind(py)
             .call_method1("on", ("new-message", callback))?;
+        slf.bind(py).setattr("_stop_keyword", stop_keyword)?;
         Ok(())
     }
     #[classattr]
     fn name() -> &'static str {
         "imessage"
+    }
+    /// Handle a BlueBubbles socket event by name, such as "updated-message" or
+    /// "group-name-change". The handler receives `{"event": name, "data": ...}`.
+    fn on_event(slf: &Bound<'_, Self>, event_type: Object) -> Output {
+        let py = slf.py();
+        let decorator = apps::decorator(slf.as_any(), "event", event_type.clone_ref(py))?;
+        let name = event_type.bind(py).extract::<String>()?;
+        if name != "new-message" {
+            let callback = py
+                .import("functools")?
+                .getattr("partial")?
+                .call1((slf.getattr("_on_socket_event")?, &name))?;
+            slf.borrow()
+                ._socket
+                .bind(py)
+                .call_method1("on", (name, callback))?;
+        }
+        Ok(decorator)
+    }
+    /// iMessage has no buttons; registered action handlers never run.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Object) -> Output {
+        apps::decorator(slf.as_any(), "action", action_id)
+    }
+    /// iMessage has no forms; registered view handlers never run.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Object) -> Output {
+        apps::decorator(slf.as_any(), "view", callback_id)
+    }
+    /// Handle messages starting with this command, such as "/start", instead of
+    /// passing them to the message handler.
+    fn on_command(slf: &Bound<'_, Self>, command: Object) -> Output {
+        apps::decorator(slf.as_any(), "command", command)
+    }
+    /// Handle every other routed event.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Object) -> Output {
+        apps::raw(slf.as_any(), handler)
+    }
+    fn _on_socket_event(slf: Py<Self>, py: Python<'_>, name: String, data: Object) -> Output {
+        host::coroutine(py, async move {
+            Python::attach(|py| {
+                let channel = slf.bind(py);
+                let route = agentchat_core::Route::Event {
+                    event_type: name.clone(),
+                };
+                if let Some(handler) = apps::find(channel.as_any(), &route)? {
+                    let payload = PyDict::new(py);
+                    payload.set_item("event", &name)?;
+                    payload.set_item("data", data.bind(py))?;
+                    let this = slf.borrow(py);
+                    apps::spawn(
+                        channel.as_any(),
+                        this._delivery.bind(py),
+                        &handler,
+                        &payload.into_any().unbind(),
+                    )?;
+                }
+                Ok(py.None())
+            })
+        })
+    }
+    /// iMessage has no private notices; in a one-to-one chat with that person an
+    /// ordinary reply is already private. Elsewhere this raises ValueError.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Object,
+        user_id: String,
+        text: String,
+        blocks: Option<Object>,
+    ) -> Output {
+        if blocks.is_some_and(|b| !b.is_none(py)) {
+            return Err(PyValueError::new_err("iMessage notices are text only"));
+        }
+        let message = convert::from_message(source.bind(py))?;
+        let direct = message
+            .metadata
+            .get("chat_guid")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(policy::is_direct);
+        if !direct || message.sender.id != user_id {
+            return Err(PyValueError::new_err(
+                "iMessage can only show a notice as a reply in a one-to-one chat with that person",
+            ));
+        }
+        Ok(slf.bind(py).call_method1("reply", (source, text))?.unbind())
     }
     #[classmethod]
     fn from_env(cls: &Bound<'_, PyType>) -> Output {
@@ -467,6 +554,29 @@ impl IMessage {
                 {
                     return Ok(py.None());
                 }
+                // A command the application handles never becomes a message.
+                if let Some(command) = agentchat_core::command_of(&message.text) {
+                    let route = agentchat_core::Route::Command { command };
+                    if let Some(handler) = apps::find(slf.bind(py).as_any(), &route)? {
+                        apps::spawn(
+                            slf.bind(py).as_any(),
+                            this._delivery.bind(py),
+                            &handler,
+                            &event,
+                        )?;
+                        return Ok(py.None());
+                    }
+                }
+                // The stop keyword, when configured, stops the sender's running turn.
+                let keyword = slf
+                    .bind(py)
+                    .getattr("_stop_keyword")?
+                    .extract::<Option<String>>()?;
+                let message = if policy::is_stop_keyword(&message.text, keyword.as_deref()) {
+                    policy::stop_request(&message)
+                } else {
+                    message
+                };
                 let value = convert::to_message(py, &message)?;
                 this._delivery
                     .bind(py)

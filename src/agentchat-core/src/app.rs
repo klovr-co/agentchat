@@ -23,7 +23,7 @@ pub enum Route {
 /// `"/deploy@my_bot staging"`: a leading `/`, then letters, digits, `_` or `-`.
 /// A `@bot` suffix is dropped. `None` for any other text.
 pub fn command_of(text: &str) -> Option<String> {
-    let word = text.trim_start().split_whitespace().next()?;
+    let word = text.split_whitespace().next()?;
     let name = word.strip_prefix('/')?;
     let name = name.split_once('@').map_or(name, |(name, _)| name);
     if name.is_empty()

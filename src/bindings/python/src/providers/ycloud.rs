@@ -1,6 +1,6 @@
 //! Python foreign-I/O adapter for the portable YCloud WhatsApp policies.
 use crate::prompts::PromptFields;
-use crate::{convert, host};
+use crate::{apps, convert, host};
 use agentchat_providers::ycloud::{self as policy, kind};
 use pyo3::{
     exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError},
@@ -375,6 +375,88 @@ impl YCloud {
     fn name() -> &'static str {
         "ycloud"
     }
+    /// Handle webhook events by type, such as "whatsapp.message.updated", and inbound
+    /// reactions or other message types ("reaction", "location"). The handler
+    /// receives the webhook payload; `bind_events` keeps working alongside.
+    fn on_event(slf: &Bound<'_, Self>, event_type: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "event", event_type)
+    }
+    /// Handle button and list replies whose ID matches, instead of the message handler.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "action", action_id)
+    }
+    /// Handle WhatsApp Flow responses whose `flow_token` matches.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "view", callback_id)
+    }
+    /// Handle text messages starting with this command, such as "/start".
+    fn on_command(slf: &Bound<'_, Self>, command: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "command", command)
+    }
+    /// Handle every other routed event.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::raw(slf.as_any(), handler)
+    }
+    /// Send one WhatsApp `interactive` message (buttons, a list, a CTA URL or a
+    /// Flow) given as the only entry of `content.blocks`.
+    fn reply_rich(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        content: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let rich = convert::from_rich_reply(content.bind(py))?;
+        let interactive = agentchat_providers::whatsapp::interactive_object(&rich)
+            .map_err(PyValueError::new_err)?;
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let source_host = source;
+            let source = Python::attach(|py| convert::from_message(source_host.bind(py)))?;
+            let phone = extract::<String>(&get(&this, "_phone_number")?)?;
+            let destination =
+                policy::destination(&source, &phone).map_err(PyValueError::new_err)?;
+            let payload = policy::interactive_payload(
+                &phone,
+                &destination.recipient,
+                &destination.message_id,
+                interactive,
+                None,
+            )
+            .map_err(PyValueError::new_err)?;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let result = api_json(
+                &this,
+                "post",
+                "/whatsapp/messages/sendDirectly",
+                json!({"json": payload}),
+            )
+            .await?;
+            let message = policy::receipt(&source, &phone, &rich.text, &result, None)
+                .map_err(PyRuntimeError::new_err)?;
+            receipt_with_metadata(&source_host, &message)
+        })
+    }
+    /// WhatsApp chats are one-to-one, so a notice for the person this conversation
+    /// is with is an ordinary reply; any other recipient raises ValueError.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        user_id: String,
+        text: String,
+        blocks: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if blocks.is_some_and(|b| !b.is_none(py)) {
+            return Err(PyValueError::new_err("WhatsApp notices are text only"));
+        }
+        if convert::from_message(source.bind(py))?.sender.id != user_id {
+            return Err(PyValueError::new_err(
+                "A WhatsApp chat can only show notices to the person it is with",
+            ));
+        }
+        Ok(slf.bind(py).call_method1("reply", (source, text))?.unbind())
+    }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(payload) = self.payload.as_deref() {
             visit.call(&payload.state)?;
@@ -544,6 +626,26 @@ impl YCloud {
             }
             let payload = serde_json::from_slice(&bytes)
                 .map_err(|_| fail_response("HTTPBadRequest", "Invalid webhook JSON"))?;
+            // The application's handler; a press, Flow reply or command it handles
+            // never also becomes a message.
+            let phone = extract::<String>(&get(&this, "_phone_number")?)?;
+            if let Some(route) = policy::app_route(&payload, &phone) {
+                if let Some(handler) = Python::attach(|py| apps::find(this.bind(py), &route))? {
+                    let delivery = get(&this, "_delivery")?;
+                    let raw = j(payload.clone())?;
+                    if !Python::attach(|py| {
+                        apps::spawn(this.bind(py), delivery.bind(py), &handler, &raw)
+                    })? {
+                        return Err(fail_response(
+                            "HTTPServiceUnavailable",
+                            "YCloud receiver is busy",
+                        ));
+                    }
+                    if !matches!(route, agentchat_core::Route::Event { .. }) {
+                        return error_response("Response", "OK");
+                    }
+                }
+            }
             let event = policy::classify(
                 &payload,
                 &extract::<String>(&get(&this, "_phone_number")?)?,

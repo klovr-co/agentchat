@@ -5,7 +5,7 @@
 //! `Route`. Handlers receive the raw payload. Where the provider's acknowledgement
 //! can carry an answer, the handler's return value is that answer if it arrives
 //! within `ACK_DEADLINE`; a slower handler keeps running as drained work.
-use crate::host::{await_py, coroutine};
+use crate::host::await_py;
 use agentchat_core::Route;
 use pyo3::{
     exceptions::PyTypeError,
@@ -225,16 +225,6 @@ pub async fn answer(delivery: Object, handler: Object, payload: Object) -> PyRes
         delivery.bind(py).call_method1("track", (pending,))?;
         Ok(py.None())
     })
-}
-
-/// A coroutine that returns `answer(...)`, for bindings that hand it to Python.
-pub fn answer_coroutine(
-    py: Python<'_>,
-    delivery: Object,
-    handler: Object,
-    payload: Object,
-) -> PyResult<Object> {
-    coroutine(py, answer(delivery, handler, payload))
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
