@@ -21,7 +21,7 @@ from tests.support.discord import DiscordClient, discord_event
 from tests.support.receipts import Receipt
 from tests.support.slack import FakeSlackClient, slack_source
 from tests.support.teams import APP_ID, TENANT_ID, teams_event
-from tests.support.telegram import TelegramClient, faked, read, telegram_update
+from tests.support.telegram import TelegramClient, faked, group_update, read, telegram_update
 from tests.support.whatsapp import WhatsAppSession, whatsapp_event
 
 OPTIONS = {"max_pending_events": 2, "shutdown_timeout": 0.01}
@@ -113,18 +113,65 @@ async def test_discord_posts_then_edits_and_splits_at_its_limit():
 
 
 @pytest.mark.asyncio
-async def test_telegram_sends_then_edits_in_place():
+async def test_telegram_groups_send_then_edit_in_place():
     client = TelegramClient()
+    channel = faked(client)
+    source = read(group_update())
+    chat = source.metadata["chat_id"]
+    try:
+        answer, _ = await stream(channel, source, ["Hel", "lo"])
+        assert client.method_calls("sendMessageDraft") == []
+        assert [p["text"] for p in client.method_calls("sendMessage")] == ["Hel"]
+        edits = client.method_calls("editMessageText")
+        assert [(e["chat_id"], e["message_id"], e["text"]) for e in edits] == [
+            (chat, 101, "Hello"),
+        ]
+        assert answer.messages[0].metadata["message_id"] == 101
+    finally:
+        await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_private_chats_stream_a_draft_then_send_the_answer():
+    client = TelegramClient()
+    channel = faked(client)
+    source = read(telegram_update())
+    assert source.metadata["chat_type"] == "private"
+    try:
+        answer, history = await stream(channel, source, ["Hel", "", "lo"])
+        drafts = client.method_calls("sendMessageDraft")
+        # One draft per changed text, all with the same non-zero ID.
+        assert [d["text"] for d in drafts] == ["Hel", "Hello"]
+        assert len({d["draft_id"] for d in drafts}) == 1 and drafts[0]["draft_id"] != 0
+        assert all(d["chat_id"] == 30 and "reply_parameters" not in d for d in drafts)
+        sent = client.method_calls("sendMessage")
+        assert [s["text"] for s in sent] == ["Hello"]
+        assert sent[0]["reply_parameters"]["message_id"] == source.metadata["message_id"]
+        assert client.method_calls("editMessageText") == []
+        assert answer.messages[0].metadata["message_id"] == 101
+        assert history[-1].text == "Hello"
+    finally:
+        await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_falls_back_to_editing_when_drafts_are_refused():
+    class NoDrafts(TelegramClient):
+        async def call(self, method, payload=None, **options):
+            if method == "sendMessageDraft":
+                self.calls.append((method, payload))
+                raise RuntimeError("Bad Request: method not found")
+            return await super().call(method, payload, **options)
+
+    client = NoDrafts()
     channel = faked(client)
     source = read(telegram_update())
     try:
         answer, _ = await stream(channel, source, ["Hel", "lo"])
+        assert len(client.method_calls("sendMessageDraft")) == 1
         assert [p["text"] for p in client.method_calls("sendMessage")] == ["Hel"]
-        edits = client.method_calls("editMessageText")
-        assert [(e["chat_id"], e["message_id"], e["text"]) for e in edits] == [
-            (30, 101, "Hello"),
-        ]
-        assert answer.messages[0].metadata["message_id"] == 101
+        assert [e["text"] for e in client.method_calls("editMessageText")] == ["Hello"]
+        assert answer.messages[0].text == "Hello"
     finally:
         await channel.close()
 

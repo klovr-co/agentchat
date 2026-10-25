@@ -6,7 +6,7 @@ every channel; how it looks depends on what the provider can show.
 | | Slack | Telegram | Discord | Teams | WhatsApp and YCloud | iMessage |
 | --- | --- | --- | --- | --- | --- | --- |
 | Live status (`working()`) | Status text in the thread | "typing…" | "typing…" | "typing…" | "typing…" (marks the message read) | "typing…" (needs the BlueBubbles Private API) |
-| Streamed answer (`stream()`) | Native stream in threads | Edits one message | Edits one message | Native stream in one-to-one chats, otherwise edits one message | One reply when finished | One reply when finished |
+| Streamed answer (`stream()`) | Native stream in threads | Native draft in private chats, otherwise edits one message | Edits one message | Native stream in one-to-one chats, otherwise edits one message | One reply when finished | One reply when finished |
 | Buttons (`ask()`) | Block Kit buttons | Inline keyboard | Message buttons | Adaptive Card | Reply buttons, or a list for more than three or longer choices | None: `ask()` raises `TypeError` |
 | Stop / Queue / Steer | Buttons | Buttons | Buttons | Buttons | Buttons | `app.stop()` and `busy=` only |
 
@@ -61,7 +61,8 @@ or 120 seconds pass. `context.set_status(status)` sets it once; `""` clears it.
 text; at most one update is sent per `stream_interval` (Slack and Discord 1 s,
 Teams 1.5 s, Telegram 2 s), and the rest is sent when the block ends. The
 finished answer is confirmed as ordinary messages and added to conversation
-history. A long answer continues in a new message at the provider's limit
+history. Telegram private chats show a native draft while writing and send the
+answer as a new message at the end. A long answer continues in a new message at the provider's limit
 (Discord 2,000, Telegram 4,096, Slack 12,000 UTF-16 units), after a line or
 word break where one is near. Slack finalizes a stream 10 minutes after it starts
 with what was streamed so far; later updates to that stream fail.

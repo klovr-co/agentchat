@@ -513,7 +513,9 @@ impl Telegram {
     fn stream_limit() -> usize {
         4096
     }
-    /// Send the first part of a streamed answer; later parts edit it in place.
+    /// Start a streamed answer. Private chats show a native draft that the final
+    /// message replaces; elsewhere, or if Telegram refuses the draft, the first part
+    /// is sent and later parts edit it in place.
     fn start_stream(
         slf: Py<Self>,
         py: Python<'_>,
@@ -525,6 +527,23 @@ impl Telegram {
             let source = Python::attach(|py| convert::from_message(source.bind(py)))?;
             let dest = destination(&this, &source)?;
             call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            if policy::streams_drafts(&source) {
+                let id = policy::draft_id();
+                let payload =
+                    policy::draft_payload(&dest, id, &text).map_err(PyValueError::new_err)?;
+                // A draft is only a preview, so a refused one can safely fall back.
+                match client_call(&this, "sendMessageDraft", Some(payload), None).await {
+                    Ok(_) => return j(json!({"draft_id": id, "shown": text})),
+                    Err(error)
+                        if Python::attach(|py| {
+                            !error.is_instance_of::<pyo3::exceptions::PyException>(py)
+                        }) =>
+                    {
+                        return Err(error)
+                    }
+                    Err(_) => {}
+                }
+            }
             let payload = stream_payload(&text)?;
             let result =
                 client_call(&this, "sendMessage", Some(dest.route(payload, true)), None).await?;
@@ -545,7 +564,11 @@ impl Telegram {
         text: String,
     ) -> PyResult<Py<PyAny>> {
         host::coroutine(py, async move {
-            let (_, stream) = edit_streamed(&slf.into_any(), &source, &stream, &text).await?;
+            let this = slf.into_any();
+            if value(&stream)?.get("draft_id").is_some() {
+                return update_draft(&this, &source, &stream, &text).await;
+            }
+            let (_, stream) = edit_streamed(&this, &source, &stream, &text).await?;
             Ok(stream)
         })
     }
@@ -558,9 +581,18 @@ impl Telegram {
     ) -> PyResult<Py<PyAny>> {
         host::coroutine(py, async move {
             let this = slf.into_any();
-            policy::text_payload(Some(&text)).map_err(PyValueError::new_err)?;
-            let (id, _) = edit_streamed(&this, &source, &stream, &text).await?;
+            let payload = policy::text_payload(Some(&text)).map_err(PyValueError::new_err)?;
             let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let id = if value(&stream)?.get("draft_id").is_some() {
+                // The draft is a preview; the answer becomes a message only when sent.
+                let dest = destination(&this, &message)?;
+                call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+                let sent = client_call(&this, "sendMessage", Some(dest.route(payload, true)), None)
+                    .await?;
+                value(&sent)?["message_id"].clone()
+            } else {
+                json!(edit_streamed(&this, &source, &stream, &text).await?.0)
+            };
             let sent = policy::receipt(
                 &message,
                 extract(&get(&this, "_bot_id")?)?,
@@ -925,6 +957,28 @@ fn stream_payload(text: &str) -> PyResult<Value> {
     policy::text_payload(Some(text))
         .or_else(|_| policy::text_payload(Some("…")))
         .map_err(PyValueError::new_err)
+}
+/// Show `text` in a streamed draft, unless it already does; returns the next handle.
+async fn update_draft(
+    this: &Py<PyAny>,
+    source: &Py<PyAny>,
+    stream: &Py<PyAny>,
+    text: &str,
+) -> PyResult<Py<PyAny>> {
+    let source = Python::attach(|py| convert::from_message(source.bind(py)))?;
+    let dest = destination(this, &source)?;
+    call(&get(this, "_delivery")?, "check_reply", vec![], None)?;
+    let mut handle = value(stream)?;
+    if handle["shown"] == text {
+        return Ok(clone_obj(stream));
+    }
+    let id = handle["draft_id"]
+        .as_i64()
+        .ok_or_else(|| PyValueError::new_err("Expected a Telegram stream handle"))?;
+    let payload = policy::draft_payload(&dest, id, text).map_err(PyValueError::new_err)?;
+    client_call(this, "sendMessageDraft", Some(payload), None).await?;
+    handle["shown"] = json!(text);
+    j(handle)
 }
 /// Edit a streamed message to `text`, unless it already shows it. Returns its
 /// message ID and the handle for the next call.

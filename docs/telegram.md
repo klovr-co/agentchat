@@ -116,6 +116,15 @@ Telegram implements the optional capabilities:
 - Inline keyboard taps arrive as ordinary messages whose text is the tapped
   button's label; `metadata["callback_data"]` holds its data. The adapter answers
   the tap so the button's spinner stops.
+- `context.stream()` shows the answer while it is written. In private chats it
+  uses Telegram's native draft (`sendMessageDraft`), then sends the finished
+  answer as one message that replaces the draft. A draft is a preview that
+  disappears about 30 seconds after its last update, so a long pause without new
+  text hides it until the next update. In groups, or if Telegram refuses the
+  draft, the first part is sent and later parts edit it in place. Updates go out
+  at most every two seconds.
+- `ask()` shows prompt buttons as an inline keyboard; see
+  [Live controls](live-controls.md).
 - `upload_files()` sends each file as a document to the source chat or topic, with
   `title` as the caption. The Bot API accepts uploads up to 50 MB. If a later file
   fails, earlier files were already delivered.

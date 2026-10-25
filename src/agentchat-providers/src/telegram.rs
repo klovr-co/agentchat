@@ -726,64 +726,6 @@ pub fn text_payload(content: Option<&str>) -> Result<Value, &'static str> {
     }
     Ok(payload)
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn utf16_entities_and_mentions() {
-        let r = render("😀 **bold 😀**");
-        assert_eq!(
-            serde_json::to_value(&r.entities[0]).unwrap(),
-            json!({"type":"bold","offset":3,"length":7})
-        );
-        let a = strip_bot_address(
-            "😀 @bot hi",
-            &[json!({"type":"mention","offset":3,"length":4})],
-            1,
-            "bot",
-        );
-        assert!(a.is_addressed);
-        assert_eq!(a.text, "😀  hi");
-    }
-    #[test]
-    fn malformed_utf16_and_expanding_casefold_are_safe() {
-        let address = strip_bot_address(
-            "@İ",
-            &[json!({"type":"bot_command","offset":0,"length":2})],
-            1,
-            "İ",
-        );
-        assert!(address.is_addressed);
-        assert_eq!(address.text, "@İ");
-        let address = strip_bot_address(
-            "😀 @bot",
-            &[
-                json!({"type":"mention","offset":1,"length":1}),
-                json!({"type":"mention","offset":u64::MAX,"length":1}),
-            ],
-            1,
-            "bot",
-        );
-        assert!(!address.is_addressed);
-        assert_eq!(address.text, "😀 @bot");
-    }
-    #[test]
-    fn validated_routes_and_limits() {
-        assert_eq!(validate_config("99:abc", None, None).unwrap(), 99);
-        assert!(validate_config("99:abc", Some("http://x/webhooks/telegram"), Some("x")).is_err());
-        assert_eq!(truncate_caption(&"😀".repeat(600)), "😀".repeat(512));
-        assert!(text_payload(Some(&"😀".repeat(2049))).is_err());
-    }
-    #[test]
-    fn nested_markup() {
-        assert_eq!(render("**bold _it_ end**").text, "bold it end");
-        assert_eq!(render("snake_case_name").entities.len(), 0);
-        assert_eq!(
-            render("[**big** docs](https://x.y)").entities[0].kind,
-            EntityKind::TextLink
-        );
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotIdentity {
@@ -900,5 +842,124 @@ pub fn close_prompt_request(answered: Option<&str>) -> Result<(&'static str, Val
             "editMessageReplyMarkup",
             json!({"reply_markup": {"inline_keyboard": []}}),
         )),
+    }
+}
+
+/// Telegram streams drafts natively only in private chats; elsewhere the answer's
+/// message is sent once and then edited.
+pub fn streams_drafts(source: &Message) -> bool {
+    source.metadata.get("chat_type").and_then(Value::as_str) == Some("private")
+}
+
+/// A fresh draft ID: non-zero, and distinct for each answer so its updates animate.
+pub fn draft_id() -> i64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    // Kept within 31 bits so every client reads it exactly.
+    (hasher.finish() % (i32::MAX as u64)) as i64 + 1
+}
+
+/// `sendMessageDraft` showing `text` as a temporary preview. Blank text shows
+/// Telegram's "Thinking…" placeholder. The finished answer is sent with `sendMessage`.
+pub fn draft_payload(
+    destination: &Destination,
+    draft_id: i64,
+    text: &str,
+) -> Result<Value, &'static str> {
+    let mut payload = if text.trim().is_empty() {
+        json!({"text": ""})
+    } else {
+        let full = text_payload(Some(text))?;
+        let mut draft = json!({"text": full["text"]});
+        if let Some(entities) = full.get("entities") {
+            draft["entities"] = entities.clone();
+        }
+        draft
+    };
+    payload = destination.route(payload, false);
+    payload["draft_id"] = json!(draft_id);
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drafts_stream_in_private_chats_only() {
+        let destination = Destination {
+            chat_id: 30,
+            message_id: 7,
+            thread_id: Some(4),
+        };
+        let draft = draft_payload(&destination, 9, "**Hi**").unwrap();
+        assert_eq!(draft["chat_id"], 30);
+        assert_eq!(draft["draft_id"], 9);
+        assert_eq!(draft["message_thread_id"], 4);
+        assert_eq!(draft["text"], "Hi");
+        assert!(draft.get("entities").is_some());
+        assert!(draft.get("reply_parameters").is_none());
+        assert!(draft.get("link_preview_options").is_none());
+        assert_eq!(draft_payload(&destination, 9, " ").unwrap()["text"], "");
+        let ids: Vec<i64> = (0..50).map(|_| draft_id()).collect();
+        assert!(ids.iter().all(|id| (1..=i32::MAX as i64).contains(id)));
+        assert_ne!(ids[0], ids[1]);
+    }
+    #[test]
+    fn utf16_entities_and_mentions() {
+        let r = render("😀 **bold 😀**");
+        assert_eq!(
+            serde_json::to_value(&r.entities[0]).unwrap(),
+            json!({"type":"bold","offset":3,"length":7})
+        );
+        let a = strip_bot_address(
+            "😀 @bot hi",
+            &[json!({"type":"mention","offset":3,"length":4})],
+            1,
+            "bot",
+        );
+        assert!(a.is_addressed);
+        assert_eq!(a.text, "😀  hi");
+    }
+    #[test]
+    fn malformed_utf16_and_expanding_casefold_are_safe() {
+        let address = strip_bot_address(
+            "@İ",
+            &[json!({"type":"bot_command","offset":0,"length":2})],
+            1,
+            "İ",
+        );
+        assert!(address.is_addressed);
+        assert_eq!(address.text, "@İ");
+        let address = strip_bot_address(
+            "😀 @bot",
+            &[
+                json!({"type":"mention","offset":1,"length":1}),
+                json!({"type":"mention","offset":u64::MAX,"length":1}),
+            ],
+            1,
+            "bot",
+        );
+        assert!(!address.is_addressed);
+        assert_eq!(address.text, "😀 @bot");
+    }
+    #[test]
+    fn validated_routes_and_limits() {
+        assert_eq!(validate_config("99:abc", None, None).unwrap(), 99);
+        assert!(validate_config("99:abc", Some("http://x/webhooks/telegram"), Some("x")).is_err());
+        assert_eq!(truncate_caption(&"😀".repeat(600)), "😀".repeat(512));
+        assert!(text_payload(Some(&"😀".repeat(2049))).is_err());
+    }
+    #[test]
+    fn nested_markup() {
+        assert_eq!(render("**bold _it_ end**").text, "bold it end");
+        assert_eq!(render("snake_case_name").entities.len(), 0);
+        assert_eq!(
+            render("[**big** docs](https://x.y)").entities[0].kind,
+            EntityKind::TextLink
+        );
     }
 }
