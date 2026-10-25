@@ -4,6 +4,7 @@
 //! ordering policy while effects and user callbacks execute on their host loop.
 
 mod activity;
+mod app;
 mod channel;
 mod context;
 mod control;
@@ -17,6 +18,7 @@ mod stream;
 mod turn;
 
 pub use activity::WorkingStatus;
+pub use app::{command_of, Route};
 pub use channel::Channel;
 pub use context::{Conversation, MessageContext};
 pub use control::{is_stop_request, Allowed, Busy, TurnControl, STOP_METADATA};
@@ -31,6 +33,6 @@ pub use runtime::{AgentChat, AskOptions, Handler, Runtime, StopOptions};
 pub use state::{ConversationPermit, MemoryState, MemoryStore, State};
 pub use stream::{
     queue_plan, queue_task, stream_split, AnswerStream, StreamHandle, StreamOptions, StreamUpdate,
-    TaskStatus, TaskUpdate,
+    TaskBoard, TaskStatus, TaskUpdate,
 };
 pub use turn::{Turn, TurnEffect, TurnResult};

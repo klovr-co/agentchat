@@ -12,7 +12,6 @@
 use std::time::Duration;
 
 use agentchat_core::{Error, Message, Result, Role, Sender, STOP_METADATA};
-use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::events::nonempty;
@@ -23,21 +22,7 @@ use super::route::SlackTimestamp;
 /// handler that misses this is acknowledged without a body and keeps running.
 pub const ACK_DEADLINE: Duration = Duration::from_millis(2_500);
 
-/// Where an application payload is routed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Route {
-    /// An Events API event AgentChat did not turn into a message, by `event.type`.
-    Event { event_type: String },
-    /// A `block_actions` press that is not an AgentChat prompt answer.
-    Action { action_ids: Vec<String> },
-    /// A `view_submission` or `view_closed`, by the view's `callback_id`.
-    View { callback_id: String },
-    /// A slash command, such as `/deploy`.
-    Command { command: String },
-    /// Anything else, for example shortcuts and options requests.
-    Other,
-}
+pub use agentchat_core::Route;
 
 /// Classify an authenticated payload for the application's handlers.
 pub fn route(payload: &Value) -> Route {

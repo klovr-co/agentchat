@@ -1,7 +1,7 @@
 //! Python Discord SDK I/O driven by the native provider policy.
 use crate::prompts::PromptFields;
-use crate::{convert, host};
-use agentchat_core::Attachment;
+use crate::{apps, convert, host};
+use agentchat_core::{Attachment, TaskBoard};
 use agentchat_providers::discord as policy;
 use pyo3::{
     exceptions::{PyAttributeError, PyModuleNotFoundError, PyRuntimeError, PyValueError},
@@ -316,6 +316,8 @@ impl Discord {
                 }
                 let args = PyDict::new(py);
                 args.set_item("intents", intents)?;
+                // Raw gateway frames reach `on_event` handlers.
+                args.set_item("enable_debug_events", true)?;
                 args.set_item(
                     "allowed_mentions",
                     module.getattr("AllowedMentions")?.call_method0("none")?,
@@ -354,11 +356,248 @@ impl Discord {
             ._client
             .bind(py)
             .setattr("on_interaction", callback)?;
+        let callback = host::callback(py, slf.bind(py).getattr("_on_gateway")?.unbind())?;
+        slf.borrow(py)
+            ._client
+            .bind(py)
+            .setattr("on_socket_raw_receive", callback)?;
         Ok(())
     }
     #[classattr]
     fn name() -> &'static str {
         "discord"
+    }
+    /// Handle gateway events by type, such as "GUILD_CREATE" when the bot joins a
+    /// server. The handler receives the raw frame (`t`, `d`). Needs a client created
+    /// by this channel, or one with `enable_debug_events=True`.
+    fn on_event(slf: &Bound<'_, Self>, event_type: Py<PyAny>) -> Output {
+        apps::decorator(slf.as_any(), "event", event_type)
+    }
+    /// Handle component interactions (buttons, menus) whose `custom_id` matches. The
+    /// returned interaction response, such as `{"type": 9, "data": modal}` or
+    /// `{"type": 4, "data": {"content": ..., "flags": 64}}`, is sent as the reply.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Py<PyAny>) -> Output {
+        apps::decorator(slf.as_any(), "action", action_id)
+    }
+    /// Handle modal submissions whose `custom_id` matches; the return value is the
+    /// interaction response.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Py<PyAny>) -> Output {
+        apps::decorator(slf.as_any(), "view", callback_id)
+    }
+    /// Handle an application (slash) command such as "/deploy"; the return value
+    /// is the interaction response.
+    fn on_command(slf: &Bound<'_, Self>, command: Py<PyAny>) -> Output {
+        apps::decorator(slf.as_any(), "command", command)
+    }
+    /// Handle every other routed interaction or event, such as autocomplete.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> Output {
+        apps::raw(slf.as_any(), handler)
+    }
+    fn _on_gateway(slf: Py<Self>, py: Python<'_>, raw: Py<PyAny>) -> Output {
+        host::coroutine(py, async move {
+            Python::attach(|py| {
+                let channel = slf.bind(py);
+                if apps::event_types(channel.as_any())?.is_empty() {
+                    return Ok(py.None());
+                }
+                let raw = raw.bind(py);
+                let text = match raw.extract::<String>() {
+                    Ok(text) => text,
+                    Err(_) => return Ok(py.None()),
+                };
+                let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    return Ok(py.None());
+                };
+                let Some(kind) = policy::gateway_event(&frame) else {
+                    return Ok(py.None());
+                };
+                let route = agentchat_core::Route::Event {
+                    event_type: kind.into(),
+                };
+                if let Some(handler) = apps::find(channel.as_any(), &route)? {
+                    let this = slf.borrow(py);
+                    let payload = convert::from_json(py, &frame)?;
+                    apps::spawn(
+                        channel.as_any(),
+                        this._delivery.bind(py),
+                        &handler,
+                        &payload,
+                    )?;
+                }
+                Ok(py.None())
+            })
+        })
+    }
+    /// Run an interaction handler and send its response within Discord's three seconds.
+    fn _respond(slf: Py<Self>, py: Python<'_>, handler: Py<PyAny>, payload: Py<PyAny>) -> Output {
+        host::coroutine(py, async move {
+            let (delivery, sender, kind, id, token) = Python::attach(|py| -> PyResult<_> {
+                let this = slf.borrow(py);
+                let data = convert::to_json(payload.bind(py))?;
+                Ok((
+                    this._delivery.clone_ref(py),
+                    this._sender.clone_ref(py),
+                    data["type"].as_u64().unwrap_or_default(),
+                    data["id"].as_str().unwrap_or_default().to_owned(),
+                    data["token"].as_str().unwrap_or_default().to_owned(),
+                ))
+            })?;
+            let answer = apps::answer(delivery, handler, payload).await;
+            let body = match &answer {
+                Ok(body) => {
+                    Python::attach(|py| convert::to_json(body.bind(py))).unwrap_or_default()
+                }
+                Err(_) => serde_json::Value::Null,
+            };
+            let response = policy::interaction_response(kind, &body);
+            let call = Python::attach(|py| {
+                sender
+                    .bind(py)
+                    .call_method1(
+                        "interaction_callback",
+                        (id, token, convert::from_json(py, &response)?),
+                    )
+                    .map(Bound::unbind)
+            })?;
+            host::await_py(call).await?;
+            answer.map(|_| Python::attach(|py| py.None()))
+        })
+    }
+    /// A notice only `user_id` sees. Discord shows those only in reply to an
+    /// interaction, so return `{"type": 4, "data": {"content": ..., "flags": 64}}`
+    /// from an `on_action` or `on_command` handler instead. In a direct message
+    /// with that user, this is an ordinary reply; elsewhere it raises ValueError.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        user_id: String,
+        text: String,
+        blocks: Option<Py<PyAny>>,
+    ) -> Output {
+        let _ = blocks;
+        let message = convert::from_message(source.bind(py))?;
+        if !policy::private_reply_allowed(&message, &user_id) {
+            return Err(PyValueError::new_err(
+                "Discord shows private messages only in reply to an interaction: return \
+                 {'type': 4, 'data': {'content': ..., 'flags': 64}} from an on_action or \
+                 on_command handler",
+            ));
+        }
+        slf.bind(py)
+            .call_method1("reply", (source, text))
+            .map(Bound::unbind)
+    }
+    /// Delete a message this bot sent.
+    fn delete(slf: Py<Self>, py: Python<'_>, message: Py<PyAny>) -> Output {
+        let (path, sender) = {
+            let this = slf.borrow(py);
+            let bot = this._client.bind(py).getattr("user")?;
+            if bot.is_none() {
+                return Err(PyValueError::new_err(
+                    "Source does not belong to this Discord adapter",
+                ));
+            }
+            let message = convert::from_message(message.bind(py))?;
+            (
+                policy::delete_path(&message, bot.getattr("id")?.extract()?)
+                    .map_err(PyValueError::new_err)?,
+                this._sender.clone_ref(py),
+            )
+        };
+        Ok(sender.bind(py).call_method1("delete", (path,))?.unbind())
+    }
+    /// Show task progress as a separate reply, edited in place and deleted when the
+    /// answer is finished. A failed update never fails the answer.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        updates: Py<PyAny>,
+    ) -> Output {
+        host::coroutine(py, async move {
+            let updates: Vec<agentchat_core::StreamUpdate> =
+                serde_json::from_value(Python::attach(|py| convert::to_json(updates.bind(py)))?)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let mut handle = Python::attach(|py| {
+                if stream.is_none(py) {
+                    Ok(json!({}))
+                } else {
+                    convert::to_json(stream.bind(py))
+                }
+            })?;
+            let mut board: TaskBoard =
+                serde_json::from_value(handle["progress"]["board"].clone()).unwrap_or_default();
+            board.apply(&updates);
+            let text = board.render(1900);
+            if text.is_empty() || handle["post"] == true {
+                return Python::attach(|py| convert::from_json(py, &handle));
+            }
+            let progress = handle["progress"].clone();
+            let (destination, sender) =
+                Python::attach(|py| slf.borrow(py).stream_route(py, source.bind(py)))?;
+            let shown: PyResult<u64> = match progress["message_id"].as_u64() {
+                Some(id) if progress["shown"] == text.as_str() => Ok(id),
+                Some(id) => {
+                    let call = Python::attach(|py| {
+                        sender
+                            .bind(py)
+                            .call_method1(
+                                "edit_text",
+                                (
+                                    destination.channel_id,
+                                    id,
+                                    convert::from_json(
+                                        py,
+                                        &policy::Destination::edit_payload(&text, false),
+                                    )?,
+                                ),
+                            )
+                            .map(Bound::unbind)
+                    })?;
+                    host::await_py(call).await.map(|_| id)
+                }
+                None => {
+                    let call = Python::attach(|py| {
+                        sender
+                            .bind(py)
+                            .call_method1(
+                                "send_text",
+                                (
+                                    destination.channel_id,
+                                    convert::from_json(py, &destination.payload(&text))?,
+                                ),
+                            )
+                            .map(Bound::unbind)
+                    })?;
+                    match host::await_py(call).await {
+                        Ok(receipt) => Python::attach(|py| receipt.bind(py).extract::<u64>())
+                            .map_err(|_| PyRuntimeError::new_err("No message receipt")),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            match shown {
+                Ok(id) => {
+                    handle["progress"] = json!({"message_id": id, "board": board, "shown": text});
+                }
+                Err(error) => Python::attach(|py| -> PyResult<()> {
+                    py.import("logging")?
+                        .call_method1("getLogger", ("agentchat.channels.discord.adapter",))?
+                        .call_method1(
+                            "warning",
+                            (
+                                "Discord task progress update failed (%s)",
+                                error.to_string(),
+                            ),
+                        )?;
+                    Ok(())
+                })?,
+            }
+            Python::attach(|py| convert::from_json(py, &handle))
+        })
     }
     #[classmethod]
     fn from_env(cls: &Bound<'_, PyType>) -> Output {
@@ -527,6 +766,24 @@ impl Discord {
         text: String,
     ) -> Output {
         host::coroutine(py, async move {
+            let handle = Python::attach(|py| convert::to_json(stream.bind(py)))?;
+            if handle.get("message_id").is_none() && handle.get("progress").is_some() {
+                // Only task progress has been shown so far; the answer starts now.
+                if text.is_empty() {
+                    return Ok(stream);
+                }
+                let started = Python::attach(|py| {
+                    slf.bind(py)
+                        .call_method1("start_stream", (source.bind(py), &text))
+                        .map(Bound::unbind)
+                })?;
+                let started = host::await_py(started).await?;
+                return Python::attach(|py| {
+                    let mut started = convert::to_json(started.bind(py))?;
+                    started["progress"] = handle["progress"].clone();
+                    convert::from_json(py, &started)
+                });
+            }
             let (_, stream) = edit_streamed(&slf, &source, &stream, &text).await?;
             Ok(stream)
         })
@@ -539,30 +796,10 @@ impl Discord {
         text: String,
     ) -> Output {
         host::coroutine(py, async move {
-            policy::text_payload(&text).map_err(PyValueError::new_err)?;
-            let (Some(message_id), _) = edit_streamed(&slf, &source, &stream, &text).await? else {
-                let reply = Python::attach(|py| {
-                    slf.bind(py)
-                        .call_method1("reply", (source.bind(py), &text))
-                        .map(Bound::unbind)
-                })?;
-                return host::await_py(reply).await;
-            };
-            Python::attach(|py| {
-                let this = slf.borrow(py);
-                let (destination, _) = this.stream_route(py, source.bind(py))?;
-                let message = convert::from_message(source.bind(py))?;
-                let display_name = this
-                    ._client
-                    .bind(py)
-                    .getattr("user")?
-                    .getattr("display_name")?
-                    .extract::<Option<String>>()?;
-                let reply = destination
-                    .confirmed_reply(&message, text, message_id, display_name)
-                    .map_err(PyRuntimeError::new_err)?;
-                super::transport::receipt_with_metadata(&source, &reply)
-            })
+            let handle = Python::attach(|py| convert::to_json(stream.bind(py)))?;
+            let result = finish_stream(&slf, &source, &stream, &handle, text).await;
+            remove_progress(&slf, &source, &handle).await;
+            result
         })
     }
     /// Show "typing…" in the source channel until cleared with "" or the keeper expires.
@@ -606,6 +843,14 @@ impl Discord {
                     return Ok(None);
                 }
                 let event = interaction.bind(py);
+                // Other interactions go to the application's handlers, if any.
+                if slf
+                    .bind(py)
+                    .call_method1("_on_app_interaction", (event,))?
+                    .is_truthy()?
+                {
+                    return Ok(None);
+                }
                 let component = sdk(py)?.getattr("InteractionType")?.getattr("component")?;
                 if !event.getattr("type")?.eq(component)? {
                     return Ok(None);
@@ -632,6 +877,50 @@ impl Discord {
                 Ok(py.None())
             })
         })
+    }
+    /// Hand an interaction to the application's handler, if it has one; True when
+    /// handled. Prompt presses are never the application's.
+    fn _on_app_interaction(slf: &Bound<'_, Self>, event: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let py = slf.py();
+        let kind: u64 = event.getattr("type")?.getattr("value")?.extract()?;
+        let data = event.getattr("data")?;
+        let data = if data.is_none() {
+            serde_json::Value::Null
+        } else {
+            convert::to_json(&data)?
+        };
+        let Some(route) = policy::interaction_route(kind, &data) else {
+            return Ok(false);
+        };
+        let Some(handler) = apps::find(slf.as_any(), &route)? else {
+            return Ok(false);
+        };
+        let text = |value: Bound<'_, PyAny>| -> PyResult<serde_json::Value> {
+            Ok(if value.is_none() {
+                serde_json::Value::Null
+            } else {
+                json!(value.str()?.to_string())
+            })
+        };
+        let user = event.getattr("user")?;
+        let message = event.getattr("message")?;
+        let payload = json!({
+            "id": text(event.getattr("id")?)?,
+            "type": kind,
+            "token": event.getattr("token")?.extract::<String>()?,
+            "application_id": text(event.getattr("application_id")?)?,
+            "guild_id": text(event.getattr("guild_id")?)?,
+            "channel_id": text(event.getattr("channel_id")?)?,
+            "user": {"id": text(user.getattr("id")?)?, "name": text(user.getattr("name")?)?},
+            "message": if message.is_none() { serde_json::Value::Null } else { json!({"id": text(message.getattr("id")?)?}) },
+            "data": data,
+        });
+        let pending = slf.call_method1("_respond", (handler, convert::from_json(py, &payload)?))?;
+        let this = slf.borrow();
+        this._delivery
+            .bind(py)
+            .call_method1("spawn", (slf, pending))?;
+        Ok(true)
     }
     /// Show a prompt as a reply with one button per choice.
     fn send_prompt(slf: Py<Self>, py: Python<'_>, source: Py<PyAny>, prompt: Py<PyAny>) -> Output {
@@ -768,6 +1057,72 @@ impl Discord {
             })
         })
     }
+}
+/// Delete the task progress reply once the answer is finished; best effort.
+async fn remove_progress(slf: &Py<Discord>, source: &Py<PyAny>, handle: &serde_json::Value) {
+    let Some(id) = handle["progress"]["message_id"].as_u64() else {
+        return;
+    };
+    let call = Python::attach(|py| -> PyResult<Py<PyAny>> {
+        let (destination, sender) = slf.borrow(py).stream_route(py, source.bind(py))?;
+        Ok(sender
+            .bind(py)
+            .call_method1(
+                "delete",
+                (format!("channels/{}/messages/{id}", destination.channel_id),),
+            )?
+            .unbind())
+    });
+    if let Ok(call) = call {
+        let _ = host::await_py(call).await;
+    }
+}
+/// Finish a streamed answer and confirm it. A stream that only showed task
+/// progress is confirmed without text.
+async fn finish_stream(
+    slf: &Py<Discord>,
+    source: &Py<PyAny>,
+    stream: &Py<PyAny>,
+    handle: &serde_json::Value,
+    text: String,
+) -> Output {
+    if handle.get("message_id").is_none() && text.trim().is_empty() {
+        if let Some(progress) = handle["progress"]["message_id"].as_u64() {
+            return Python::attach(|py| {
+                let this = slf.borrow(py);
+                let (destination, _) = this.stream_route(py, source.bind(py))?;
+                let message = convert::from_message(source.bind(py))?;
+                let reply = destination
+                    .confirmed_reply(&message, String::new(), progress, None)
+                    .map_err(PyRuntimeError::new_err)?;
+                super::transport::receipt_with_metadata(source, &reply)
+            });
+        }
+    }
+    policy::text_payload(&text).map_err(PyValueError::new_err)?;
+    let (Some(message_id), _) = edit_streamed(slf, source, stream, &text).await? else {
+        let reply = Python::attach(|py| {
+            slf.bind(py)
+                .call_method1("reply", (source.bind(py), &text))
+                .map(Bound::unbind)
+        })?;
+        return host::await_py(reply).await;
+    };
+    Python::attach(|py| {
+        let this = slf.borrow(py);
+        let (destination, _) = this.stream_route(py, source.bind(py))?;
+        let message = convert::from_message(source.bind(py))?;
+        let display_name = this
+            ._client
+            .bind(py)
+            .getattr("user")?
+            .getattr("display_name")?
+            .extract::<Option<String>>()?;
+        let reply = destination
+            .confirmed_reply(&message, text, message_id, display_name)
+            .map_err(PyRuntimeError::new_err)?;
+        super::transport::receipt_with_metadata(source, &reply)
+    })
 }
 /// A streamed message's ID, the edit to await (None when unchanged), and the next handle.
 type StreamEdit = (u64, Option<Py<PyAny>>, Py<PyAny>);
@@ -951,6 +1306,55 @@ impl DiscordRESTClient {
             rest_request(&slf, "patch", "edit", &path, Some(payload))
                 .await
                 .map_err(uncertain_delivery)?;
+            Ok(Python::attach(|py| py.None()))
+        })
+    }
+    /// Respond to an interaction (`POST /interactions/{id}/{token}/callback`).
+    fn interaction_callback(
+        slf: Py<Self>,
+        py: Python<'_>,
+        interaction_id: String,
+        token: String,
+        payload: Py<PyAny>,
+    ) -> Output {
+        host::coroutine(py, async move {
+            if !interaction_id.bytes().all(|c| c.is_ascii_digit())
+                || token.is_empty()
+                || !token
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+            {
+                return Err(PyValueError::new_err("Expected a Discord interaction"));
+            }
+            rest_request(
+                &slf,
+                "post",
+                "interaction response",
+                &format!("interactions/{interaction_id}/{token}/callback"),
+                Some(payload),
+            )
+            .await
+            .map_err(uncertain_delivery)?;
+            Ok(Python::attach(|py| py.None()))
+        })
+    }
+    /// Delete a message (`DELETE channels/{channel}/messages/{message}`).
+    fn delete(slf: Py<Self>, py: Python<'_>, path: String) -> Output {
+        host::coroutine(py, async move {
+            let valid = path
+                .strip_prefix("channels/")
+                .and_then(|rest| rest.split_once("/messages/"))
+                .is_some_and(|(channel, message)| {
+                    [channel, message]
+                        .iter()
+                        .all(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))
+                });
+            if !valid {
+                return Err(PyValueError::new_err(
+                    "Expected a Discord message to delete",
+                ));
+            }
+            rest_request(&slf, "delete", "delete", &path, None).await?;
             Ok(Python::attach(|py| py.None()))
         })
     }

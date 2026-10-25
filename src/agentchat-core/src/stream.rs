@@ -98,6 +98,90 @@ pub enum StreamUpdate {
     Task(TaskUpdate),
 }
 
+/// The latest state of a stream's plan and tasks, for channels that show progress
+/// as an ordinary message they edit: updates are applied in order and rendered as
+/// a short checklist.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBoard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<TaskUpdate>,
+}
+
+impl TaskBoard {
+    /// Most tasks shown; the oldest finished ones give way to newer ones.
+    pub const MAX_TASKS: usize = 20;
+
+    /// Apply updates in order. A task keeps its position; its latest title and
+    /// status replace the old ones and its latest output is shown.
+    pub fn apply(&mut self, updates: &[StreamUpdate]) {
+        for update in updates {
+            match update {
+                StreamUpdate::Plan { title } => self.plan = Some(title.clone()),
+                StreamUpdate::Task(task) => {
+                    match self.tasks.iter_mut().find(|known| known.id == task.id) {
+                        Some(known) => {
+                            known.title = task.title.clone();
+                            known.status = task.status;
+                            if task.output.is_some() {
+                                known.output = task.output.clone();
+                            }
+                        }
+                        None => self.tasks.push(TaskUpdate {
+                            details: None,
+                            ..task.clone()
+                        }),
+                    }
+                }
+            }
+        }
+        while self.tasks.len() > Self::MAX_TASKS {
+            let index = self
+                .tasks
+                .iter()
+                .position(|task| matches!(task.status, TaskStatus::Complete | TaskStatus::Error))
+                .unwrap_or(0);
+            self.tasks.remove(index);
+        }
+    }
+
+    /// One line per task under the plan's title, in Markdown, at most `limit`
+    /// characters; empty when there is nothing to show.
+    pub fn render(&self, limit: usize) -> String {
+        let mut lines = Vec::new();
+        if let Some(plan) = &self.plan {
+            lines.push(format!("**{}**", plan.trim()));
+        }
+        for task in &self.tasks {
+            let mark = match task.status {
+                TaskStatus::Pending => "▫️",
+                TaskStatus::InProgress => "⏳",
+                TaskStatus::Complete => "✅",
+                TaskStatus::Error => "❌",
+            };
+            let mut line = format!("{mark} {}", task.title.trim());
+            if let Some(output) = task
+                .output
+                .as_deref()
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+            {
+                line.push_str(" — ");
+                line.push_str(output.lines().next().unwrap_or_default());
+            }
+            lines.push(line);
+        }
+        let text = lines.join("\n");
+        if text.chars().count() <= limit {
+            return text;
+        }
+        let mut cut: String = text.chars().take(limit.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
 /// Add a task update to the unsent ones. An update without new details or output
 /// replaces an unsent one for the same task; details and output add text, so
 /// those updates are kept in order.
@@ -369,7 +453,10 @@ impl AnswerStream {
         self.handle = Some(handle.clone());
         let message = self.channel.stop_stream(&self.source, handle, text).await?;
         self.handle = None;
-        self.app.state().append(message.clone()).await?;
+        // A message that only showed task progress has no text for history.
+        if !text.trim().is_empty() {
+            self.app.state().append(message.clone()).await?;
+        }
         self.offset += text.len();
         self.messages.push(message);
         Ok(())
@@ -379,6 +466,36 @@ impl AnswerStream {
 #[cfg(test)]
 mod tests {
     use super::stream_split as split_at;
+    use super::{StreamUpdate, TaskBoard, TaskStatus, TaskUpdate};
+
+    #[test]
+    fn task_boards_keep_positions_and_render_a_checklist() {
+        let mut board = TaskBoard::default();
+        board.apply(&[
+            StreamUpdate::Plan {
+                title: "Fix the build".into(),
+            },
+            StreamUpdate::Task(TaskUpdate::new("a", "Read logs", TaskStatus::InProgress)),
+            StreamUpdate::Task(TaskUpdate::new("b", "Patch", TaskStatus::Pending)),
+        ]);
+        let mut done = TaskUpdate::new("a", "Read logs", TaskStatus::Complete);
+        done.output = Some("1 error\nmore".into());
+        board.apply(&[StreamUpdate::Task(done)]);
+        assert_eq!(
+            board.render(1000),
+            "**Fix the build**\n✅ Read logs — 1 error\n▫️ Patch"
+        );
+        assert_eq!(board.render(5).chars().count(), 5);
+        for index in 0..30 {
+            board.apply(&[StreamUpdate::Task(TaskUpdate::new(
+                format!("t{index}"),
+                "Step",
+                TaskStatus::Complete,
+            ))]);
+        }
+        assert_eq!(board.tasks.len(), TaskBoard::MAX_TASKS);
+        assert_eq!(board.tasks[0].id, "b");
+    }
 
     #[test]
     fn splits_at_a_late_break_or_the_limit() {

@@ -12,6 +12,7 @@ use pyo3::types::{PyDict, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
 mod activity;
+mod apps;
 mod control;
 mod convert;
 mod delivery;
@@ -183,6 +184,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     host::register(module)?;
     providers::slack_socket::register(module)?;
     delivery::register(module)?;
+    apps::register(module)?;
     state::register(module)?;
     integrations::register(module)?;
     activity::register(module)?;

@@ -124,6 +124,53 @@ impl DeliveryTasks {
         )?;
         Ok(true)
     }
+    /// Run an application handler's awaitable as accepted work: bounded like
+    /// messages, logged on failure and drained by `close()`. False when closed or full.
+    fn spawn(&self, py: Python<'_>, channel: Py<PyAny>, awaitable: Py<PyAny>) -> PyResult<bool> {
+        if self.closed || self.tasks.bind(py).len() >= self.limit {
+            return Ok(false);
+        }
+        let future = coroutine(py, async move {
+            if let Err(error) = await_py(awaitable).await {
+                Python::attach(|py| -> PyResult<()> {
+                    if !error.is_instance_of::<PyException>(py) {
+                        return Err(error);
+                    }
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item(
+                        "exc_info",
+                        (error.get_type(py), error.value(py), error.traceback(py)),
+                    )?;
+                    py.import("logging")?
+                        .call_method1("getLogger", ("agentchat._delivery",))?
+                        .call_method(
+                            "error",
+                            ("%s handler failed", channel.bind(py).getattr("name")?),
+                            Some(&kwargs),
+                        )?;
+                    Ok(())
+                })?;
+            }
+            Ok(Python::attach(|py| py.None()))
+        })?;
+        self.track(
+            py,
+            py.import("asyncio")?
+                .call_method1("create_task", (future,))?
+                .unbind(),
+        )?;
+        Ok(true)
+    }
+    /// Drain an already running task on `close()`, whatever the limit.
+    fn track(&self, py: Python<'_>, task: Py<PyAny>) -> PyResult<()> {
+        let task = task.bind(py);
+        self.tasks.bind(py).add(task)?;
+        task.call_method1(
+            "add_done_callback",
+            (self.tasks.bind(py).getattr("discard")?,),
+        )?;
+        Ok(())
+    }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         let Some(state) = &self.inner else {
             return Ok(());

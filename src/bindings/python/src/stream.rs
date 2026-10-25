@@ -263,8 +263,19 @@ async fn confirm(
     message: Object,
     bytes: usize,
 ) -> PyResult<()> {
-    let state = Python::attach(|py| app.bind(py).getattr("state").map(Bound::unbind))?;
-    call(state, "append", vec![copy(&message)], vec![]).await?;
+    // A message that only showed task progress has no text for history.
+    let text = Python::attach(|py| -> PyResult<bool> {
+        Ok(!message
+            .bind(py)
+            .getattr("text")?
+            .extract::<String>()?
+            .trim()
+            .is_empty())
+    })?;
+    if text {
+        let state = Python::attach(|py| app.bind(py).getattr("state").map(Bound::unbind))?;
+        call(state, "append", vec![copy(&message)], vec![]).await?;
+    }
     Python::attach(|py| {
         let mut this = slf.borrow_mut(py);
         this.offset += bytes;

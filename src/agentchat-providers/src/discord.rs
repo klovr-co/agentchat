@@ -232,8 +232,123 @@ pub fn receipt(response: &Value) -> Result<u64, &'static str> {
         .filter(|id| *id > 0)
         .ok_or("Discord did not return a message receipt")
 }
+/// Interaction types, from Discord's interaction object.
+pub const APPLICATION_COMMAND: u64 = 2;
+pub const MESSAGE_COMPONENT: u64 = 3;
+pub const AUTOCOMPLETE: u64 = 4;
+pub const MODAL_SUBMIT: u64 = 5;
+
+/// Where an interaction goes: a component press that is not a prompt answer is an
+/// action (by `custom_id`), a modal submission a view (by `custom_id`), an
+/// application command a command (`/name`), and autocomplete anything else.
+pub fn interaction_route(kind: u64, data: &Value) -> Option<agentchat_core::Route> {
+    use agentchat_core::Route;
+    let custom_id = || data["custom_id"].as_str().filter(|id| !id.is_empty());
+    match kind {
+        MESSAGE_COMPONENT => {
+            let id = custom_id()?;
+            if agentchat_core::answer_metadata(id).is_some() {
+                return None;
+            }
+            Some(Route::Action {
+                action_ids: vec![id.into()],
+            })
+        }
+        MODAL_SUBMIT => Some(Route::View {
+            callback_id: custom_id()?.into(),
+        }),
+        APPLICATION_COMMAND => Some(Route::Command {
+            command: format!("/{}", data["name"].as_str().filter(|n| !n.is_empty())?),
+        }),
+        AUTOCOMPLETE => Some(Route::Other),
+        _ => None,
+    }
+}
+
+/// The interaction response to send: the handler's answer when it is a response
+/// object (it has a `type`), otherwise an acknowledgement that shows nothing new.
+/// Commands get a private "thinking" state the handler can follow up on.
+pub fn interaction_response(kind: u64, answer: &Value) -> Value {
+    if answer.get("type").and_then(Value::as_u64).is_some() {
+        return answer.clone();
+    }
+    match kind {
+        APPLICATION_COMMAND => json!({"type": 5, "data": {"flags": 64}}),
+        AUTOCOMPLETE => json!({"type": 8, "data": {"choices": []}}),
+        _ => json!({"type": 6}),
+    }
+}
+
+/// A dispatched gateway event (opcode 0) as its type and the raw frame.
+pub fn gateway_event(frame: &Value) -> Option<&str> {
+    if frame["op"] != 0 {
+        return None;
+    }
+    frame["t"].as_str().filter(|t| !t.is_empty())
+}
+
+/// The REST path that deletes a message this bot sent.
+pub fn delete_path(message: &Message, bot_id: u64) -> Result<String, &'static str> {
+    let destination = Destination::from_source(message, bot_id)?;
+    Ok(format!(
+        "channels/{}/messages/{}",
+        destination.channel_id, destination.message_id
+    ))
+}
+
+/// Whether a notice for `user_id` can be an ordinary reply: only in a direct
+/// message with that user, where every message is already private.
+pub fn private_reply_allowed(source: &Message, user_id: &str) -> bool {
+    source.metadata.get("guild_id").is_none_or(Value::is_null) && source.sender.id == user_id
+}
+
 #[cfg(test)]
 mod tests {
+    use agentchat_core::Route;
+
+    #[test]
+    fn interactions_route_by_type_and_get_a_response() {
+        assert_eq!(
+            interaction_route(MESSAGE_COMPONENT, &json!({"custom_id": "retry"})),
+            Some(Route::Action {
+                action_ids: vec!["retry".into()]
+            })
+        );
+        let token = agentchat_core::prompt_token("0123456789abcdef", "yes").unwrap();
+        assert_eq!(
+            interaction_route(MESSAGE_COMPONENT, &json!({"custom_id": token})),
+            None
+        );
+        assert_eq!(
+            interaction_route(MODAL_SUBMIT, &json!({"custom_id": "settings"})),
+            Some(Route::View {
+                callback_id: "settings".into()
+            })
+        );
+        assert_eq!(
+            interaction_route(APPLICATION_COMMAND, &json!({"name": "deploy"})),
+            Some(Route::Command {
+                command: "/deploy".into()
+            })
+        );
+        assert_eq!(interaction_route(1, &json!({})), None);
+        let modal = json!({"type": 9, "data": {"custom_id": "m"}});
+        assert_eq!(interaction_response(MESSAGE_COMPONENT, &modal), modal);
+        assert_eq!(
+            interaction_response(MESSAGE_COMPONENT, &Value::Null),
+            json!({"type": 6})
+        );
+        assert_eq!(
+            interaction_response(APPLICATION_COMMAND, &json!({"text": "x"}))["type"],
+            5
+        );
+        assert_eq!(
+            gateway_event(&json!({"op": 0, "t": "GUILD_CREATE"})),
+            Some("GUILD_CREATE")
+        );
+        assert_eq!(gateway_event(&json!({"op": 11})), None);
+    }
+
     use super::*;
     #[test]
     fn text_uses_utf16() {
