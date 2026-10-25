@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use agentchat_core::{
     Allowed, AnswerStream, AskOptions, Attachment, Busy, Channel, Choice, ConversationId,
-    Error as CoreError, Message, RichReply, Runtime, StopOptions, TurnControl, UploadFile,
+    Error as CoreError, Message, RichReply, Runtime, StopOptions, TaskStatus, TaskUpdate,
+    TurnControl, UploadFile,
 };
-use agentchat_slack::{Slack, SlackConfig};
+use agentchat_slack::{interaction, Slack, SlackConfig, ViewTarget};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
@@ -19,6 +20,16 @@ type Handler = ThreadsafeFunction<
     FnArgs<(u32, String, u32)>,
     Promise<Option<String>>,
     FnArgs<(u32, String, u32)>,
+    Status,
+    false,
+>;
+
+/// The application's Slack handlers: `(channelIndex, {"route", "payload"} JSON)`,
+/// resolving to the acknowledgement body as JSON, or null.
+type AppHandler = ThreadsafeFunction<
+    FnArgs<(u32, String)>,
+    Promise<Option<String>>,
+    FnArgs<(u32, String)>,
     Status,
     false,
 >;
@@ -83,6 +94,8 @@ struct SlackOptions {
     max_pending_events: Option<usize>,
     shutdown_timeout_ms: Option<u64>,
     api_base_url: Option<String>,
+    #[serde(default)]
+    agent_sessions: bool,
 }
 
 fn default_ack_emoji() -> Option<String> {
@@ -171,6 +184,42 @@ impl NativeAnswerStream {
             .await
             .map_err(native_error)
     }
+
+    /// Show a task's progress with the answer: status is "pending", "in_progress",
+    /// "complete" or "error".
+    #[napi]
+    pub async fn task(
+        &self,
+        id: String,
+        title: String,
+        status: String,
+        details: Option<String>,
+        output: Option<String>,
+    ) -> napi::Result<()> {
+        let status: TaskStatus = status.parse().map_err(native_error)?;
+        let update = TaskUpdate {
+            id,
+            title,
+            status,
+            details,
+            output,
+        };
+        let mut stream = self.inner.lock().await;
+        self.slack
+            .with_admitted_source(&self.source, stream.task(update))
+            .await
+            .map_err(native_error)
+    }
+
+    /// Group the answer's tasks under a plan with `title`.
+    #[napi]
+    pub async fn plan(&self, title: String) -> napi::Result<()> {
+        let mut stream = self.inner.lock().await;
+        self.slack
+            .with_admitted_source(&self.source, stream.plan(&title))
+            .await
+            .map_err(native_error)
+    }
 }
 
 #[napi]
@@ -215,6 +264,7 @@ impl NativeAgentChat {
                 if let Some(url) = options.api_base_url {
                     config.api_base_url = url;
                 }
+                config.agent_sessions = options.agent_sessions;
                 Slack::new(config).map(Arc::new).map_err(native_error)
             })
             .collect::<napi::Result<Vec<_>>>()?;
@@ -231,17 +281,54 @@ impl NativeAgentChat {
     }
 
     #[napi(
-        ts_args_type = "handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>"
+        ts_args_type = "handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>, appHandler?: (channelIndex: number, routedJson: string) => Promise<string | null>"
     )]
-    pub async fn run(&self, handler: Arc<Handler>) -> napi::Result<()> {
+    pub async fn run(
+        &self,
+        handler: Arc<Handler>,
+        app_handler: Option<Arc<AppHandler>>,
+    ) -> napi::Result<()> {
         if self.closing.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
             return Err(native_error("AgentChat is closed"));
         }
         if self.running.swap(true, Ordering::AcqRel) {
             return Err(native_error("AgentChat is already running"));
         }
+        // The JavaScript callback must not outlive `run`, or it keeps Node alive.
+        struct ClearHandlers<'a>(&'a [Arc<Slack>]);
+        impl Drop for ClearHandlers<'_> {
+            fn drop(&mut self) {
+                for slack in self.0 {
+                    slack.clear_handlers();
+                }
+            }
+        }
+        let _clear = ClearHandlers(&self.channels);
         let mut tasks = JoinSet::new();
         for (index, slack) in self.channels.iter().enumerate() {
+            if let Some(app_handler) = &app_handler {
+                // JavaScript matches its handlers; the route comes from the provider.
+                let app_handler = Arc::clone(app_handler);
+                slack.on_raw(move |payload| {
+                    let app_handler = Arc::clone(&app_handler);
+                    async move {
+                        let routed = serde_json::json!({
+                            "route": interaction::route(&payload),
+                            "payload": payload,
+                        });
+                        let promise = app_handler
+                            .call_async_catch((index as u32, routed.to_string()).into())
+                            .await
+                            .map_err(|e| CoreError::Handler(e.to_string()))?;
+                        let body = promise
+                            .await
+                            .map_err(|e| CoreError::Handler(e.to_string()))?;
+                        body.map(|json| serde_json::from_str(&json))
+                            .transpose()
+                            .map_err(|e| CoreError::Handler(e.to_string()))
+                    }
+                });
+            }
             let slack = Arc::clone(slack);
             let runtime = Arc::clone(&self.runtime);
             let handler = Arc::clone(&handler);
@@ -678,6 +765,111 @@ impl NativeAgentChat {
             .await
             .map_err(native_error)?;
         encode_message(&mirrored)
+    }
+}
+
+#[napi]
+impl NativeAgentChat {
+    /// Post a notice only `userId` can see; the sent message as JSON.
+    #[napi]
+    pub async fn send_ephemeral(
+        &self,
+        channel_index: u32,
+        source_json: String,
+        user_id: String,
+        content_json: String,
+    ) -> napi::Result<String> {
+        let source = decode_message(&source_json)?;
+        let content: RichReply = serde_json::from_str(&content_json).map_err(native_error)?;
+        let slack = self.channel(channel_index)?;
+        let channel: Arc<dyn Channel> = slack.clone();
+        let sent = slack
+            .with_admitted_source(
+                &source,
+                self.runtime
+                    .send_ephemeral(channel, &source, &user_id, &content),
+            )
+            .await
+            .map_err(native_error)?;
+        encode_message(&sent)
+    }
+
+    /// Delete a message this app sent.
+    #[napi]
+    pub async fn delete_message(
+        &self,
+        channel_index: u32,
+        message_json: String,
+    ) -> napi::Result<()> {
+        let message = decode_message(&message_json)?;
+        let slack = self.channel(channel_index)?;
+        let channel: Arc<dyn Channel> = slack.clone();
+        self.runtime
+            .delete(channel, &message)
+            .await
+            .map_err(native_error)
+    }
+
+    /// `views.open` (`push` false) or `views.push`; the view as JSON.
+    #[napi]
+    pub async fn open_view(
+        &self,
+        channel_index: u32,
+        trigger_id: String,
+        view_json: String,
+        push: bool,
+    ) -> napi::Result<String> {
+        let view: serde_json::Value = serde_json::from_str(&view_json).map_err(native_error)?;
+        let slack = self.channel(channel_index)?;
+        let opened = if push {
+            slack.push_view(&trigger_id, &view).await
+        } else {
+            slack.open_view(&trigger_id, &view).await
+        }
+        .map_err(native_error)?;
+        Ok(opened.to_string())
+    }
+
+    /// `views.update` by `viewId` or `externalId`; the view as JSON.
+    #[napi]
+    pub async fn update_view(
+        &self,
+        channel_index: u32,
+        view_json: String,
+        view_id: Option<String>,
+        external_id: Option<String>,
+        hash: Option<String>,
+    ) -> napi::Result<String> {
+        let view: serde_json::Value = serde_json::from_str(&view_json).map_err(native_error)?;
+        let target = match (view_id, external_id) {
+            (Some(id), None) => ViewTarget::Id(id),
+            (None, Some(id)) => ViewTarget::External(id),
+            _ => return Err(native_error("Pass exactly one of viewId or externalId")),
+        };
+        let slack = self.channel(channel_index)?;
+        let updated = slack
+            .update_view(&view, &target, hash.as_deref())
+            .await
+            .map_err(native_error)?;
+        Ok(updated.to_string())
+    }
+
+    /// `views.publish` of a user's App Home; the view as JSON.
+    #[napi]
+    pub async fn publish_home(
+        &self,
+        channel_index: u32,
+        user_id: String,
+        view_json: String,
+        hash: Option<String>,
+    ) -> napi::Result<String> {
+        let view: serde_json::Value = serde_json::from_str(&view_json).map_err(native_error)?;
+        let slack = self.channel(channel_index)?;
+        let published = slack
+            .publish_home(&user_id, &view, hash.as_deref())
+            .await
+            .map_err(native_error)?;
+        Ok(published.to_string())
     }
 }
 

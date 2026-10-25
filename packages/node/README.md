@@ -51,7 +51,20 @@ the sender's press by default (`allowed` widens it), and rejects with a
 `TimeoutError` when nobody answers. `context.stream()` shows the answer with
 Slack's native stream in threads and posts it once elsewhere; call `finish()`,
 or `abort()` on failure, and return `null`. Button presses need **Interactivity**
-turned on in the Slack app. See [Live controls](../../docs/live-controls.md).
+turned on in the Slack app. `reply.task(id, title, status)` and `reply.plan(title)`
+show progress in the stream. Slack's native stop button stops the turn of the
+person who started it. See [Live controls](../../docs/live-controls.md).
+
+Every other Slack payload reaches handlers on the `Slack` channel:
+`slack.onEvent("app_home_opened", handler)`, `onAction(id | RegExp)`,
+`onView(callbackId | RegExp)` (a submission's return value, such as
+`{ response_action: "errors", errors }`, is the acknowledgement), `onCommand` and
+`onRaw`. Handlers receive the raw payload. `slack.openView(triggerId, view)`,
+`pushView`, `updateView`, `publishHome`, `sendEphemeral`, `delete` and
+`context.replyEphemeral(text)` call Slack once and reject with its error; they
+need the `AgentChat` the channel belongs to. `agentSessions: true` reports status
+through Slack agent sessions. See
+[Slack app features](../../docs/slack.md#slack-app-features).
 
 Native metadata is portable JSON. Node handlers execute on Node's event loop;
 provider I/O and per-conversation ordering run in Rust. Different conversations

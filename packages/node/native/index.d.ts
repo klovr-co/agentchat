@@ -11,7 +11,7 @@ export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-was
 
 export declare class NativeAgentChat {
   constructor(channelsJson: string, busy?: string | undefined | null)
-  run(handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>): Promise<void>
+  run(handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>, appHandler?: (channelIndex: number, routedJson: string) => Promise<string | null>): Promise<void>
   close(): Promise<void>
   reply(channelIndex: number, sourceJson: string, text: string): Promise<string>
   history(conversationId: string, limit?: number | undefined | null): Promise<string>
@@ -35,6 +35,16 @@ export declare class NativeAgentChat {
   offerStop(channelIndex: number, sourceJson: string, turnId: number, text: string, label: string, allowedJson?: string | undefined | null): Promise<string | null>
   stream(channelIndex: number, sourceJson: string, intervalMs?: number | undefined | null): NativeAnswerStream
   mirror(channelIndex: number, sourceJson: string, messageJson: string, origin: string): Promise<string>
+  /** Post a notice only `userId` can see; the sent message as JSON. */
+  sendEphemeral(channelIndex: number, sourceJson: string, userId: string, contentJson: string): Promise<string>
+  /** Delete a message this app sent. */
+  deleteMessage(channelIndex: number, messageJson: string): Promise<void>
+  /** `views.open` (`push` false) or `views.push`; the view as JSON. */
+  openView(channelIndex: number, triggerId: string, viewJson: string, push: boolean): Promise<string>
+  /** `views.update` by `viewId` or `externalId`; the view as JSON. */
+  updateView(channelIndex: number, viewJson: string, viewId?: string | undefined | null, externalId?: string | undefined | null, hash?: string | undefined | null): Promise<string>
+  /** `views.publish` of a user's App Home; the view as JSON. */
+  publishHome(channelIndex: number, userId: string, viewJson: string, hash?: string | undefined | null): Promise<string>
 }
 
 export declare class NativeAnswerStream {
@@ -42,6 +52,13 @@ export declare class NativeAnswerStream {
   /** Returns the confirmed messages as JSON. */
   finish(): Promise<string>
   abort(): Promise<void>
+  /**
+   * Show a task's progress with the answer: status is "pending", "in_progress",
+   * "complete" or "error".
+   */
+  task(id: string, title: string, status: string, details?: string | undefined | null, output?: string | undefined | null): Promise<void>
+  /** Group the answer's tasks under a plan with `title`. */
+  plan(title: string): Promise<void>
 }
 
 export declare class NativeWorkingStatus {
