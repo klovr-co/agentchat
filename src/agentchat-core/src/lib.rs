@@ -19,7 +19,7 @@ mod turn;
 pub use activity::WorkingStatus;
 pub use channel::Channel;
 pub use context::{Conversation, MessageContext};
-pub use control::{Allowed, Busy, TurnControl};
+pub use control::{is_stop_request, Allowed, Busy, TurnControl, STOP_METADATA};
 pub use error::{Error, Result};
 pub use history::{select_history, thread_history_indices, HistoryLimit};
 pub use models::*;
@@ -29,5 +29,8 @@ pub use prompt::{
 };
 pub use runtime::{AgentChat, AskOptions, Handler, Runtime, StopOptions};
 pub use state::{ConversationPermit, MemoryState, MemoryStore, State};
-pub use stream::{stream_split, AnswerStream, StreamHandle, StreamOptions};
+pub use stream::{
+    queue_plan, queue_task, stream_split, AnswerStream, StreamHandle, StreamOptions, StreamUpdate,
+    TaskStatus, TaskUpdate,
+};
 pub use turn::{Turn, TurnEffect, TurnResult};

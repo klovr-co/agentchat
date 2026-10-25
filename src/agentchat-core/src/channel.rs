@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::{
     Answer, Attachment, DownloadedFile, Error, Message, Prompt, Result, RichReply, StreamHandle,
-    StreamOptions, UploadFile, UploadedFile,
+    StreamOptions, StreamUpdate, UploadFile, UploadedFile,
 };
 
 /// A transport returns a message only after provider confirmation.
@@ -90,6 +90,40 @@ pub trait Channel: Send + Sync {
         _text: &str,
     ) -> Result<Message> {
         Err(Error::Unsupported("streaming"))
+    }
+
+    /// Whether streamed answers show task and plan updates. Channels that return
+    /// false ignore `AnswerStream::task` and `AnswerStream::plan`.
+    fn stream_tasks(&self) -> bool {
+        false
+    }
+
+    /// Show task and plan updates with a streamed answer: start the stream with
+    /// them when `stream` is `None`, otherwise add them to it. Returns the handle
+    /// to use next. A channel may drop updates its stream can no longer show.
+    async fn update_stream_tasks(
+        &self,
+        _source: &Message,
+        _stream: Option<StreamHandle>,
+        _updates: &[StreamUpdate],
+    ) -> Result<StreamHandle> {
+        Err(Error::Unsupported("task updates"))
+    }
+
+    /// Post a notice in the source conversation that only `user_id` can see.
+    /// Channels without private notices must fail rather than post publicly.
+    async fn send_ephemeral(
+        &self,
+        _source: &Message,
+        _user_id: &str,
+        _content: &RichReply,
+    ) -> Result<Message> {
+        Err(Error::Unsupported("ephemeral messages"))
+    }
+
+    /// Delete a message this application sent.
+    async fn delete(&self, _message: &Message) -> Result<()> {
+        Err(Error::Unsupported("deleting messages"))
     }
 
     /// Whether this channel can show prompts with buttons.

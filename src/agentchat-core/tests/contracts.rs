@@ -1091,3 +1091,179 @@ async fn channels_without_streaming_get_one_reply() {
     assert!(empty.finish().await.unwrap().is_none());
     assert_eq!(app.history(&"chat".into(), None).await.unwrap().len(), 1);
 }
+
+fn stop_request(id: &str, conversation: &str, sender: &str) -> Message {
+    let mut message = incoming(id, conversation);
+    message.sender.id = sender.into();
+    message.text = String::new();
+    message
+        .metadata
+        .insert(STOP_METADATA.into(), serde_json::Value::Bool(true));
+    message
+}
+
+#[tokio::test]
+async fn provider_stop_requests_stop_only_the_starters_turn_and_never_run() {
+    let app = Arc::new(Runtime::new());
+    let channel = Arc::new(LiveChannel::default());
+    assert!(is_stop_request(&stop_request("s0", "chat", "alice")));
+    assert!(!is_stop_request(&incoming("plain", "chat")));
+    // Nothing running: the request is ignored and never starts a turn.
+    app.receive(
+        channel.clone(),
+        stop_request("s1", "chat", "alice"),
+        |_| async { panic!("a stop request never runs the handler") },
+    )
+    .await
+    .unwrap();
+    let release = Arc::new(Semaphore::new(0));
+    let running = tokio::spawn({
+        let (app, channel, release) = (app.clone(), channel.clone(), release.clone());
+        async move {
+            app.receive(channel, incoming("work", "chat"), move |context| {
+                let release = release.clone();
+                async move {
+                    release.add_permits(1);
+                    context.wait_stopped().await;
+                    Ok(Some("stopped".into()))
+                }
+            })
+            .await
+        }
+    });
+    release.acquire().await.unwrap().forget();
+    let noop = |_| async { panic!("a stop request never runs the handler") };
+    for ignored in [
+        stop_request("s2", "chat", "mallory"),
+        stop_request("s3", "elsewhere", "alice"),
+    ] {
+        app.receive(channel.clone(), ignored, noop).await.unwrap();
+    }
+    assert!(!app.running(&"chat".into()).unwrap().stopped());
+    app.receive(channel.clone(), stop_request("s4", "chat", "alice"), noop)
+        .await
+        .unwrap();
+    running.await.unwrap().unwrap();
+    let history = app.history(&"chat".into(), None).await.unwrap();
+    assert_eq!(
+        history.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        vec!["work", "stopped"]
+    );
+}
+
+/// A streaming channel that shows task updates and records them.
+#[derive(Default)]
+struct TaskChannel {
+    live: LiveChannel,
+    updates: std::sync::Mutex<Vec<(bool, Vec<StreamUpdate>)>>,
+}
+
+#[async_trait]
+impl Channel for TaskChannel {
+    fn name(&self) -> &str {
+        "tasks"
+    }
+    async fn reply(&self, source: &Message, content: &str) -> Result<Message> {
+        self.live.reply(source, content).await
+    }
+    fn streaming(&self) -> Option<StreamOptions> {
+        self.live.streaming()
+    }
+    async fn start_stream(&self, source: &Message, text: &str) -> Result<StreamHandle> {
+        self.live.start_stream(source, text).await
+    }
+    async fn append_stream(
+        &self,
+        source: &Message,
+        stream: StreamHandle,
+        text: &str,
+    ) -> Result<StreamHandle> {
+        self.live.append_stream(source, stream, text).await
+    }
+    async fn stop_stream(
+        &self,
+        source: &Message,
+        stream: StreamHandle,
+        text: &str,
+    ) -> Result<Message> {
+        self.live.stop_stream(source, stream, text).await
+    }
+    fn stream_tasks(&self) -> bool {
+        true
+    }
+    async fn update_stream_tasks(
+        &self,
+        _source: &Message,
+        stream: Option<StreamHandle>,
+        updates: &[StreamUpdate],
+    ) -> Result<StreamHandle> {
+        self.updates
+            .lock()
+            .unwrap()
+            .push((stream.is_some(), updates.to_vec()));
+        Ok(stream.unwrap_or_else(|| serde_json::json!({"n": 0})))
+    }
+}
+
+#[tokio::test]
+async fn task_updates_start_or_join_the_stream_and_coalesce_between_updates() {
+    let app = Arc::new(Runtime::new());
+    let channel = Arc::new(TaskChannel::default());
+    let source = incoming("question", "chat");
+    let mut stream = app.stream(channel.clone(), &source, Some(Duration::from_secs(60)));
+    assert!(stream
+        .task(TaskUpdate::new("", "Search", TaskStatus::Pending))
+        .await
+        .is_err());
+    assert!(stream.plan(" ").await.is_err());
+    // The first update is sent at once and starts the stream.
+    stream
+        .task(TaskUpdate::new("t1", "Search", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    // Within the interval, updates wait; one without details replaces the last.
+    stream
+        .task(TaskUpdate::new(
+            "t1",
+            "Search the web",
+            TaskStatus::InProgress,
+        ))
+        .await
+        .unwrap();
+    let mut done = TaskUpdate::new("t1", "Search the web", TaskStatus::Complete);
+    done.details = Some("3 results".into());
+    stream.task(done.clone()).await.unwrap();
+    stream.plan("Research").await.unwrap();
+    stream.append("Answer").await.unwrap();
+    stream.finish().await.unwrap();
+    let updates = channel.updates.lock().unwrap().clone();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(
+        updates[0],
+        (
+            false,
+            vec![StreamUpdate::Task(TaskUpdate::new(
+                "t1",
+                "Search",
+                TaskStatus::InProgress
+            ))]
+        )
+    );
+    assert_eq!(
+        updates[1],
+        (
+            true,
+            vec![
+                StreamUpdate::Plan {
+                    title: "Research".into()
+                },
+                StreamUpdate::Task(done),
+            ]
+        )
+    );
+    assert_eq!(*channel.live.streamed.lock().unwrap(), vec!["stop:Answer"]);
+    assert_eq!(
+        serde_json::to_value(&updates[1].1[0]).unwrap(),
+        serde_json::json!({"type": "plan", "title": "Research"})
+    );
+}
