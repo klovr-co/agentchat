@@ -5,6 +5,34 @@ use serde_json::{json, Map, Value};
 
 pub const MIRROR_EVENT_TYPE: &str = "agentchat_user_mirror_v1";
 
+/// A prompt as a text section and one button per choice; buttons carry the token.
+pub fn prompt_blocks(
+    text: &str,
+    prompt: &str,
+    choices: &[(String, String, String)],
+) -> Result<Vec<Value>> {
+    let mut blocks = text_blocks(text)?;
+    let buttons = choices
+        .iter()
+        .map(|(id, label, style)| {
+            let mut button = json!({
+                "type": "button",
+                "action_id": format!("agentchat_{id}"),
+                "text": {"type": "plain_text", "text": label, "emoji": true},
+                "value": agentchat_core::prompt_token(prompt, id)?,
+            });
+            if style == "primary" || style == "danger" {
+                button["style"] = json!(style);
+            }
+            Ok(button)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    blocks.push(
+        json!({"type": "actions", "block_id": format!("agentchat_{prompt}"), "elements": buttons}),
+    );
+    Ok(blocks)
+}
+
 /// Split a single Slack message into expanded sections without breaking code fences.
 pub fn text_blocks(text: &str) -> Result<Vec<Value>> {
     if super::events::trim_python(text).is_empty() {

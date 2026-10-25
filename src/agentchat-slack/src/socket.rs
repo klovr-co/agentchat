@@ -287,7 +287,8 @@ impl Slack {
                 }
                 return Ok(SocketExit::Reconnect);
             }
-            if envelope["type"] != "events_api" {
+            // Events, and interactions such as presses on prompt buttons.
+            if envelope["type"] != "events_api" && envelope["type"] != "interactive" {
                 continue;
             }
             let Some(envelope_id) = super::events::nonempty(&envelope["envelope_id"]) else {
@@ -316,12 +317,15 @@ impl Slack {
                 // Accepted work remains valid during shutdown and is drained before CLOSED.
                 if let Some(message) = slack.prepare_event(&payload).await? {
                     let _admitted = AdmittedMessage::new(slack.inner.clone(), &message)?;
+                    let press = message
+                        .metadata
+                        .contains_key(agentchat_core::ANSWER_METADATA);
                     if let Some(emoji) = slack
                         .inner
                         .config
                         .ack_emoji
                         .as_deref()
-                        .filter(|v| !v.is_empty())
+                        .filter(|v| !v.is_empty() && !press)
                     {
                         let _ = slack
                             .inner

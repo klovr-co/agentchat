@@ -257,6 +257,7 @@ pub enum DeliveryKind {
     Reply,
     RichReply,
     Mirror,
+    Stream,
 }
 impl DeliveryKind {
     fn label(self) -> &'static str {
@@ -264,6 +265,7 @@ impl DeliveryKind {
             Self::Reply => "reply",
             Self::RichReply => "rich reply",
             Self::Mirror => "mirror",
+            Self::Stream => "streamed reply",
         }
     }
 }
@@ -366,6 +368,56 @@ impl MirroredReply<'_> {
             .insert("mirrored_message_id".into(), json!(self.message.id));
         reply.metadata.insert("origin".into(), self.origin.into());
     }
+}
+
+/// Most characters one Slack stream may hold in total; longer answers continue
+/// in a new stream. Counted in UTF-16 units, which is never fewer.
+pub const STREAM_LIMIT: usize = 12_000;
+
+/// The unsent end of a streamed message; Slack streams can only grow.
+pub fn stream_delta<'a>(sent: &str, text: &'a str) -> Result<&'a str> {
+    text.strip_prefix(sent).ok_or_else(|| {
+        Error::InvalidInput("A Slack stream can only add text to what it already sent".into())
+    })
+}
+
+/// `chat.startStream` in a thread, addressed to the person who asked.
+pub fn stream_start_request(channel: &str, thread_ts: &str, text: &str, source: &Message) -> Value {
+    let mut request = json!({
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "markdown_text": text,
+        "recipient_user_id": source.sender.id,
+    });
+    if let Some(team) = source
+        .metadata
+        .get("team_id")
+        .filter(|team| team.is_string())
+    {
+        request["recipient_team_id"] = team.clone();
+    }
+    request
+}
+
+/// `chat.appendStream` (`finishing` false) or `chat.stopStream` for the text that
+/// `handle` has not sent yet; `None` when an append has nothing to add. Returns the
+/// request and the handle to use next.
+pub fn stream_request(
+    handle: &Value,
+    text: &str,
+    finishing: bool,
+) -> Result<(Option<Value>, Value)> {
+    let sent = handle["sent"].as_str().unwrap_or_default();
+    let delta = stream_delta(sent, text)?;
+    let mut request = json!({"channel": handle["channel"], "ts": handle["ts"]});
+    if !delta.is_empty() {
+        request["markdown_text"] = json!(delta);
+    } else if !finishing {
+        return Ok((None, handle.clone()));
+    }
+    let mut next = handle.clone();
+    next["sent"] = json!(text);
+    Ok((Some(request), next))
 }
 
 pub fn reply_message(
