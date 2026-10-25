@@ -7,8 +7,9 @@ every channel; how it looks depends on what the provider can show.
 | --- | --- | --- | --- | --- | --- | --- |
 | Live status (`working()`) | Status text in the thread | "typing…" | "typing…" | "typing…" | "typing…" (marks the message read) | "typing…" (needs the BlueBubbles Private API) |
 | Streamed answer (`stream()`) | Native stream in threads | Edits one message | Edits one message | Native stream in one-to-one chats, otherwise edits one message | One reply when finished | One reply when finished |
+| Task and plan progress (`reply.task()`, `reply.plan()`) | Task cards or a plan block in the stream | Ignored | Ignored | Ignored | Ignored | Ignored |
 | Buttons (`ask()`) | Block Kit buttons | Inline keyboard | Message buttons | Adaptive Card | Reply buttons, or a list for more than three or longer choices | None: `ask()` raises `TypeError` |
-| Stop / Queue / Steer | Buttons | Buttons | Buttons | Buttons | Buttons | `app.stop()` and `busy=` only |
+| Stop / Queue / Steer | Buttons, and Slack's native stop button | Buttons | Buttons | Buttons | Buttons | `app.stop()` and `busy=` only |
 
 The Python interface supports every channel above. The Node and Rust interfaces
 use the same Rust runtime for Stop, Queue, Steer, prompts, and streaming; their
@@ -65,6 +66,35 @@ history. A long answer continues in a new message at the provider's limit
 (Discord 2,000, Telegram 4,096, Slack 12,000 UTF-16 units), after a line or
 word break where one is near. Slack finalizes a stream 10 minutes after it starts
 with what was streamed so far; later updates to that stream fail.
+
+### Task and plan progress
+
+`await reply.task(id, title, status, details=None, output=None)` shows a step
+next to the answer; `status` is `"pending"`, `"in_progress"`, `"complete"` or
+`"error"`. A later call with the same `id` updates that task; `details` and
+`output` add text to it, so send each piece once. `await reply.plan(title)`
+groups the tasks under a plan. Updates are sent with the text, at most once per
+interval.
+
+```python
+async with context.stream() as reply:
+    await reply.plan("Fixing the build")
+    await reply.task("logs", "Read the build logs")
+    await reply.append(await diagnose())
+    await reply.task("logs", "Read the build logs", "complete", output="1 error")
+```
+
+On Slack the updates are native `task_update` and `plan_update` chunks: tasks
+show as a plan block when a plan is named, otherwise as cards in the answer.
+Slack fixes a stream's form when it starts, so call `plan()` or `task()` before
+the first `append()`; a stream that started with text alone cannot add tasks.
+If Slack refuses task updates (for example an older workspace), the answer
+streams as plain text without them and the handler carries on. Task titles,
+details and output are escaped so they cannot create mentions or links.
+
+Other channels ignore task updates. They are progress, not answer text, and
+turning them into text would put stale steps into the confirmed answer and its
+history; an app that wants them in the text can append them itself.
 
 Return `None` from the handler after streaming; a returned string is sent as
 another reply. If the handler raises inside the block, the stream is closed with
@@ -127,6 +157,14 @@ returns `False` when none is running. `context.offer_stop()` shows a Stop button
 that does the same; by default only the sender of the request can press it, and
 it goes away when the turn ends. Channels without buttons return `None`.
 
+On Slack, the native stop button that Slack shows while an agent is working does
+the same as the Stop button: it arrives as a `agent_session_stopped` event and
+stops the running turn if pressed by the person who started it. AgentChat then
+clears the thread's working status, since Slack leaves that to the app. The event
+also reaches `@slack.on_event("agent_session_stopped")`, where an app can widen
+who may stop by calling `app.stop()` itself. Subscribe to the event to get the
+button; see [Slack](slack.md#agent-sessions-and-the-native-stop-button).
+
 Stopping is cooperative: `context.stopped` becomes `True` and
 `await context.wait_stopped()` returns. The handler decides how to wind down, for
 example by cancelling the agent's run and returning what it has. Nothing is
@@ -178,18 +216,21 @@ app.onMessage(async (context) => {
 });
 ```
 
-An unanswered prompt rejects with a `DOMException` named `TimeoutError`.
+`reply.task(id, title, status, { details, output })` and `reply.plan(title)`
+show progress. An unanswered prompt rejects with a `DOMException` named
+`TimeoutError`.
 `app.stop(conversationId)` and `await context.waitStopped()` work as in Python.
 
 In Rust, `AgentChat::new().with_busy(Busy::Steer)` sets the policy, and the
 handler context has `steered()`, `stopped()`, `wait_stopped()`,
 `ask(text, choices, AskOptions)`, `offer_stop(StopOptions)`, and
-`stream(interval)`. `ask` fails with `Error::Unsupported` without buttons and
+`stream(interval)`, whose `task(TaskUpdate)` and `plan(title)` show progress.
+`ask` fails with `Error::Unsupported` without buttons and
 `Error::Timeout` when nobody answers. Because unread steered messages run as
 their own turns, `receive` takes a handler it can call more than once (`Fn`).
 A custom `Channel` opts in by overriding `streaming()`, `start_stream`,
-`append_stream`, and `stop_stream`, and `supports_prompts()`, `send_prompt`,
-and `close_prompt`.
+`append_stream`, and `stop_stream`; `stream_tasks()` and `update_stream_tasks`;
+and `supports_prompts()`, `send_prompt`, and `close_prompt`.
 
 ## Writing a channel
 

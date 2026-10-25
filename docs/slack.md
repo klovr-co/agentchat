@@ -123,7 +123,216 @@ Slack automatically prefixes the app’s name. `assistant.threads.setStatus` acc
 existing reply thread, including explicitly threaded DMs. Plain top-level DMs and
 channels without status support return `False` rather than opening an unexpected
 thread. This feature does not move conversations into Slack’s new agent-session
-channels or require a new installation permission.
+channels or require a new installation permission. To report status through agent
+sessions instead, see [Agent sessions](#agent-sessions-and-the-native-stop-button).
+
+## Slack app features
+
+Slack sends Socket Mode payloads to whichever connection is open, so an app can't
+run AgentChat for messages and Slack Bolt for everything else on one app token.
+AgentChat delivers every payload: messages, prompt answers and Slack's native
+stop become AgentChat input, and everything else goes to your handlers.
+
+```python
+import re
+
+from agentchat import AgentChat
+from agentchat.channels.slack import Slack
+
+slack = Slack.from_env(ack_emoji=None)
+app = AgentChat(channels=[slack])
+
+
+@slack.on_event("app_home_opened")
+async def home(payload):
+    event = payload["event"]
+    if event.get("tab") == "home":
+        await slack.publish_home(event["user"], {"type": "home", "blocks": [...]})
+
+
+@slack.on_action("settings")
+async def open_settings(payload):
+    # trigger_id expires three seconds after Slack sends it: open the modal first.
+    await slack.open_view(payload["trigger_id"], settings_modal())
+
+
+@slack.on_action(re.compile(r"^retry_"))
+async def retry(payload):
+    ...
+
+
+@slack.on_view("settings")
+async def save_settings(payload):
+    values = payload["view"]["state"]["values"]
+    if not valid(values):
+        return {"response_action": "errors", "errors": {"name": "Enter a name"}}
+    await save(payload["user"]["id"], values)
+    return None  # Close the modal.
+
+
+@slack.on_command("/deploy")
+async def deploy(payload):
+    return {"response_type": "ephemeral", "text": f"Deploying {payload['text']}"}
+
+
+@slack.on_event("member_joined_channel")
+async def joined(payload):
+    if payload["event"]["user"] == my_bot_user_id:
+        await refresh_allowed_channels()
+```
+
+| Decorator | Receives | Return value |
+| --- | --- | --- |
+| `on_event(type)` | Events API events AgentChat does not turn into a message, as the whole envelope (`payload["event"]`, `payload["team_id"]`, `payload["authorizations"]`) | Ignored |
+| `on_action(action_id)` | `block_actions` payloads (`trigger_id`, `user`, `channel`, `message`, `container`, `actions`, `response_url`) | Ignored |
+| `on_view(callback_id)` | `view_submission` and `view_closed` (`trigger_id`, `user`, `view`) | For a submission, the acknowledgement: `response_action` `errors`, `update`, `push` or `clear` |
+| `on_command(command)` | Slash commands (`command`, `text`, `user_id`, `channel_id`, `trigger_id`, `response_url`) | The response, such as `{"text": ...}` |
+| `on_raw` | Anything no other handler matched: shortcuts, message shortcuts, options requests | The acknowledgement, for options requests |
+
+`action_id` and `callback_id` match exactly, or with a compiled pattern whose
+`search()` matches, as in Bolt. The first matching handler runs. Handlers receive
+the raw payload and run on the event loop of `app.run()`.
+
+Acknowledgements:
+
+- Slack needs one within three seconds. Events, button presses and shortcuts are
+  acknowledged as soon as they arrive, then the handler runs.
+- View submissions, options requests and slash commands can carry a response,
+  so AgentChat waits for the handler and sends its return value as the
+  acknowledgement. A handler that takes longer than 2.5 seconds gets an empty
+  acknowledgement (Slack closes the modal) and keeps running; `close()` waits for
+  it like other accepted work.
+- Payloads without a handler are acknowledged and ignored, as before.
+- Payloads from another workspace are ignored. With `workspace_id=` set, or after
+  `run()` authenticates, the team must match; an interactive payload without a
+  team is dropped.
+- AgentChat's own prompt buttons (Stop, `ask()`, Queue/Steer) never reach
+  `on_action`. Messages AgentChat ignores, such as other bots' messages or
+  unsubscribed thread replies, reach `on_event("message")`.
+
+### Modals and App Home
+
+`await slack.open_view(trigger_id, view)` opens a modal; `push_view(trigger_id,
+view)` pushes one onto an open modal; `update_view(view, view_id=... or
+external_id=..., hash=None)` replaces one; `publish_home(user_id, view,
+hash=None)` publishes a user's Home tab (the view's `type` must be `"home"`).
+Each returns the view Slack sends back and raises Slack's error, for example
+`expired_trigger_id`, without retrying.
+
+### Private notices
+
+```python
+await context.reply_ephemeral("Only you can see this.")
+await context.reply_ephemeral("Your report is ready.", user_id="U123", blocks=[...])
+await app.send_ephemeral(slack, source, "U123", "Only you can see this.")
+```
+
+Ephemeral messages use `chat.postEphemeral` in the source thread and are not
+added to conversation history. Slack delivers them only if the person is active in
+Slack and a member of the channel, does not keep them across reloads or devices,
+and shows one in a thread only when the thread is already active. Treat them as
+notices, not as the only copy of something important. Failures raise; a notice
+is never posted publicly instead. Channels without private notices raise
+`TypeError`: Discord only has ephemeral responses to interactions, and Teams and
+the other channels have none, so only Slack supports this.
+
+### Deleting messages
+
+`await app.delete(slack, message)` deletes a message the app sent, such as a
+temporary "Working…" reply, with `chat.delete`. History keeps it. Ephemeral
+notices cannot be deleted through the Web API and raise `ValueError`. Other
+channels raise `TypeError` for now.
+
+### Agent sessions and the native stop button
+
+Slack shows a stop button while an agent session is `processing`, if the app
+subscribes to the `agent_session_stopped` event. AgentChat turns that event into
+a stop request for the thread's conversation: it stops the running turn when the
+person who started the turn pressed it (like the default Stop button), clears the
+thread's status, and also passes the event to `on_event("agent_session_stopped")`.
+
+Status updates use `assistant.threads.setStatus` by default; Slack maps its
+non-empty status to an agent session in `processing` and an empty one to
+`active`. With `Slack(..., agent_sessions=True)`, `set_status()` and `working()`
+call `agents.sessions.setStatus` directly (`processing` while working, `active`
+when cleared). That method takes no custom text, so Slack shows its own loading
+text. It needs an app declared as an agent in the app settings and returns
+`feature_disabled` on workspaces without agent sessions, so it is off by default.
+`chat.startStream` also starts a session, and `chat.stopStream` sets it `active`.
+
+### Host-owned HTTP sources
+
+A `SlackEventSource` delivers Events API envelopes, interactive payloads (the
+decoded `payload` form field) and slash commands to the receiver. When
+`agentchat.channels.slack.events.responds(payload)` is true (view submissions,
+options requests and slash commands), await the receiver and return its value as
+the HTTP response body; it returns within `events.ACK_DEADLINE` (2.5) seconds.
+Acknowledge everything else first, as before. Rust hosts call
+`slack.handle_payload(&payload)`, which returns the message for the runtime and
+the acknowledgement body.
+
+### Node and Rust
+
+```ts
+const slack = Slack.fromEnv({ agentSessions: false });
+slack.onAction("settings", async (payload) => {
+  await slack.openView(payload.trigger_id as string, settingsModal());
+});
+slack.onView("settings", () => ({ response_action: "clear" }));
+await context.replyEphemeral("Only you can see this.");
+```
+
+The Node `Slack` has `onEvent`, `onAction` (string or `RegExp`), `onView`,
+`onCommand`, `onRaw`, `openView`, `pushView`, `updateView`, `publishHome`,
+`sendEphemeral` and `delete`; the `AgentChat` it belongs to must exist first. In
+Rust, `Slack` has `on_event`, `on_action` (`&str` or `Regex`), `on_view`,
+`on_command` and `on_raw` with `async` handlers returning
+`Result<Option<Value>>`, the same view methods, `send_ephemeral` and `delete`.
+
+### Manifest scopes and events
+
+| Feature | Bot scopes | Events and settings |
+| --- | --- | --- |
+| Messages | `app_mentions:read`, `chat:write`, `im:history`, `channels:history`, `groups:history` | `app_mention`, `message.im`, `message.channels`, `message.groups` |
+| Buttons, modals, shortcuts, options | — | **Interactivity & Shortcuts** on |
+| Slash commands | `commands` | Each command under **Slash Commands** |
+| Shortcuts | `commands` | Each shortcut under **Interactivity & Shortcuts** |
+| Modals (`views.open`, `push`, `update`) | None | Interactivity, for the `trigger_id` |
+| App Home (`views.publish`) | None | **App Home** tab on; `app_home_opened` |
+| Private notices (`chat.postEphemeral`) | `chat:write` | — |
+| Deleting (`chat.delete`) | `chat:write` (only the app's own messages) | — |
+| Streams with tasks and plans | `chat:write` | — |
+| Working status | `chat:write` | — |
+| Agent sessions (`agent_sessions=True`) | `chat:write`; declaring the app as an agent adds `assistant:write` | — |
+| Native stop button | `chat:write` | `agent_session_stopped` |
+| Following invitations | `channels:read`, `groups:read`, `mpim:read` | `member_joined_channel` |
+
+Reinstall the app after adding scopes.
+
+## Moving from Slack Bolt
+
+| Slack Bolt | AgentChat |
+| --- | --- |
+| `App(token=..., ...)` with `SocketModeHandler(app, app_token)` | `Slack(bot_token=..., app_token=...)` in `AgentChat(channels=[slack])`; `await app.run()` |
+| `@app.event("app_mention")`, `@app.event("message")` for the agent | `@app.on_message`; DMs, mentions and subscribed threads arrive normalized and deduplicated |
+| `@app.event("app_home_opened")` and other events | `@slack.on_event("app_home_opened")`; the event is `payload["event"]` |
+| `@app.action("id")`, `@app.action(re.compile(...))` | `@slack.on_action("id")`, `@slack.on_action(re.compile(...))` |
+| `@app.view("callback_id")` with `ack(response_action=...)` | `@slack.on_view("callback_id")` returning `{"response_action": ...}` |
+| `@app.command("/name")` with `ack(...)` or `respond(...)` | `@slack.on_command("/name")` returning the response |
+| `@app.shortcut(...)`, `@app.options(...)` | `@slack.on_raw`, checking `payload["type"]` |
+| `ack()` | Automatic; the return value is the acknowledgement where Slack accepts one |
+| `client.views_open`, `views_push`, `views_update`, `views_publish` | `slack.open_view`, `push_view`, `update_view`, `publish_home` |
+| `client.chat_postEphemeral` | `context.reply_ephemeral()` or `app.send_ephemeral()` |
+| `client.chat_delete` | `app.delete(slack, message)` |
+| `client.chat_startStream` / `appendStream` / `stopStream` with chunks | `context.stream()` with `reply.append()`, `reply.task()`, `reply.plan()` |
+| `client.assistant_threads_setStatus`, `agents.sessions.setStatus` | `context.working()` or `context.set_status()`; `agent_sessions=True` for sessions |
+| `@app.event("agent_session_stopped")` that cancels the run | Built in: stops the turn; read `context.stopped` or `await context.wait_stopped()` |
+| `client.chat_postMessage` in a thread | `context.reply()` or `context.reply_rich()` |
+| Other `client.*` calls | Keep a `slack_sdk` `AsyncWebClient` (or pass yours as `web_client=`) |
+
+Move one handler at a time: register it on `slack`, remove the Bolt listener, and
+stop the Bolt process once nothing is left, because Slack splits Socket Mode
+payloads between all open connections.
 
 ## Slack user profiles
 
