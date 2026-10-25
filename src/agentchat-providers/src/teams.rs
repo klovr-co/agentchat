@@ -87,6 +87,12 @@ pub fn normalize(event: &Value, app_id: &str, tenant_id: &str) -> Option<Message
         return None;
     }
     let kind = ConversationKind::parse(conversation.get("conversationType")?.as_str()?)?;
+    // A press on a prompt card: Action.Submit returns the button's data as `value`.
+    let answer = event
+        .get("value")
+        .and_then(|v| v.get("agentchat"))
+        .and_then(Value::as_str)
+        .and_then(agentchat_core::answer_metadata);
     let mut text = match event.get("text") {
         Some(v) if truthy(v) => v.as_str()?.to_owned(),
         _ => String::new(),
@@ -111,7 +117,7 @@ pub fn normalize(event: &Value, app_id: &str, tenant_id: &str) -> Option<Message
             }
         }
     }
-    if kind != ConversationKind::Personal && !mentioned {
+    if answer.is_none() && kind != ConversationKind::Personal && !mentioned {
         return None;
     }
     let attachments = event
@@ -140,15 +146,16 @@ pub fn normalize(event: &Value, app_id: &str, tenant_id: &str) -> Option<Message
         })
         .collect::<Vec<_>>();
     let text = strip(&text).to_owned();
-    if text.is_empty() && attachments.is_empty() {
+    if answer.is_none() && text.is_empty() && attachments.is_empty() {
         return None;
     }
-    let routing = ConversationRoute::from_activity(
-        kind,
-        conversation_id,
-        activity_id,
-        event.get("replyToId"),
-    )?;
+    // A press replies to the card, not the thread root; the root is in the ID.
+    let reply_to = if answer.is_some() && conversation_id.contains(";messageid=") {
+        None
+    } else {
+        event.get("replyToId")
+    };
+    let routing = ConversationRoute::from_activity(kind, conversation_id, activity_id, reply_to)?;
     let root = routing.root_id.map(str::to_owned);
     let base = routing.base_id;
     let mut identity = format!("{}:{}:{}", quote(app_id), quote(tenant_id), quote(base));
@@ -177,18 +184,56 @@ pub fn normalize(event: &Value, app_id: &str, tenant_id: &str) -> Option<Message
         },
         text,
         role: Role::User,
-        metadata: json!({
-            "app_id": app_id,
-            "tenant_id": tenant_id,
-            "activity_id": activity_id,
-            "continuation_activity": route,
-        })
-        .as_object()?
-        .clone(),
+        metadata: {
+            let mut metadata = json!({
+                "app_id": app_id,
+                "tenant_id": tenant_id,
+                "activity_id": activity_id,
+                "continuation_activity": route,
+            });
+            if let Some(answer) = answer {
+                metadata[agentchat_core::ANSWER_METADATA] = answer;
+            }
+            metadata.as_object()?.clone()
+        },
         thread_id: root,
         addressed: true,
         attachments,
     })
+}
+/// A prompt as an Adaptive Card with one Submit button per choice.
+pub fn prompt_card(
+    text: &str,
+    prompt: &str,
+    choices: &[(String, String, String)],
+) -> Result<Value, &'static str> {
+    text_payload(text)?;
+    let actions = choices
+        .iter()
+        .map(|(id, label, style)| {
+            let style = match style.as_str() {
+                "primary" => "positive",
+                "danger" => "destructive",
+                _ => "default",
+            };
+            agentchat_core::prompt_token(prompt, id)
+                .map(|token| {
+                    json!({"type": "Action.Submit", "title": label, "style": style,
+                           "data": {"agentchat": token}})
+                })
+                .map_err(|_| "Invalid prompt or choice ID")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.4",
+            "body": [{"type": "TextBlock", "text": text, "wrap": true}],
+            "actions": actions,
+        },
+    }))
 }
 pub fn validate_service_url(raw: &str, allowed_host: bool) -> Result<(), &'static str> {
     let invalid = "Teams service URL is not an allowed HTTPS Microsoft endpoint";
@@ -292,9 +337,106 @@ impl Destination {
         Ok(result)
     }
 }
+/// Least seconds between streamed updates; Teams throttles streams to one request
+/// per second.
+pub const STREAM_INTERVAL: f64 = 1.5;
+/// Longest streamed message before the answer continues in a new one.
+pub const STREAM_LIMIT: usize = 20_000;
+
+pub fn text_activity(text: &str) -> Value {
+    json!({"type": "message", "text": text, "textFormat": "plain"})
+}
+
+/// Teams shows a blank streamed update as nothing; show an ellipsis instead.
+fn shown(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "…"
+    } else {
+        text
+    }
+}
+
+/// Teams streams natively only in one-to-one chats; elsewhere a message is updated.
+pub fn streams_natively(destination: &Destination) -> bool {
+    destination.activity["conversation"]["conversationType"] == "personal"
+}
+
+/// The first activity of a streamed answer.
+pub fn stream_start_activity(text: &str, native: bool) -> Value {
+    if native {
+        json!({"type": "typing", "text": shown(text), "entities": [
+            {"type": "streaminfo", "streamType": "streaming", "streamSequence": 1}]})
+    } else {
+        text_activity(shown(text))
+    }
+}
+
+/// The handle for a stream started with `stream_start_activity` and confirmed as `id`.
+pub fn stream_handle(id: &str, native: bool) -> Value {
+    json!({"id": id, "native": native, "sequence": 1})
+}
+
+/// The next update of a stream, numbering native updates from 1 without gaps.
+/// Returns the activity, whether it updates an existing message, and the next handle.
+pub fn stream_update_activity(handle: &Value, text: &str) -> (Value, bool, Value) {
+    let mut next = handle.clone();
+    let id = handle["id"].clone();
+    if handle["native"] == true {
+        let sequence = handle["sequence"].as_u64().unwrap_or(1) + 1;
+        next["sequence"] = json!(sequence);
+        let activity = json!({"type": "typing", "id": id, "text": shown(text), "entities": [
+            {"type": "streaminfo", "streamId": id, "streamType": "streaming",
+             "streamSequence": sequence}]});
+        (activity, false, next)
+    } else {
+        let mut activity = text_activity(shown(text));
+        activity["id"] = id;
+        (activity, true, next)
+    }
+}
+
+/// The final message of a stream; a native stream's final message has no sequence.
+/// Returns the activity and whether it updates an existing message.
+pub fn stream_final_activity(handle: &Value, text: &str) -> (Value, bool) {
+    let id = handle["id"].clone();
+    let mut activity = text_activity(text);
+    activity["id"] = id.clone();
+    let native = handle["native"] == true;
+    if native {
+        activity["entities"] =
+            json!([{"type": "streaminfo", "streamId": id, "streamType": "final"}]);
+    }
+    (activity, !native)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_streams_number_updates_and_end_without_a_sequence() {
+        let start = stream_start_activity(" ", true);
+        assert_eq!(start["text"], "…");
+        assert_eq!(start["entities"][0]["streamSequence"], 1);
+        let handle = stream_handle("A1", true);
+        let (update, edits, handle) = stream_update_activity(&handle, "Hel");
+        assert!(!edits);
+        assert_eq!(update["entities"][0]["streamSequence"], 2);
+        assert_eq!(update["entities"][0]["streamId"], "A1");
+        let (_, _, handle) = stream_update_activity(&handle, "Hello");
+        assert_eq!(handle["sequence"], 3);
+        let (last, edits) = stream_final_activity(&handle, "Hello!");
+        assert!(!edits);
+        assert_eq!(last["type"], "message");
+        assert_eq!(last["entities"][0]["streamType"], "final");
+        assert!(last["entities"][0].get("streamSequence").is_none());
+        let (update, edits, _) = stream_update_activity(&stream_handle("A2", false), "Hi");
+        assert!(edits);
+        assert_eq!(
+            (update["type"].as_str(), update["id"].as_str()),
+            (Some("message"), Some("A2"))
+        );
+    }
     #[test]
     fn enforce_bytes() {
         assert!(text_payload(&"😀".repeat(6000)).is_ok());

@@ -10,8 +10,8 @@
 export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-wasip1'
 
 export declare class NativeAgentChat {
-  constructor(channelsJson: string)
-  run(handler: (channelIndex: number, messageJson: string) => Promise<string | null>): Promise<void>
+  constructor(channelsJson: string, busy?: string | undefined | null)
+  run(handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>): Promise<void>
   close(): Promise<void>
   reply(channelIndex: number, sourceJson: string, text: string): Promise<string>
   history(conversationId: string, limit?: number | undefined | null): Promise<string>
@@ -22,7 +22,26 @@ export declare class NativeAgentChat {
   downloadAttachment(channelIndex: number, sourceJson: string, attachmentJson: string, maxBytes: number): Promise<NativeDownloadedFile>
   setStatus(channelIndex: number, sourceJson: string, status: string): Promise<boolean>
   working(channelIndex: number, sourceJson: string, status: string, refreshIntervalMs: number): Promise<NativeWorkingStatus>
+  /** Messages steered to a running handler since it last asked, as JSON. */
+  steered(turnId: number): string
+  stopped(turnId: number): boolean
+  /** Resolves true once the turn is asked to stop, or false if it ended first. */
+  waitStopped(turnId: number): Promise<boolean>
+  /** Ask a conversation's running handler to stop; false when none is running. */
+  stop(conversationId: string): boolean
+  /** Returns `{"answer": ...}`, or `{"error": "timeout" | "unsupported"}`. */
+  ask(channelIndex: number, sourceJson: string, text: string, choicesJson: string, timeoutMs: number, allowedJson?: string | undefined | null): Promise<string>
+  /** Show a Stop button for the running handler; the shown message as JSON, or null. */
+  offerStop(channelIndex: number, sourceJson: string, turnId: number, text: string, label: string, allowedJson?: string | undefined | null): Promise<string | null>
+  stream(channelIndex: number, sourceJson: string, intervalMs?: number | undefined | null): NativeAnswerStream
   mirror(channelIndex: number, sourceJson: string, messageJson: string, origin: string): Promise<string>
+}
+
+export declare class NativeAnswerStream {
+  append(text: string): Promise<void>
+  /** Returns the confirmed messages as JSON. */
+  finish(): Promise<string>
+  abort(): Promise<void>
 }
 
 export declare class NativeWorkingStatus {

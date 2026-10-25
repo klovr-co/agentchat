@@ -1,12 +1,15 @@
 # Public compatibility signatures; update with the corresponding Rust binding API.
 from collections.abc import Awaitable, Callable, Sequence
+from typing import Literal
 
 from agentchat._backend import Backend
 from agentchat.activity import WorkingStatus
 from agentchat.channels.base import Channel
 from agentchat.context import MessageContext
 from agentchat.models import (
+    Answer,
     Attachment,
+    Choice,
     DownloadedFile,
     Message,
     RichReply,
@@ -14,8 +17,10 @@ from agentchat.models import (
     UploadFile,
 )
 from agentchat.state.base import State
+from agentchat.stream import AnswerStream
 
 MessageHandler = Callable[[MessageContext], Awaitable[str | None]]
+Busy = Literal["steer", "queue", "ask", "reject"]
 
 class AgentChat:
     channels: tuple[Channel, ...]
@@ -27,9 +32,23 @@ class AgentChat:
         channels: Sequence[Channel],
         state: State | None = ...,
         backend: Backend | None = ...,
+        busy: Busy = ...,
     ) -> None: ...
     @property
     def backend(self) -> str: ...
+    @property
+    def busy(self) -> Busy: ...
+    def stop(self, conversation_id: str) -> bool: ...
+    # A default expiry keeps an unanswered approval from waiting forever.
+    async def ask(
+        self, channel: Channel, source: Message, text: str, choices: Sequence[Choice | str], *,
+        timeout: float = ...,  # noqa: ASYNC109
+        allowed: Sequence[str] | Literal["anyone"] | None = ...,
+    ) -> Answer: ...
+    async def offer_stop(
+        self, channel: Channel, source: Message, *, text: str = ..., label: str = ...,
+        allowed: Sequence[str] | Literal["anyone"] | None = ...,
+    ) -> Message | None: ...
     def on_message(self, handler: MessageHandler) -> MessageHandler: ...
     async def run(self) -> None: ...
     async def close(self) -> None: ...
@@ -44,6 +63,9 @@ class AgentChat:
     async def download_attachment(
         self, channel: Channel, source: Message, attachment: Attachment, *, max_bytes: int = ...
     ) -> DownloadedFile: ...
+    def stream(
+        self, channel: Channel, source: Message, *, interval: float | None = ...
+    ) -> AnswerStream: ...
     def working(
         self, channel: Channel, source: Message, status: str = ..., *, refresh_interval: float = ...
     ) -> WorkingStatus: ...

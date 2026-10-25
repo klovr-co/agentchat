@@ -1,4 +1,5 @@
 //! Python foreign-I/O adapter for the portable YCloud WhatsApp policies.
+use crate::prompts::PromptFields;
 use crate::{convert, host};
 use agentchat_providers::ycloud::{self as policy, kind};
 use pyo3::{
@@ -364,6 +365,7 @@ impl YCloud {
         state.set_item("_closed", false)?;
         state.set_item("_session", py.None())?;
         state.set_item("_runner", py.None())?;
+        state.set_item("_typing", super::typing::keeper(py, ADAPTER, 20.0, 120.0)?)?;
         slf.borrow_mut(py).payload = Some(Box::new(YCloudState {
             state: state.unbind(),
         }));
@@ -496,6 +498,7 @@ impl YCloud {
                 } else {
                     Ok(none())
                 };
+                acall(&get(&this, "_typing")?, "close", vec![], None).await?;
                 let drain = acall(&get(&this, "_delivery")?, "close", vec![], None).await;
                 let session = get(&this, "_session")?;
                 let closed = if !is_none(&session) {
@@ -652,6 +655,101 @@ impl YCloud {
             .map_err(PyRuntimeError::new_err)?;
             receipt_with_metadata(&source_host, &message)
         })
+    }
+    /// Show "typing…" for the source message until cleared with "" or the keeper
+    /// expires. WhatsApp shows no status text and also marks the message as read.
+    fn set_status(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        status: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let phone = extract::<String>(&get(&this, "_phone_number")?)?;
+            let destination =
+                policy::destination(&message, &phone).map_err(PyValueError::new_err)?;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let keeper = get(&this, "_typing")?;
+            let key = j(json!(destination.message_id))?;
+            if status.is_empty() {
+                call(&keeper, "stop", vec![key], None)?;
+                return j(json!(true));
+            }
+            let send = call(
+                &module("functools")?,
+                "partial",
+                vec![
+                    get(&this, "_send_typing")?,
+                    j(json!(destination.message_id))?,
+                ],
+                None,
+            )?;
+            acall(&keeper, "start", vec![key, send], None).await
+        })
+    }
+    fn _send_typing(slf: Py<Self>, py: Python<'_>, message_id: String) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let id = extract::<String>(&call(
+                &module("urllib.parse")?,
+                "quote",
+                vec![j(json!(message_id))?, j(json!(""))?],
+                None,
+            )?)?;
+            let path = format!("/whatsapp/inboundMessages/{id}/typing");
+            api_json(&this, "post", &path, json!({})).await?;
+            Ok(none())
+        })
+    }
+    /// Show a prompt as reply buttons, or a list for more or longer choices.
+    fn send_prompt(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        prompt: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let fields = Python::attach(|py| PromptFields::read(prompt.bind(py)))?;
+            let phone = extract::<String>(&get(&this, "_phone_number")?)?;
+            let destination =
+                policy::destination(&message, &phone).map_err(PyValueError::new_err)?;
+            let payload = policy::prompt_payload(
+                &phone,
+                &destination.recipient,
+                &destination.message_id,
+                &fields.text,
+                &fields.id,
+                &fields.pairs(),
+            )
+            .map_err(PyValueError::new_err)?;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let result = api_json(
+                &this,
+                "post",
+                "/whatsapp/messages/sendDirectly",
+                json!({"json": payload}),
+            )
+            .await?;
+            let sent = policy::receipt(&message, &phone, &fields.text, &result, None)
+                .map_err(PyRuntimeError::new_err)?;
+            receipt_with_metadata(&source, &sent)
+        })
+    }
+    /// WhatsApp cannot edit a sent message, so the buttons stay; later presses are
+    /// ignored because the prompt is no longer open.
+    fn close_prompt(
+        &self,
+        py: Python<'_>,
+        _source: Py<PyAny>,
+        _sent: Py<PyAny>,
+        _prompt: Py<PyAny>,
+        _answer: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move { Ok(none()) })
     }
     #[pyo3(signature=(destination,name,language_code,components=None,*,external_id=None))]
     fn send_template(

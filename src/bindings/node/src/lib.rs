@@ -1,10 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use agentchat_core::{
-    Attachment, Channel, ConversationId, Error as CoreError, Message, RichReply, Runtime,
-    UploadFile,
+    Allowed, AnswerStream, AskOptions, Attachment, Busy, Channel, Choice, ConversationId,
+    Error as CoreError, Message, RichReply, Runtime, StopOptions, TurnControl, UploadFile,
 };
 use agentchat_slack::{Slack, SlackConfig};
 use napi::bindgen_prelude::*;
@@ -15,12 +16,60 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 type Handler = ThreadsafeFunction<
-    FnArgs<(u32, String)>,
+    FnArgs<(u32, String, u32)>,
     Promise<Option<String>>,
-    FnArgs<(u32, String)>,
+    FnArgs<(u32, String, u32)>,
     Status,
     false,
 >;
+
+/// Running handlers' turn controls, by the turn ID passed to the JavaScript handler.
+#[derive(Default)]
+struct Turns {
+    next: AtomicU32,
+    controls: std::sync::Mutex<HashMap<u32, TurnControl>>,
+}
+
+impl Turns {
+    fn controls(&self) -> std::sync::MutexGuard<'_, HashMap<u32, TurnControl>> {
+        self.controls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+    fn get(&self, id: u32) -> Option<TurnControl> {
+        self.controls().get(&id).cloned()
+    }
+}
+
+/// Forgets a turn's control once its JavaScript handler settles.
+struct TurnEntry<'a> {
+    turns: &'a Turns,
+    id: u32,
+}
+
+impl Drop for TurnEntry<'_> {
+    fn drop(&mut self) {
+        self.turns.controls().remove(&self.id);
+    }
+}
+
+fn allowed(value: Option<String>) -> napi::Result<Allowed> {
+    match value.as_deref() {
+        None => Ok(Allowed::Sender),
+        Some(json) => {
+            match serde_json::from_str::<serde_json::Value>(json).map_err(native_error)? {
+                serde_json::Value::Null => Ok(Allowed::Sender),
+                serde_json::Value::String(anyone) if anyone == "anyone" => Ok(Allowed::Anyone),
+                ids @ serde_json::Value::Array(_) => Ok(Allowed::Senders(
+                    serde_json::from_value(ids).map_err(native_error)?,
+                )),
+                _ => Err(native_error(
+                    "allowed must be \"anyone\" or a list of sender IDs",
+                )),
+            }
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -86,8 +135,48 @@ fn encode_message(value: &Message) -> napi::Result<String> {
 }
 
 #[napi]
+pub struct NativeAnswerStream {
+    slack: Arc<Slack>,
+    source: Message,
+    inner: Arc<Mutex<AnswerStream>>,
+}
+
+#[napi]
+impl NativeAnswerStream {
+    #[napi]
+    pub async fn append(&self, text: String) -> napi::Result<()> {
+        let mut stream = self.inner.lock().await;
+        self.slack
+            .with_admitted_source(&self.source, stream.append(&text))
+            .await
+            .map_err(native_error)
+    }
+
+    /// Returns the confirmed messages as JSON.
+    #[napi]
+    pub async fn finish(&self) -> napi::Result<String> {
+        let mut stream = self.inner.lock().await;
+        self.slack
+            .with_admitted_source(&self.source, stream.finish())
+            .await
+            .map_err(native_error)?;
+        serde_json::to_string(stream.messages()).map_err(native_error)
+    }
+
+    #[napi]
+    pub async fn abort(&self) -> napi::Result<()> {
+        let mut stream = self.inner.lock().await;
+        self.slack
+            .with_admitted_source(&self.source, stream.abort())
+            .await
+            .map_err(native_error)
+    }
+}
+
+#[napi]
 pub struct NativeAgentChat {
     runtime: Arc<Runtime>,
+    turns: Arc<Turns>,
     channels: Vec<Arc<Slack>>,
     running: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
@@ -99,7 +188,12 @@ pub struct NativeAgentChat {
 #[napi]
 impl NativeAgentChat {
     #[napi(constructor)]
-    pub fn new(channels_json: String) -> napi::Result<Self> {
+    pub fn new(channels_json: String, busy: Option<String>) -> napi::Result<Self> {
+        let busy: Busy = busy
+            .as_deref()
+            .unwrap_or("steer")
+            .parse()
+            .map_err(native_error)?;
         let options: Vec<SlackOptions> =
             serde_json::from_str(&channels_json).map_err(native_error)?;
         if options.is_empty() {
@@ -125,7 +219,8 @@ impl NativeAgentChat {
             })
             .collect::<napi::Result<Vec<_>>>()?;
         Ok(Self {
-            runtime: Arc::new(Runtime::new()),
+            runtime: Arc::new(Runtime::new().with_busy(busy)),
+            turns: Arc::default(),
             channels,
             running: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
@@ -136,7 +231,7 @@ impl NativeAgentChat {
     }
 
     #[napi(
-        ts_args_type = "handler: (channelIndex: number, messageJson: string) => Promise<string | null>"
+        ts_args_type = "handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>"
     )]
     pub async fn run(&self, handler: Arc<Handler>) -> napi::Result<()> {
         if self.closing.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
@@ -150,6 +245,7 @@ impl NativeAgentChat {
             let slack = Arc::clone(slack);
             let runtime = Arc::clone(&self.runtime);
             let handler = Arc::clone(&handler);
+            let turns = Arc::clone(&self.turns);
             tasks.spawn(async move {
                 let channel: Arc<dyn Channel> = slack.clone();
                 slack
@@ -157,18 +253,26 @@ impl NativeAgentChat {
                         let runtime = Arc::clone(&runtime);
                         let channel = Arc::clone(&channel);
                         let handler = Arc::clone(&handler);
+                        let turns = Arc::clone(&turns);
                         async move {
                             runtime
-                                .receive(channel, message, move |context| async move {
-                                    let json = serde_json::to_string(&context.message)
-                                        .map_err(|error| CoreError::Handler(error.to_string()))?;
-                                    let promise = handler
-                                        .call_async_catch((index as u32, json).into())
-                                        .await
-                                        .map_err(|error| CoreError::Handler(error.to_string()))?;
-                                    promise
-                                        .await
-                                        .map_err(|error| CoreError::Handler(error.to_string()))
+                                .receive(channel, message, move |context| {
+                                    let handler = Arc::clone(&handler);
+                                    let turns = Arc::clone(&turns);
+                                    async move {
+                                        let json = serde_json::to_string(&context.message)
+                                            .map_err(|e| CoreError::Handler(e.to_string()))?;
+                                        let id = turns.next.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(control) = context.control() {
+                                            turns.controls().insert(id, control.clone());
+                                        }
+                                        let _entry = TurnEntry { turns: &turns, id };
+                                        let promise = handler
+                                            .call_async_catch((index as u32, json, id).into())
+                                            .await
+                                            .map_err(|e| CoreError::Handler(e.to_string()))?;
+                                        promise.await.map_err(|e| CoreError::Handler(e.to_string()))
+                                    }
                                 })
                                 .await
                         }
@@ -437,6 +541,123 @@ impl NativeAgentChat {
         Ok(NativeWorkingStatus { inner })
     }
 
+    /// Messages steered to a running handler since it last asked, as JSON.
+    #[napi]
+    pub fn steered(&self, turn_id: u32) -> napi::Result<String> {
+        let messages = self.turn(turn_id).map(|t| t.steered()).unwrap_or_default();
+        serde_json::to_string(&messages).map_err(native_error)
+    }
+
+    #[napi]
+    pub fn stopped(&self, turn_id: u32) -> bool {
+        self.turn(turn_id).is_some_and(|turn| turn.stopped())
+    }
+
+    /// Resolves true once the turn is asked to stop, or false if it ended first.
+    #[napi]
+    pub async fn wait_stopped(&self, turn_id: u32) -> bool {
+        match self.turn(turn_id) {
+            Some(turn) => {
+                let stopped = turn.until_stopped();
+                drop(turn);
+                stopped.await
+            }
+            None => false,
+        }
+    }
+
+    /// Ask a conversation's running handler to stop; false when none is running.
+    #[napi]
+    pub fn stop(&self, conversation_id: String) -> bool {
+        self.runtime.stop(&ConversationId(conversation_id))
+    }
+
+    /// Returns `{"answer": ...}`, or `{"error": "timeout" | "unsupported"}`.
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask(
+        &self,
+        channel_index: u32,
+        source_json: String,
+        text: String,
+        choices_json: String,
+        timeout_ms: u32,
+        allowed_json: Option<String>,
+    ) -> napi::Result<String> {
+        let source = decode_message(&source_json)?;
+        let choices: Vec<Choice> = serde_json::from_str(&choices_json).map_err(native_error)?;
+        let options = AskOptions {
+            timeout: Duration::from_millis(timeout_ms.into()),
+            allowed: allowed(allowed_json)?,
+        };
+        let slack = self.channel(channel_index)?;
+        let channel: Arc<dyn Channel> = slack.clone();
+        let result = slack
+            .with_admitted_source(
+                &source,
+                self.runtime.ask(channel, &source, &text, choices, options),
+            )
+            .await;
+        let value = match result {
+            Ok(answer) => serde_json::json!({"answer": answer}),
+            Err(CoreError::Timeout(_)) => serde_json::json!({"error": "timeout"}),
+            Err(CoreError::Unsupported(_)) => serde_json::json!({"error": "unsupported"}),
+            Err(error) => return Err(native_error(error)),
+        };
+        Ok(value.to_string())
+    }
+
+    /// Show a Stop button for the running handler; the shown message as JSON, or null.
+    #[napi]
+    pub async fn offer_stop(
+        &self,
+        channel_index: u32,
+        source_json: String,
+        turn_id: u32,
+        text: String,
+        label: String,
+        allowed_json: Option<String>,
+    ) -> napi::Result<Option<String>> {
+        let source = decode_message(&source_json)?;
+        let options = StopOptions {
+            text,
+            label,
+            allowed: allowed(allowed_json)?,
+        };
+        let turn = self
+            .turn(turn_id)
+            .ok_or_else(|| native_error("This handler is no longer running"))?;
+        let slack = self.channel(channel_index)?;
+        let channel: Arc<dyn Channel> = slack.clone();
+        let shown = slack
+            .with_admitted_source(
+                &source,
+                self.runtime.offer_stop_for(channel, &source, options, turn),
+            )
+            .await
+            .map_err(native_error)?;
+        shown.map(|message| encode_message(&message)).transpose()
+    }
+
+    #[napi]
+    pub fn stream(
+        &self,
+        channel_index: u32,
+        source_json: String,
+        interval_ms: Option<u32>,
+    ) -> napi::Result<NativeAnswerStream> {
+        let source = decode_message(&source_json)?;
+        let slack = self.channel(channel_index)?;
+        let channel: Arc<dyn Channel> = slack.clone();
+        let interval = interval_ms.map(|ms| Duration::from_millis(ms.into()));
+        let stream = self.runtime.stream(channel, &source, interval);
+        Ok(NativeAnswerStream {
+            slack,
+            source,
+            inner: Arc::new(Mutex::new(stream)),
+        })
+    }
+
     #[napi]
     pub async fn mirror(
         &self,
@@ -461,6 +682,10 @@ impl NativeAgentChat {
 }
 
 impl NativeAgentChat {
+    fn turn(&self, turn_id: u32) -> Option<TurnControl> {
+        self.turns.get(turn_id)
+    }
+
     fn channel(&self, index: u32) -> napi::Result<Arc<Slack>> {
         if self.closed.load(Ordering::Acquire) {
             return Err(native_error("AgentChat is closed"));

@@ -5,6 +5,7 @@ class FakeSlackClient:
     def __init__(self) -> None:
         self.posts: list[dict[str, object]] = []
         self.reactions: list[dict[str, object]] = []
+        self.api_calls: list[tuple[str, dict[str, object]]] = []
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -12,6 +13,10 @@ class FakeSlackClient:
 
     async def reactions_add(self, **kwargs):
         self.reactions.append(kwargs)
+
+    async def api_call(self, api_method, *, json=None, **kwargs):
+        self.api_calls.append((api_method, json))
+        return {"ok": True, "ts": "5.0"} if api_method == "chat.startStream" else {"ok": True}
 
 
 def channel_event(ts="1.0", text="<@BOT> inspect <@TARGET>", **extra):

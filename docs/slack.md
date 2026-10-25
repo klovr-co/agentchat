@@ -59,6 +59,8 @@ Create a Slack app with Socket Mode enabled, then add these bot scopes:
 - `reactions:write` (or set `ack_emoji=None`)
 
 Subscribe to `app_mention`, `message.im`, `message.channels`, and `message.groups`.
+Turn on **Interactivity & Shortcuts** for prompt buttons, `context.offer_stop()`,
+and `busy="ask"`; see [Live controls](live-controls.md).
 Install the app and invite it to the channels where it should respond. Existing
 installations need to be reinstalled when adding scopes. Then export its tokens:
 

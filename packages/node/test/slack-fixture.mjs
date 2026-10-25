@@ -30,6 +30,9 @@ export async function slackFixture({ replyDelayMs = 0, statusClearDelayMs = 0, s
     else if (method === "chat.postMessage") result = { ok: true, channel: body.channel, ts: `200.${calls.length}`, message: { text: body.text, user: "B1" } };
     else if (method === "conversations.replies") result = { ok: true, has_more: false, messages: [{ type: "message", ts: "100.1", user: "U1", text: "root" }] };
     else if (method === "assistant.threads.setStatus") result = { ok: true };
+    else if (method === "chat.startStream") result = { ok: true, channel: body.channel, ts: `300.${calls.length}` };
+    else if (method === "chat.appendStream" || method === "chat.stopStream") result = { ok: true, channel: body.channel, ts: body.ts };
+    else if (method === "chat.update") result = { ok: true, channel: body.channel, ts: body.ts };
     else if (method === "reactions.add") result = { ok: true };
     else if (method === "chat.getPermalink") result = { ok: true, permalink: "https://slack.example/message" };
     else if (method === "files.info") result = { ok: true, file: { id: "F1", name: "hello.txt", size: 5, mimetype: "text/plain", url_private_download: `http://127.0.0.1:${server.address().port}/files-pri/F1` } };
@@ -70,6 +73,18 @@ export async function slackFixture({ replyDelayMs = 0, statusClearDelayMs = 0, s
         payload: { team_id: "T1", event_id: `Ev-${ts}`, event: {
           type, user: "U1", channel, channel_type: "channel", text, ts, thread_ts: thread, files,
         } },
+      }));
+    },
+    /** Press a button on a message the bot posted in thread 100.1 of C1. */
+    async press(value, { user = "U1", ts = "250.1", messageTs = "200.1", envelope = `press-${ts}-${user}` } = {}) {
+      const socket = await connection;
+      socket.send(JSON.stringify({
+        type: "interactive", envelope_id: envelope,
+        payload: {
+          type: "block_actions", team: { id: "T1" }, user: { id: user, name: user.toLowerCase() },
+          channel: { id: "C1" }, message: { ts: messageTs, thread_ts: "100.1" },
+          actions: [{ action_id: "agentchat", value, action_ts: ts }],
+        },
       }));
     },
     async close() {

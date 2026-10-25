@@ -96,6 +96,7 @@ pub fn normalize(payload: &Value, phone: &str) -> Vec<Message> {
                 if text.trim().is_empty() && attachments.is_empty() {
                     continue;
                 }
+                let answer = reply_answer(event);
                 let display_name = items(&value["contacts"])
                     .iter()
                     .rev()
@@ -122,6 +123,7 @@ pub fn normalize(payload: &Value, phone: &str) -> Vec<Message> {
                         ("message_type".into(), json!(kind)),
                     ]
                     .into_iter()
+                    .chain(answer.map(|a| (agentchat_core::ANSWER_METADATA.into(), a)))
                     .collect(),
                 });
             }
@@ -171,6 +173,203 @@ pub fn text_payload(
     Ok(
         json!({"messaging_product":"whatsapp","recipient_type":"individual","to":recipient,"type":"text","text":{"body":content,"preview_url":false},"context":{"message_id":id}}),
     )
+}
+/// Shows "typing…" for the message being answered. WhatsApp also marks that
+/// message as read, and clears the indicator after 25 seconds or on the reply.
+pub fn typing_payload(message_id: &str) -> Value {
+    json!({"messaging_product":"whatsapp","status":"read","message_id":message_id,"typing_indicator":{"type":"text"}})
+}
+/// The emoji people react with to pick each choice: 👍 for one, 👍 and 👎 for two,
+/// keycaps 1️⃣ to 🔟 for more.
+pub fn reaction_emojis(count: usize) -> Vec<&'static str> {
+    const KEYCAPS: [&str; 10] = [
+        "1\u{fe0f}\u{20e3}",
+        "2\u{fe0f}\u{20e3}",
+        "3\u{fe0f}\u{20e3}",
+        "4\u{fe0f}\u{20e3}",
+        "5\u{fe0f}\u{20e3}",
+        "6\u{fe0f}\u{20e3}",
+        "7\u{fe0f}\u{20e3}",
+        "8\u{fe0f}\u{20e3}",
+        "9\u{fe0f}\u{20e3}",
+        "\u{1f51f}",
+    ];
+    match count {
+        1 => vec!["\u{1f44d}"],
+        2 => vec!["\u{1f44d}", "\u{1f44e}"],
+        _ => KEYCAPS.iter().take(count).copied().collect(),
+    }
+}
+/// Whether two reactions are the same emoji, ignoring skin tones and the
+/// variation selector that WhatsApp clients add or drop.
+pub fn same_emoji(left: &str, right: &str) -> bool {
+    let plain = |s: &str| -> String {
+        s.chars()
+            .filter(|c| *c != '\u{fe0f}' && !('\u{1f3fb}'..='\u{1f3ff}').contains(c))
+            .collect()
+    };
+    !left.is_empty() && plain(left) == plain(right)
+}
+/// A prompt as a text reply that lists which emoji to react with for each choice.
+/// Returns the payload, the text sent, and each choice's emoji.
+pub fn reaction_prompt_payload(
+    text: &str,
+    recipient: &str,
+    id: &str,
+    labels: &[String],
+) -> Result<(Value, String, Vec<&'static str>), &'static str> {
+    let emojis = reaction_emojis(labels.len());
+    if emojis.len() != labels.len() {
+        return Err("WhatsApp reaction prompts allow 1 to 10 choices");
+    }
+    let legend = emojis
+        .iter()
+        .zip(labels)
+        .map(|(emoji, label)| format!("{emoji} {label}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!("{}\n\nReact with:\n{legend}", text.trim_end());
+    let payload = text_payload(Some(&body), recipient, id)?;
+    Ok((payload, body, emojis))
+}
+/// Reactions to messages, as messages from the person who reacted. Removed
+/// reactions (an empty emoji) are left out.
+pub fn reactions(payload: &Value, phone: &str) -> Vec<Message> {
+    let mut found = Vec::new();
+    if payload["object"] != "whatsapp_business_account" {
+        return found;
+    }
+    for entry in items(&payload["entry"]) {
+        for change in items(&entry["changes"]) {
+            let value = &change["value"];
+            if change["field"] != "messages"
+                || value["messaging_product"] != "whatsapp"
+                || value["metadata"]["phone_number_id"] != phone
+            {
+                continue;
+            }
+            for event in items(&value["messages"]) {
+                let reaction = &event["reaction"];
+                let (Some(sender), Some(id), Some(target), Some(emoji)) = (
+                    event["from"].as_str().filter(|s| digits(s)),
+                    event["id"].as_str().filter(|s| !s.is_empty()),
+                    reaction["message_id"].as_str().filter(|s| !s.is_empty()),
+                    reaction["emoji"].as_str().filter(|s| !s.is_empty()),
+                ) else {
+                    continue;
+                };
+                if event["type"] != "reaction" {
+                    continue;
+                }
+                found.push(Message {
+                    id: format!("whatsapp:{phone}:{id}").into(),
+                    conversation_id: format!("whatsapp:{phone}:{sender}").into(),
+                    channel: "whatsapp".into(),
+                    sender: Sender {
+                        id: sender.into(),
+                        display_name: items(&value["contacts"])
+                            .iter()
+                            .rev()
+                            .find(|v| v["wa_id"] == sender)
+                            .and_then(|v| v["profile"]["name"].as_str())
+                            .map(str::to_owned),
+                    },
+                    text: emoji.into(),
+                    role: Role::User,
+                    thread_id: None,
+                    addressed: true,
+                    attachments: vec![],
+                    metadata: [
+                        ("phone_number_id".into(), json!(phone)),
+                        ("message_id".into(), json!(id)),
+                        ("wa_id".into(), json!(sender)),
+                        ("message_type".into(), json!("reaction")),
+                        ("reacted_to".into(), json!(target)),
+                        ("emoji".into(), json!(emoji)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                });
+            }
+        }
+    }
+    found
+}
+/// The `interactive` object of a prompt: up to three short choices become reply
+/// buttons (titles of 20 characters); otherwise a list of up to ten rows, with long
+/// labels continued in the row's description. YCloud sends the same object.
+pub fn prompt_interactive(
+    text: &str,
+    prompt: &str,
+    choices: &[(String, String)],
+) -> Result<Value, &'static str> {
+    if text.trim().is_empty() || text.chars().count() > 1024 {
+        return Err("WhatsApp prompts need 1 to 1,024 characters of text");
+    }
+    let token = |choice: &str| {
+        agentchat_core::prompt_token(prompt, choice).map_err(|_| "Invalid prompt or choice ID")
+    };
+    let short = |label: &str, limit: usize| -> String {
+        if label.chars().count() <= limit {
+            label.into()
+        } else {
+            label.chars().take(limit - 1).chain(['…']).collect()
+        }
+    };
+    let mut interactive =
+        if choices.len() <= 3 && choices.iter().all(|(_, l)| l.chars().count() <= 20) {
+            let buttons = choices
+                .iter()
+                .map(|(choice, label)| {
+                    Ok(json!({"type": "reply", "reply": {"id": token(choice)?, "title": label}}))
+                })
+                .collect::<Result<Vec<_>, &'static str>>()?;
+            json!({"type": "button", "action": {"buttons": buttons}})
+        } else {
+            let rows = choices
+                .iter()
+                .map(|(choice, label)| {
+                    let mut row = json!({"id": token(choice)?, "title": short(label, 24)});
+                    if label.chars().count() > 24 {
+                        row["description"] = json!(short(label, 72));
+                    }
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, &'static str>>()?;
+            json!({"type": "list", "action": {"button": "Choose", "sections": [{"rows": rows}]}})
+        };
+    interactive["body"] = json!({"text": text});
+    Ok(interactive)
+}
+/// The answer a button or list reply carries, if it is a reply to a prompt.
+pub fn reply_answer(event: &Value) -> Option<Value> {
+    let interactive = &event["interactive"];
+    let reply = if interactive["button_reply"].is_object() {
+        &interactive["button_reply"]
+    } else {
+        &interactive["list_reply"]
+    };
+    (event["type"] == "interactive")
+        .then(|| reply["id"].as_str())
+        .flatten()
+        .and_then(agentchat_core::answer_metadata)
+}
+/// A prompt as a Cloud API interactive reply to the source message.
+pub fn prompt_payload(
+    text: &str,
+    recipient: &str,
+    id: &str,
+    prompt: &str,
+    choices: &[(String, String)],
+) -> Result<Value, &'static str> {
+    Ok(json!({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "interactive",
+        "interactive": prompt_interactive(text, prompt, choices)?,
+        "context": {"message_id": id},
+    }))
 }
 pub fn receipt(
     source: &Message,
@@ -239,6 +438,31 @@ mod tests {
         assert!(validate_config("١", "t", "s", "v", "v23.0").is_err());
         assert!(text_payload(Some(&"😀".repeat(4096)), "1", "m").is_ok());
         assert!(text_payload(None, "1", "m").is_err());
+        let (payload, body, emojis) =
+            reaction_prompt_payload("Run?", "1", "m", &["Approve".into(), "Deny".into()]).unwrap();
+        assert_eq!(body, "Run?\n\nReact with:\n👍 Approve\n👎 Deny");
+        assert_eq!(payload["text"]["body"], body);
+        assert_eq!(emojis, ["👍", "👎"]);
+        assert_eq!(reaction_emojis(3)[2], "3️⃣");
+        assert!(reaction_prompt_payload("Run?", "1", "m", &vec!["x".into(); 11]).is_err());
+        assert!(same_emoji("👍🏽", "👍") && same_emoji("1⃣", "1️⃣") && !same_emoji("", ""));
+        assert!(!same_emoji("👎", "👍"));
+        let buttons = prompt_payload("Run?", "1", "m", "p", &[("y".into(), "Yes".into())]).unwrap();
+        assert_eq!(buttons["interactive"]["type"], "button");
+        assert_eq!(
+            buttons["interactive"]["action"]["buttons"][0]["reply"]["id"],
+            "ac:p:y"
+        );
+        let long = [("a".into(), "A label longer than twenty".into())];
+        let list = prompt_payload("Run?", "1", "m", "p", &long).unwrap();
+        assert_eq!(list["interactive"]["type"], "list");
+        let row = &list["interactive"]["action"]["sections"][0]["rows"][0];
+        assert_eq!(row["title"].as_str().unwrap().chars().count(), 24);
+        assert_eq!(row["description"], "A label longer than twenty");
+        assert_eq!(
+            typing_payload("wamid.1"),
+            json!({"messaging_product":"whatsapp","status":"read","message_id":"wamid.1","typing_indicator":{"type":"text"}})
+        );
     }
     #[test]
     fn signature_is_verified() {

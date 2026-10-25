@@ -9,8 +9,8 @@ if TYPE_CHECKING:
     from agentchat.context import Conversation, MessageContext
 
 __all__ = [
-    "Attachment", "Conversation", "DownloadedFile", "Message", "MessageContext", "RichReply",
-    "Role", "Sender", "UploadFile", "UploadedFile",
+    "Answer", "Attachment", "Choice", "Conversation", "DownloadedFile", "Message",
+    "MessageContext", "Prompt", "RichReply", "Role", "Sender", "UploadFile", "UploadedFile",
 ]
 
 Role = Literal["user", "assistant"]
@@ -63,6 +63,34 @@ class RichReply:
     text: str
     blocks: tuple[Mapping[str, object], ...] = ()
     attachments: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Choice:
+    """One button of a prompt. `id` is returned in the answer; people see `label`."""
+
+    id: str
+    label: str
+    style: Literal["default", "primary", "danger"] = "default"
+
+
+@dataclass(frozen=True, slots=True)
+class Prompt:
+    """A question with buttons, as AgentChat hands it to a channel to show."""
+
+    id: str
+    text: str
+    choices: tuple[Choice, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Answer:
+    """The button someone pressed, and who pressed it."""
+
+    prompt: str
+    choice: str
+    label: str
+    sender: Sender
 
 
 @dataclass(frozen=True, slots=True)

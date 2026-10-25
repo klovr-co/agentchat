@@ -40,6 +40,19 @@ changes its label. Upload/download content uses `Uint8Array`/`Buffer` and is not
 added to conversation history. The host remains responsible for authorizing
 history, file access, mirroring, and thread subscriptions.
 
+A conversation runs one handler at a time. By default a message that arrives
+meanwhile is steered: it is added to history and returned once by
+`context.steered()`; messages the handler never reads run afterwards as their own
+turns. Pass `busy: "queue"`, `"ask"` (Queue/Steer buttons), or `"reject"` to
+change this. `app.stop(conversationId)` or a button from `context.offerStop()`
+sets `context.stopped` and resolves `context.waitStopped()`; stopping is
+cooperative. `context.ask(text, choices)` shows Block Kit buttons, accepts only
+the sender's press by default (`allowed` widens it), and rejects with a
+`TimeoutError` when nobody answers. `context.stream()` shows the answer with
+Slack's native stream in threads and posts it once elsewhere; call `finish()`,
+or `abort()` on failure, and return `null`. Button presses need **Interactivity**
+turned on in the Slack app. See [Live controls](../../docs/live-controls.md).
+
 Native metadata is portable JSON. Node handlers execute on Node's event loop;
 provider I/O and per-conversation ordering run in Rust. Different conversations
 can run concurrently. The default history and deduplication store is in memory.

@@ -26,6 +26,8 @@ class DiscordClient:
         self.user = SimpleNamespace(id=99, display_name="Bot")
         self.stopped, self.started = asyncio.Event(), asyncio.Event()
         self.closed = False
+        self.typing, self.typing_error = [], None
+        self.edits = []
 
     async def start(self, token):
         self.started.set()
@@ -40,3 +42,11 @@ class DiscordClient:
 
     async def send_text(self, channel_id, payload):
         return self.receipt.get(channel_id, payload)
+
+    async def trigger_typing(self, channel_id):
+        self.typing.append(channel_id)
+        if self.typing_error:
+            raise self.typing_error
+
+    async def edit_text(self, channel_id, message_id, payload):
+        self.edits.append((channel_id, message_id, payload["content"]))

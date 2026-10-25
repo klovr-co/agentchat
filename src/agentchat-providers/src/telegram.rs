@@ -215,6 +215,11 @@ pub fn normalize(update: &Value, bot: i64, username: &str) -> Option<Message> {
             .metadata
             .insert("callback_query_id".into(), json!(id));
         result.metadata.insert("callback_data".into(), json!(data));
+        if let Some(answer) = agentchat_core::answer_metadata(data) {
+            result
+                .metadata
+                .insert(agentchat_core::ANSWER_METADATA.into(), answer);
+        }
         return Some(result);
     }
     let message = &update["message"];
@@ -807,6 +812,30 @@ pub fn rich_payload(content: &agentchat_core::RichReply) -> Result<Value, &'stat
     payload["reply_markup"] = json!(content.blocks[0]);
     Ok(payload)
 }
+/// A prompt as a message with one inline button per choice: one row for up to
+/// three, otherwise one per row.
+pub fn prompt_payload(
+    text: &str,
+    prompt: &str,
+    choices: &[(String, String)],
+) -> Result<Value, &'static str> {
+    let mut payload = text_payload(Some(text))?;
+    let buttons = choices
+        .iter()
+        .map(|(id, label)| {
+            agentchat_core::prompt_token(prompt, id)
+                .map(|token| json!({"text": label, "callback_data": token}))
+                .map_err(|_| "Invalid prompt or choice ID")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<Value> = if buttons.len() <= 3 {
+        vec![json!(buttons)]
+    } else {
+        buttons.into_iter().map(|b| json!([b])).collect()
+    };
+    payload["reply_markup"] = json!({"inline_keyboard": rows});
+    Ok(payload)
+}
 pub fn validate_upload(file: &agentchat_core::UploadFile) -> Result<(), &'static str> {
     if !plain_filename(&file.filename) {
         return Err("Expected a plain filename");
@@ -860,4 +889,16 @@ pub fn download_name(attachment: &Attachment, path: &str) -> String {
                 .unwrap_or("attachment")
         })
         .into()
+}
+
+/// The Bot API method and payload that close a prompt: its text with the answer, or
+/// (`None`, on expiry) the same message without its keyboard.
+pub fn close_prompt_request(answered: Option<&str>) -> Result<(&'static str, Value), &'static str> {
+    match answered {
+        Some(text) => Ok(("editMessageText", text_payload(Some(text))?)),
+        None => Ok((
+            "editMessageReplyMarkup",
+            json!({"reply_markup": {"inline_keyboard": []}}),
+        )),
+    }
 }

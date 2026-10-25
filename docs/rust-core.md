@@ -81,6 +81,13 @@ conversation ordering, context operations and the turn engine. Custom channels
 implement the open `Channel` trait; they do not need registration in a closed
 provider enum. Rust applications use their own Tokio runtime.
 
+The runtime also owns the live controls: the busy policy (`Busy::Steer` by
+default, so a message sent while its conversation's handler runs reaches
+`steered()` instead of waiting), cooperative Stop, prompts with buttons, and
+`AnswerStream`. `receive` may call its handler more than once, for steered
+messages left unread, so it takes an `Fn`. Streaming and prompts are optional
+`Channel` methods. See [Live controls](live-controls.md).
+
 Provider crates own normalization, route validation, authentication, transports
 and confirmed receipts. Language bindings do not parse Slack routing fields or
 implement independent turn algorithms. Shared domain results use named structs

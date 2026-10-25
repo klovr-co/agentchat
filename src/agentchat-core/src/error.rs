@@ -9,6 +9,9 @@ pub enum Error {
     Transport(String),
     #[error("{0}")]
     Handler(String),
+    /// Nobody answered a prompt in time; never an approval.
+    #[error("{0}")]
+    Timeout(String),
     #[error("Channel is closed")]
     Closed,
     #[error("Invalid turn transition: {0}")]

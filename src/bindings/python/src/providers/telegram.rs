@@ -2,6 +2,7 @@
 #[path = "telegram_transport.rs"]
 mod transport;
 use super::transport::*;
+use crate::prompts::PromptFields;
 use crate::{convert, host};
 use agentchat_providers::telegram as policy;
 use pyo3::{
@@ -503,6 +504,122 @@ impl Telegram {
             .await
         })
     }
+    /// Telegram limits how often one chat's messages can be edited.
+    #[classattr]
+    fn stream_interval() -> f64 {
+        2.0
+    }
+    #[classattr]
+    fn stream_limit() -> usize {
+        4096
+    }
+    /// Send the first part of a streamed answer; later parts edit it in place.
+    fn start_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        text: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let source = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let dest = destination(&this, &source)?;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let payload = stream_payload(&text)?;
+            let result =
+                client_call(&this, "sendMessage", Some(dest.route(payload, true)), None).await?;
+            let id = value(&result)?["message_id"]
+                .as_i64()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("Telegram did not return a message receipt")
+                })?;
+            j(json!({"message_id": id, "shown": text}))
+        })
+    }
+    fn append_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        text: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let (_, stream) = edit_streamed(&slf.into_any(), &source, &stream, &text).await?;
+            Ok(stream)
+        })
+    }
+    fn stop_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        text: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            policy::text_payload(Some(&text)).map_err(PyValueError::new_err)?;
+            let (id, _) = edit_streamed(&this, &source, &stream, &text).await?;
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let sent = policy::receipt(
+                &message,
+                extract(&get(&this, "_bot_id")?)?,
+                extract(&get(&this, "_first_name")?)?,
+                &text,
+                &json!({"message_id": id}),
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            receipt_with_metadata(&source, &sent)
+        })
+    }
+    /// Show a prompt with one inline button per choice, quoting the source.
+    fn send_prompt(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        prompt: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let fields = Python::attach(|py| PromptFields::read(prompt.bind(py)))?;
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let payload = policy::prompt_payload(&fields.text, &fields.id, &fields.pairs())
+                .map_err(PyValueError::new_err)?;
+            send(&this, &source, &message, payload, &fields.text).await
+        })
+    }
+    /// Take the buttons away; an answered prompt also shows the choice and who made it.
+    fn close_prompt(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        sent: Py<PyAny>,
+        prompt: Py<PyAny>,
+        answer: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let (closed, message_id) = Python::attach(|py| -> PyResult<_> {
+                let fields = PromptFields::read(prompt.bind(py))?;
+                let sent = convert::from_message(sent.bind(py))?;
+                Ok((
+                    fields.closed_text(answer.bind(py))?,
+                    sent.metadata["message_id"].clone(),
+                ))
+            })?;
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let dest = destination(&this, &message)?;
+            let (method, mut payload) =
+                policy::close_prompt_request(closed.as_deref()).map_err(PyValueError::new_err)?;
+            payload["chat_id"] = json!(dest.chat_id);
+            payload["message_id"] = message_id;
+            match client_call(&this, method, Some(payload), None).await {
+                Ok(_) => Ok(none()),
+                Err(error) if error.to_string().contains("message is not modified") => Ok(none()),
+                Err(error) => Err(error),
+            }
+        })
+    }
     fn reply_rich(
         slf: Py<Self>,
         py: Python<'_>,
@@ -802,6 +919,42 @@ async fn send(
     )
     .map_err(PyRuntimeError::new_err)?;
     receipt_with_metadata(source_host, &message)
+}
+/// A streamed part as a message payload; a part with no visible text shows "…".
+fn stream_payload(text: &str) -> PyResult<Value> {
+    policy::text_payload(Some(text))
+        .or_else(|_| policy::text_payload(Some("…")))
+        .map_err(PyValueError::new_err)
+}
+/// Edit a streamed message to `text`, unless it already shows it. Returns its
+/// message ID and the handle for the next call.
+async fn edit_streamed(
+    this: &Py<PyAny>,
+    source: &Py<PyAny>,
+    stream: &Py<PyAny>,
+    text: &str,
+) -> PyResult<(i64, Py<PyAny>)> {
+    let source = Python::attach(|py| convert::from_message(source.bind(py)))?;
+    let dest = destination(this, &source)?;
+    call(&get(this, "_delivery")?, "check_reply", vec![], None)?;
+    let mut handle = value(stream)?;
+    let id = handle["message_id"]
+        .as_i64()
+        .ok_or_else(|| PyValueError::new_err("Expected a Telegram stream handle"))?;
+    if handle["shown"] == text {
+        return Ok((id, clone_obj(stream)));
+    }
+    let mut payload = stream_payload(text)?;
+    payload["chat_id"] = json!(dest.chat_id);
+    payload["message_id"] = json!(id);
+    match client_call(this, "editMessageText", Some(payload), None).await {
+        Ok(_) => {}
+        // Markdown that renders the same as before leaves nothing to change.
+        Err(error) if error.to_string().contains("message is not modified") => {}
+        Err(error) => return Err(error),
+    }
+    handle["shown"] = json!(text);
+    Ok((id, j(handle)?))
 }
 fn cancel_typing(this: &Py<PyAny>, key: &Py<PyAny>) -> PyResult<()> {
     let task = call(

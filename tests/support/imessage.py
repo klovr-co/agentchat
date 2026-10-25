@@ -34,6 +34,20 @@ class BubblesClient:
         self.closed = True
 
 
+class TypingBubblesClient(BubblesClient):
+    """A client whose server shows typing only with its Private API on."""
+
+    def __init__(self, receipt, private_api=True):
+        super().__init__(receipt)
+        self.private_api = private_api
+        self.typed = []
+
+    async def start_typing(self, chat_guid):
+        self.typed.append(chat_guid)
+        self.receipt.get(chat_guid)
+        return self.private_api
+
+
 class SocketClient:
     def __init__(self):
         self.stopped, self.started = asyncio.Event(), asyncio.Event()

@@ -55,8 +55,27 @@ chat, and outgoing replies appear in its main timeline. There is no automatic
 history backfill or replay of events missed while offline. Socket reconnection
 recovers future traffic, not missed messages.
 
-Attachment-only messages retain file references, but downloads, uploads, rich
-replies, and working indicators are not implemented. See [shared capabilities](providers.md).
+Attachment-only messages retain file references, but downloads, uploads, and
+rich replies are not implemented. See [shared capabilities](providers.md).
+
+## Typing indicator
+
+`set_status()` and `context.working()` show "typing…" in the chat; iMessage shows
+no status text. This needs the BlueBubbles Private API with its helper connected.
+Without it the server refuses the request and `set_status()` returns `False`, so
+`working()` does nothing and the reply still goes out. Basic replies do not need
+the Private API.
+
+AgentChat sends `POST /api/v1/chat/{chat GUID}/typing` and repeats it every 5
+seconds (`TYPING_INTERVAL` in `agentchat.channels.imessage.adapter`) because the
+server stops typing after about 10 seconds. It stops repeating when the status
+is cleared, `close()` runs, or 120 seconds (`TYPING_EXPIRY`) pass. Clearing sends
+the Socket.IO `stopped-typing` event; the reply also ends the indicator. A custom
+`client` needs `start_typing(chat_guid) -> bool` for typing; without it
+`set_status()` returns `False`.
+
+Streamed answers arrive as one reply when finished, and `ask()` raises
+`TypeError` because iMessage has no buttons; see [Live controls](live-controls.md).
 
 BlueBubbles authenticates using a password in request query parameters. The
 adapter disables redirects, suppresses credential-bearing Socket.IO diagnostics,
@@ -73,6 +92,7 @@ and restarting the adapter.
 | Incoming messages appear but sends fail | Messages is signed in; BlueBubbles can automate Messages and send through AppleScript. |
 | No inbound event | Test from another Apple account; check the chat allowlist and that the Mac actually received the message. |
 | Works only while the Mac is awake | Keep the BlueBubbles host running and reachable. |
+| `set_status()` returns `False` | Enable the BlueBubbles Private API and check that its helper is connected. |
 
 Local tests run real Socket.IO and REST round trips against a simulated server.
 They do not exercise macOS Messages. The live echo above is the final check.

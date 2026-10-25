@@ -6,3 +6,8 @@ _IMessageBase = load_imessage()
 
 class IMessage(_IMessageBase):
     __init__ = _IMessageBase.initialize
+
+# BlueBubbles stops "typing…" after about 10 seconds or when the reply arrives.
+TYPING_INTERVAL = 5
+# Stop refreshing a forgotten indicator after this many seconds.
+TYPING_EXPIRY = 120

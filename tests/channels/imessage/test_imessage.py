@@ -10,7 +10,13 @@ from agentchat import AgentChat
 from agentchat.channels.imessage import IMessage
 from agentchat.channels.imessage.events import normalize
 from agentchat.channels.imessage.transport import BlueBubblesClient
-from tests.support.imessage import CHAT_GUID, BubblesClient, SocketClient, imessage_event
+from tests.support.imessage import (
+    CHAT_GUID,
+    BubblesClient,
+    SocketClient,
+    TypingBubblesClient,
+    imessage_event,
+)
 from tests.support.receipts import Receipt
 
 
@@ -184,3 +190,118 @@ async def test_http_errors_redirects_and_unconfirmed_sends(status, data):
 def test_url_validation(url):
     with pytest.raises(ValueError):
         BlueBubblesClient(url, "secret")
+
+
+@pytest.mark.asyncio
+async def test_typing_is_false_without_the_private_api_or_client_support():
+    source = normalize(imessage_event(), instance_id="mac")
+    off = IMessage(
+        server_url="http://localhost:1234", password="fake", instance_id="mac",
+        client=TypingBubblesClient(Receipt(), private_api=False), socket_client=SocketClient(),
+    )
+    without = IMessage(
+        server_url="http://localhost:1234", password="fake", instance_id="mac",
+        client=BubblesClient(Receipt()), socket_client=SocketClient(),
+    )
+    try:
+        assert await off.set_status(source, "thinking") is False
+        assert await without.set_status(source, "thinking") is False
+        assert await without.set_status(source, "") is True
+    finally:
+        await off.close()
+        await without.close()
+
+
+# What a BlueBubbles server answers when its Private API is off.
+PRIVATE_API_OFF = {
+    "status": 500,
+    "message": "Please make sure you have completed the setup for the Private API, "
+    "and your helper is connected!",
+    "error": {"type": "iMessage Error", "message": "iMessage Private API is not enabled!"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,body,shown",
+    [
+        (200, {"status": 200, "message": "Successfully started typing!"}, True),
+        (500, PRIVATE_API_OFF, False),
+        (404, {"status": 404, "message": "Not Found"}, False),
+    ],
+)
+async def test_bluebubbles_typing_route_and_private_api_check(status, body, shown):
+    paths = []
+
+    async def typing(request):
+        assert request.query["password"] == "secret"
+        paths.append(request.match_info["guid"])
+        return web.json_response(body, status=status)
+
+    server_app = web.Application()
+    server_app.router.add_post("/api/v1/chat/{guid}/typing", typing)
+    async with TestServer(server_app) as server:
+        client = BlueBubblesClient(str(server.make_url("/")), "secret")
+        try:
+            assert await client.start_typing(CHAT_GUID) is shown
+            assert paths == [CHAT_GUID]
+        finally:
+            await client.close()
+
+
+@pytest.mark.asyncio
+async def test_bluebubbles_typing_errors_still_raise():
+    async def typing(request):
+        return web.json_response({"status": 401, "message": "Unauthorized"}, status=401)
+
+    server_app = web.Application()
+    server_app.router.add_post("/api/v1/chat/{guid}/typing", typing)
+    async with TestServer(server_app) as server:
+        client = BlueBubblesClient(str(server.make_url("/")), "secret")
+        try:
+            with pytest.raises(RuntimeError, match="HTTP 401"):
+                await client.start_typing(CHAT_GUID)
+        finally:
+            await client.close()
+
+
+@pytest.mark.asyncio
+async def test_clearing_typing_uses_the_socket_event():
+    server_socket = socketio.AsyncServer(async_mode="aiohttp")
+    server_app = web.Application()
+    server_socket.attach(server_app)
+    stopped, typed = asyncio.Event(), []
+
+    @server_socket.on("stopped-typing")
+    async def stop(sid, data):
+        typed.append(("stop", data))
+        stopped.set()
+
+    async def ping(request):
+        return web.json_response({"status": 200, "data": "pong"})
+
+    async def typing(request):
+        typed.append((request.method, request.match_info["guid"]))
+        return web.json_response({"status": 200, "message": "Successfully started typing!"})
+
+    server_app.router.add_get("/api/v1/ping", ping)
+    server_app.router.add_route("*", "/api/v1/chat/{guid}/typing", typing)
+    async with TestServer(server_app) as server:
+        channel = IMessage(server_url=str(server.make_url("/")), password="pw", instance_id="mac")
+        channel.bind(lambda *_: None)
+        running = asyncio.create_task(channel.run())
+        try:
+            for _ in range(100):
+                if channel._socket.connected:
+                    break
+                await asyncio.sleep(0.02)
+            source = normalize(imessage_event(), instance_id="mac")
+            assert await channel.set_status(source, "thinking") is True
+            assert await channel.set_status(source, "") is True
+            await asyncio.wait_for(stopped.wait(), timeout=3)
+            # Never DELETE: on current servers that route starts typing again.
+            assert typed == [("POST", CHAT_GUID), ("stop", {"chatGuid": CHAT_GUID})]
+        finally:
+            await channel.close()
+            await asyncio.gather(running, return_exceptions=True)
+            await server_socket.shutdown()

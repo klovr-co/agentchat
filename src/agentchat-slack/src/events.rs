@@ -196,6 +196,66 @@ pub fn attachments_bounded(files: &Value, limit: usize) -> Vec<Attachment> {
     selected
 }
 
+/// A press on a prompt button (`block_actions`), as a message in the conversation
+/// the prompt was shown in; None for any other interaction.
+pub fn normalize_action(
+    payload: &Value,
+    bot_user_id: Option<&str>,
+    workspace_id: Option<&str>,
+    channel_name: &str,
+) -> Option<Message> {
+    if payload["type"] != "block_actions" {
+        return None;
+    }
+    let team = nonempty(&payload["team"]["id"])?;
+    if workspace_id.is_some_and(|workspace| team != workspace) {
+        return None;
+    }
+    let user = nonempty(&payload["user"]["id"])?;
+    if Some(user) == bot_user_id {
+        return None;
+    }
+    let channel = nonempty(&payload["channel"]["id"])
+        .or_else(|| nonempty(&payload["container"]["channel_id"]))?;
+    let prompt_ts = nonempty(&payload["message"]["ts"])
+        .or_else(|| nonempty(&payload["container"]["message_ts"]))?;
+    let thread = nonempty(&payload["message"]["thread_ts"])
+        .or_else(|| nonempty(&payload["container"]["thread_ts"]));
+    let (action, answer) = payload["actions"].as_array()?.iter().find_map(|action| {
+        let answer = agentchat_core::answer_metadata(action["value"].as_str()?)?;
+        Some((action, answer))
+    })?;
+    let action_ts = nonempty(&action["action_ts"]).unwrap_or(prompt_ts);
+    let direct = channel.starts_with('D');
+    let root = thread.unwrap_or(prompt_ts);
+    let mut metadata = json!({
+        "channel_id": channel, "team_id": team,
+        "channel_type": if direct { "im" } else { "channel" },
+        "reply_thread_timestamp": thread, "message_timestamp": prompt_ts,
+    });
+    metadata[agentchat_core::ANSWER_METADATA] = answer;
+    Some(Message {
+        id: format!("slack:{team}:{channel}:action:{action_ts}:{user}").into(),
+        conversation_id: if direct {
+            format!("slack:{team}:{channel}")
+        } else {
+            format!("slack:{team}:{channel}:{root}")
+        }
+        .into(),
+        channel: channel_name.into(),
+        sender: Sender {
+            id: user.into(),
+            display_name: payload["user"]["name"].as_str().map(str::to_owned),
+        },
+        text: action["text"]["text"].as_str().unwrap_or_default().into(),
+        role: Role::User,
+        thread_id: thread.map(str::to_owned),
+        addressed: true,
+        attachments: vec![],
+        metadata: metadata.as_object()?.clone(),
+    })
+}
+
 /// Decode an authenticated Events API payload without doing I/O.
 /// Untagged thread replies are marked for the adapter's subscription check.
 pub fn normalize(payload: &Value, bot_user_id: &str, workspace_id: &str) -> Option<Message> {

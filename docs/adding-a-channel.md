@@ -63,8 +63,11 @@ structurally; no capability registry is needed.
 | `FileUploadChannel` | `upload_files()` | Raises `TypeError` |
 | `FileDownloadChannel` | `download_attachment()` | Raises `TypeError` |
 | `MirroringChannel` | `mirror()` | Raises `TypeError` |
+| `StreamingChannel` | `start_stream()`, `append_stream()`, `stop_stream()` | One reply when the stream finishes |
+| `InteractiveChannel` | `send_prompt()`, `close_prompt()` | `ask()` raises `TypeError`; `busy="ask"` steers |
 
 Read exact signatures in [`channels/base.py`](../python/agentchat/channels/base.py).
+Streaming and prompt buttons are described in [Live controls](live-controls.md).
 Native history returns messages before the current turn; the context appends the
 current message and bounds the result. History errors propagate. Rich content can
 remain provider-specific. Normalize attachment references without downloading

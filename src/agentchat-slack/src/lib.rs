@@ -26,8 +26,8 @@ use std::sync::{
 use std::time::Duration;
 
 use agentchat_core::{
-    Attachment, Channel, ConversationId, DownloadedFile, Error, Message, MessageId, Result,
-    RichReply, UploadFile, UploadedFile,
+    Answer, Attachment, Channel, ConversationId, DownloadedFile, Error, Message, MessageId, Prompt,
+    Result, RichReply, StreamHandle, StreamOptions, UploadFile, UploadedFile,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -312,6 +312,15 @@ impl Slack {
 
     async fn prepare_event(&self, payload: &Value) -> Result<Option<Message>> {
         let identity = self.identity().await?;
+        // Interactivity payloads: a press on a prompt button answers that prompt.
+        if payload["type"] == "block_actions" {
+            return Ok(events::normalize_action(
+                payload,
+                Some(&identity.bot_user_id),
+                Some(&identity.workspace_id),
+                "slack",
+            ));
+        }
         let Some(message) =
             events::normalize(payload, &identity.bot_user_id, &identity.workspace_id)
         else {
@@ -399,6 +408,25 @@ impl Slack {
         Ok(())
     }
 
+    fn sent_message(
+        source: &Message,
+        destination: &Destination,
+        content: String,
+        receipt: policy::MessageReceipt,
+    ) -> Message {
+        policy::reply_message(
+            source,
+            policy::ReplyMessageRoute {
+                channel_id: destination.channel_id.clone(),
+                thread_timestamp: json!(destination.thread_timestamp),
+                team_id: Some(destination.team_id.clone()),
+            },
+            content,
+            receipt,
+            None,
+        )
+    }
+
     async fn post_message(
         &self,
         source: &Message,
@@ -413,16 +441,11 @@ impl Slack {
         let response = self.inner.client.call("chat.postMessage", &payload).await?;
         let receipt =
             policy::MessageReceipt::confirmed_timestamp(&response, policy::DeliveryKind::Reply)?;
-        Ok(policy::reply_message(
+        Ok(Self::sent_message(
             source,
-            policy::ReplyMessageRoute {
-                channel_id: destination.channel_id.clone(),
-                thread_timestamp: json!(destination.thread_timestamp),
-                team_id: Some(destination.team_id.clone()),
-            },
+            destination,
             content.into(),
             receipt,
-            None,
         ))
     }
 
@@ -464,6 +487,105 @@ impl Slack {
             )
             .await?;
         Ok(true)
+    }
+
+    /// Start a native stream in the source thread. Outside a thread the answer is
+    /// posted once when the stream stops.
+    pub async fn start_stream(&self, source: &Message, text: &str) -> Result<StreamHandle> {
+        let destination = self.destination(source).await?;
+        let Some(thread) = destination.thread_timestamp else {
+            return Ok(json!({"post": true}));
+        };
+        let request =
+            policy::stream_start_request(&destination.channel_id, thread.as_str(), text, source);
+        let response = self.inner.client.call("chat.startStream", &request).await?;
+        policy::MessageReceipt::confirmed_timestamp(&response, policy::DeliveryKind::Stream)?;
+        Ok(json!({"channel": destination.channel_id, "ts": response["ts"], "sent": text}))
+    }
+
+    pub async fn append_stream(
+        &self,
+        source: &Message,
+        stream: StreamHandle,
+        text: &str,
+    ) -> Result<StreamHandle> {
+        self.destination(source).await?;
+        if stream["post"] == true {
+            return Ok(stream);
+        }
+        let (request, next) = policy::stream_request(&stream, text, false)?;
+        if let Some(request) = request {
+            self.inner
+                .client
+                .call("chat.appendStream", &request)
+                .await?;
+        }
+        Ok(next)
+    }
+
+    pub async fn stop_stream(
+        &self,
+        source: &Message,
+        stream: StreamHandle,
+        text: &str,
+    ) -> Result<Message> {
+        if stream["post"] == true {
+            return self.reply(source, text).await;
+        }
+        let destination = self.destination(source).await?;
+        let (request, _) = policy::stream_request(&stream, text, true)?;
+        if let Some(request) = request {
+            self.inner.client.call("chat.stopStream", &request).await?;
+        }
+        let receipt = policy::MessageReceipt::confirmed_timestamp(
+            &json!({"ok": true, "ts": stream["ts"]}),
+            policy::DeliveryKind::Stream,
+        )?;
+        Ok(Self::sent_message(
+            source,
+            &destination,
+            text.into(),
+            receipt,
+        ))
+    }
+
+    /// Show a prompt in the source thread: its text and one button per choice.
+    pub async fn send_prompt(&self, source: &Message, prompt: &Prompt) -> Result<Message> {
+        let destination = self.destination(source).await?;
+        let choices: Vec<_> = prompt
+            .choices
+            .iter()
+            .map(|c| (c.id.clone(), c.label.clone(), c.style.as_str().to_owned()))
+            .collect();
+        let blocks = rendering::prompt_blocks(&prompt.text, &prompt.id, &choices)?;
+        self.post_message(
+            source,
+            &destination,
+            json!({"text": prompt.text, "blocks": blocks,
+            "unfurl_links": false, "unfurl_media": false}),
+            &prompt.text,
+        )
+        .await
+    }
+
+    /// Replace the buttons with the choice and who made it, or remove them on expiry.
+    pub async fn close_prompt(
+        &self,
+        source: &Message,
+        sent: &Message,
+        prompt: &Prompt,
+        answer: Option<&Answer>,
+    ) -> Result<()> {
+        let destination = self.destination(source).await?;
+        let text = answer.map_or_else(|| prompt.text.clone(), |a| a.closed_text(prompt));
+        let request = json!({
+            "channel": destination.channel_id,
+            "ts": sent.metadata.get("message_timestamp"),
+            "text": text,
+            "blocks": rendering::text_blocks(&text)?,
+        });
+        self.inner.client.call("chat.update", &request).await?;
+        Ok(())
     }
 
     pub async fn mirror(
@@ -542,6 +664,47 @@ impl Channel for Slack {
     }
     async fn mirror(&self, source: &Message, message: &Message, origin: &str) -> Result<Message> {
         Slack::mirror(self, source, message, origin).await
+    }
+    /// Slack accepts a few stream updates per second; one a second leaves headroom.
+    fn streaming(&self) -> Option<StreamOptions> {
+        Some(StreamOptions {
+            limit: Some(policy::STREAM_LIMIT),
+            ..StreamOptions::default()
+        })
+    }
+    async fn start_stream(&self, source: &Message, text: &str) -> Result<StreamHandle> {
+        Slack::start_stream(self, source, text).await
+    }
+    async fn append_stream(
+        &self,
+        source: &Message,
+        stream: StreamHandle,
+        text: &str,
+    ) -> Result<StreamHandle> {
+        Slack::append_stream(self, source, stream, text).await
+    }
+    async fn stop_stream(
+        &self,
+        source: &Message,
+        stream: StreamHandle,
+        text: &str,
+    ) -> Result<Message> {
+        Slack::stop_stream(self, source, stream, text).await
+    }
+    fn supports_prompts(&self) -> bool {
+        true
+    }
+    async fn send_prompt(&self, source: &Message, prompt: &Prompt) -> Result<Message> {
+        Slack::send_prompt(self, source, prompt).await
+    }
+    async fn close_prompt(
+        &self,
+        source: &Message,
+        sent: &Message,
+        prompt: &Prompt,
+        answer: Option<&Answer>,
+    ) -> Result<()> {
+        Slack::close_prompt(self, source, sent, prompt, answer).await
     }
     async fn upload_files(
         &self,

@@ -4,9 +4,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol, runtime_checkable
 
 from agentchat.models import (
+    Answer,
     Attachment,
     DownloadedFile,
     Message,
+    Prompt,
     RichReply,
     UploadedFile,
     UploadFile,
@@ -72,6 +74,43 @@ class FileDownloadChannel(Protocol):
     async def download_attachment(
         self, source: Message, attachment: Attachment, *, max_bytes: int = 10 * 1024 * 1024,
     ) -> DownloadedFile: ...
+
+
+@runtime_checkable
+class StreamingChannel(Protocol):
+    """Optional answers shown while they are written.
+
+    Each call carries the whole text of the current message so far. `start_stream`
+    returns an opaque handle; pass it to the next call, which returns the handle to
+    use after it. `stop_stream` confirms the finished message. A channel may set
+    `stream_interval` (seconds between updates) and `stream_limit` (UTF-16 code
+    units per message); longer answers continue in a new message.
+    """
+
+    async def start_stream(self, source: Message, text: str) -> object: ...
+
+    async def append_stream(self, source: Message, stream: object, text: str) -> object: ...
+
+    async def stop_stream(self, source: Message, stream: object, text: str) -> Message: ...
+
+
+@runtime_checkable
+class InteractiveChannel(Protocol):
+    """Optional questions with buttons, for approvals and choices.
+
+    `send_prompt` shows the prompt in the source conversation with one button per
+    choice. Each button carries `agentchat.prompt_token(prompt.id, choice.id)`. A
+    press arrives as an ordinary `Message` in the same conversation from the person
+    who pressed, with `metadata["agentchat_answer"] = {"prompt": ..., "choice": ...}`.
+    `close_prompt` removes the buttons once answered (`answer`) or expired (None);
+    channels that cannot edit a sent message may do nothing.
+    """
+
+    async def send_prompt(self, source: Message, prompt: Prompt) -> Message: ...
+
+    async def close_prompt(
+        self, source: Message, sent: Message, prompt: Prompt, answer: Answer | None,
+    ) -> None: ...
 
 
 @runtime_checkable

@@ -5,9 +5,11 @@ from typing import ClassVar, NamedTuple
 from aiohttp import web
 
 from agentchat.channels.base import MessageReceiver
-from agentchat.models import DownloadedFile, Message
+from agentchat.models import Answer, DownloadedFile, Message, Prompt
 
 API_ROOT: str
+TYPING_INTERVAL: float
+TYPING_EXPIRY: float
 
 class WhatsAppApiError(NamedTuple):
     code: str | None
@@ -96,6 +98,11 @@ class YCloud:
     async def reply(
         self, source: Message, content: str, *, external_id: str | None = ...
     ) -> Message: ...
+    async def set_status(self, source: Message, status: str) -> bool: ...
+    async def send_prompt(self, source: Message, prompt: Prompt) -> Message: ...
+    async def close_prompt(
+        self, source: Message, sent: Message, prompt: Prompt, answer: Answer | None,
+    ) -> None: ...
     async def send_template(
         self,
         destination: str,

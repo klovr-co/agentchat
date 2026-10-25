@@ -1,11 +1,14 @@
 # Public compatibility signatures; update with the corresponding Rust binding API.
 from collections.abc import Sequence
+from typing import Literal
 
 from agentchat.activity import WorkingStatus
 from agentchat.app import AgentChat
 from agentchat.channels.base import Channel
 from agentchat.models import (
+    Answer,
     Attachment,
+    Choice,
     DownloadedFile,
     Message,
     RichReply,
@@ -13,6 +16,7 @@ from agentchat.models import (
     UploadedFile,
     UploadFile,
 )
+from agentchat.stream import AnswerStream
 
 class Conversation:
     id: str
@@ -35,3 +39,17 @@ class MessageContext:
     ) -> DownloadedFile: ...
     async def set_status(self, status: str) -> bool: ...
     def working(self, status: str = ..., *, refresh_interval: float = ...) -> WorkingStatus: ...
+    def stream(self, *, interval: float | None = ...) -> AnswerStream: ...
+    # A default expiry keeps an unanswered approval from waiting forever.
+    async def ask(
+        self, text: str, choices: Sequence[Choice | str], *, timeout: float = ...,  # noqa: ASYNC109
+        allowed: Sequence[str] | Literal["anyone"] | None = ...,
+    ) -> Answer: ...
+    async def offer_stop(
+        self, *, text: str = ..., label: str = ...,
+        allowed: Sequence[str] | Literal["anyone"] | None = ...,
+    ) -> Message | None: ...
+    @property
+    def stopped(self) -> bool: ...
+    async def wait_stopped(self) -> None: ...
+    def steered(self) -> tuple[Message, ...]: ...

@@ -3,6 +3,7 @@ use super::{
     slack_files::{self, policy_error, PythonFiles},
     transport::*,
 };
+use crate::prompts::PromptFields;
 use crate::{convert, host};
 use agentchat_core::{Message, Role};
 use agentchat_slack::{
@@ -22,6 +23,27 @@ use pyo3::{
 };
 use serde_json::json;
 type Object = Py<PyAny>;
+/// Call a Web API method the SDK may not wrap yet; an unconfirmed call raises.
+async fn slack_api(
+    web: &Object,
+    method: &str,
+    payload: serde_json::Value,
+) -> PyResult<serde_json::Value> {
+    let response = acall(
+        web,
+        "api_call",
+        vec![j(json!(method))?],
+        Some(j(json!({"json": payload}))?),
+    )
+    .await?;
+    let response = value(&response)?;
+    if response["ok"] != true {
+        return Err(PyRuntimeError::new_err(format!(
+            "Slack {method} could not be confirmed"
+        )));
+    }
+    Ok(response)
+}
 fn from_message(value: &Object) -> PyResult<Message> {
     Python::attach(|py| convert::from_message(value.bind(py)))
 }
@@ -482,6 +504,22 @@ impl Slack {
                     receiver,
                 ))
             })?;
+            if message.is_none() {
+                let press = Python::attach(|py| {
+                    let this = slf.borrow(py);
+                    events::normalize_action(
+                        &payload,
+                        this._bot_user_id.as_deref(),
+                        this._workspace_id.as_deref(),
+                        "slack",
+                    )
+                });
+                if let Some(press) = press {
+                    let press = Python::attach(|py| convert::to_message(py, &press))?;
+                    acall(&receiver, "__call__", vec![slf.into_any(), press], None).await?;
+                }
+                return Ok(none());
+            }
             if let Some(message) = message {
                 if message.metadata.get("requires_subscription") == Some(&json!(true))
                     && !extract::<bool>(
@@ -632,6 +670,151 @@ impl Slack {
                 },
             ),
         )
+    }
+    /// Show a prompt in the source thread: its text and one button per choice.
+    fn send_prompt(&self, py: Python<'_>, source: Object, prompt: Object) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        let destination = self.destination(&from_message(&source)?, true)?;
+        let fields = PromptFields::read(prompt.bind(py))?;
+        host::coroutine(py, async move {
+            let blocks = rendering::prompt_blocks(&fields.text, &fields.id, &fields.choices)
+                .map_err(policy_error)?;
+            let payload = json!({
+                "channel": destination.channel_id,
+                "thread_ts": destination.thread_ts,
+                "text": fields.text,
+                "blocks": blocks,
+                "unfurl_links": false,
+                "unfurl_media": false,
+            });
+            let response = acall(&web, "chat_postMessage", vec![], Some(j(payload)?)).await?;
+            let receipt = MessageReceipt::confirmed(&value(&response)?, DeliveryKind::RichReply)
+                .map_err(policy_error)?;
+            let message = policy::reply_message(
+                &from_message(&source)?,
+                ReplyMessageRoute::validated(&destination),
+                fields.text,
+                receipt,
+                None,
+            );
+            Python::attach(|py| convert::to_message(py, &message))
+        })
+    }
+    /// Replace the buttons with the choice and who made it, or remove them on expiry.
+    fn close_prompt(
+        &self,
+        py: Python<'_>,
+        source: Object,
+        sent: Object,
+        prompt: Object,
+        answer: Object,
+    ) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        let destination = self.destination(&from_message(&source)?, true)?;
+        let fields = PromptFields::read(prompt.bind(py))?;
+        let text = fields.closed_text(answer.bind(py))?.unwrap_or(fields.text);
+        let ts = from_message(&sent)?.metadata["message_timestamp"].clone();
+        host::coroutine(py, async move {
+            let payload = json!({
+                "channel": destination.channel_id,
+                "ts": ts,
+                "text": text,
+                "blocks": rendering::text_blocks(&text).map_err(policy_error)?,
+            });
+            let response = acall(&web, "chat_update", vec![], Some(j(payload)?)).await?;
+            if value(&response)?["ok"] != true {
+                return Err(PyRuntimeError::new_err("Slack could not close the prompt"));
+            }
+            Ok(none())
+        })
+    }
+    /// Slack accepts a few stream updates per second; one a second leaves headroom.
+    #[classattr]
+    fn stream_interval() -> f64 {
+        1.0
+    }
+    /// A Slack stream holds at most 12,000 characters; longer answers continue.
+    #[classattr]
+    fn stream_limit() -> usize {
+        policy::STREAM_LIMIT
+    }
+    /// Start a native Slack stream in the source thread. Outside a thread, or with a
+    /// web client that has no `api_call`, the answer is posted once when it stops.
+    fn start_stream(&self, py: Python<'_>, source: Object, text: String) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        let destination = self.destination(&from_message(&source)?, true)?;
+        let streams = web.bind(py).hasattr("api_call")?;
+        host::coroutine(py, async move {
+            let message = from_message(&source)?;
+            let Some(thread) = destination.thread_ts.filter(|_| streams) else {
+                return j(json!({"post": true}));
+            };
+            let payload =
+                policy::stream_start_request(&destination.channel_id, &thread, &text, &message);
+            let response = slack_api(&web, "chat.startStream", payload).await?;
+            MessageReceipt::confirmed_timestamp(&response, DeliveryKind::Stream)
+                .map_err(policy_error)?;
+            j(json!({"channel": destination.channel_id, "ts": response["ts"], "sent": text}))
+        })
+    }
+    fn append_stream(
+        &self,
+        py: Python<'_>,
+        source: Object,
+        stream: Object,
+        text: String,
+    ) -> PyResult<Object> {
+        let web = self._web_client.clone_ref(py);
+        self.destination(&from_message(&source)?, true)?;
+        host::coroutine(py, async move {
+            let handle = value(&stream)?;
+            if handle["post"] == true {
+                return Ok(stream);
+            }
+            let (payload, next) =
+                policy::stream_request(&handle, &text, false).map_err(policy_error)?;
+            if let Some(payload) = payload {
+                slack_api(&web, "chat.appendStream", payload).await?;
+            }
+            j(next)
+        })
+    }
+    fn stop_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Object,
+        stream: Object,
+        text: String,
+    ) -> PyResult<Object> {
+        let this = slf.borrow(py);
+        let web = this._web_client.clone_ref(py);
+        let destination = this.destination(&from_message(&source)?, true)?;
+        drop(this);
+        host::coroutine(py, async move {
+            let handle = value(&stream)?;
+            if handle["post"] == true {
+                let text = j(json!(text))?;
+                return acall(&slf.into_any(), "reply", vec![source, text], None).await;
+            }
+            let (payload, _) =
+                policy::stream_request(&handle, &text, true).map_err(policy_error)?;
+            if let Some(payload) = payload {
+                slack_api(&web, "chat.stopStream", payload).await?;
+            }
+            let receipt = MessageReceipt::confirmed_timestamp(
+                &json!({"ok": true, "ts": handle["ts"]}),
+                DeliveryKind::Stream,
+            )
+            .map_err(policy_error)?;
+            let message = policy::reply_message(
+                &from_message(&source)?,
+                ReplyMessageRoute::validated(&destination),
+                text,
+                receipt,
+                None,
+            );
+            Python::attach(|py| convert::to_message(py, &message))
+        })
     }
     fn reply(&self, py: Python<'_>, source: Object, content: String) -> PyResult<Object> {
         let web = self._web_client.clone_ref(py);
