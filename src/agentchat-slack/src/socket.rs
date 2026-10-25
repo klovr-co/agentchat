@@ -8,7 +8,7 @@ use agentchat_core::{ConversationId, Error, Message, MessageId, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{timeout, Instant, MissedTickBehavior};
 use tokio_tungstenite::{
@@ -20,6 +20,8 @@ use tokio_tungstenite::{
 use super::{host::ack_request, Admission, Inner, Slack, CLOSED, DELIVERY_SCOPE, NEW, RUNNING};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// An acknowledgement sent after its handler answered: envelope ID and body.
+type LateAck = (String, Option<Value>);
 
 struct StopOnDrop(Arc<Inner>);
 impl Drop for StopOnDrop {
@@ -158,6 +160,8 @@ impl Slack {
         }
         let mut has_connected = false;
         let mut retry_seconds = 1;
+        // Acknowledgements that wait for a handler outlive a reconnect.
+        let (late_acks, mut pending_acks) = mpsc::unbounded_channel::<LateAck>();
         loop {
             let open_request = json!({});
             let response = tokio::select! {
@@ -207,7 +211,13 @@ impl Slack {
             retry_seconds = 1;
             self.inner.connected.store(true, Ordering::Release);
             let outcome = self
-                .read_socket(&mut socket, receiver.clone(), handlers)
+                .read_socket(
+                    &mut socket,
+                    receiver.clone(),
+                    handlers,
+                    &late_acks,
+                    &mut pending_acks,
+                )
                 .await;
             self.inner.connected.store(false, Ordering::Release);
             // Drop the socket immediately when shutting down; a stalled close handshake must
@@ -237,6 +247,8 @@ impl Slack {
         socket: &mut Socket,
         receiver: Arc<F>,
         handlers: &mut JoinSet<Result<()>>,
+        late_acks: &mpsc::UnboundedSender<LateAck>,
+        pending_acks: &mut mpsc::UnboundedReceiver<LateAck>,
     ) -> Result<SocketExit>
     where
         F: Fn(Message) -> Fut + Send + Sync + 'static,
@@ -252,6 +264,16 @@ impl Slack {
                 _ = self.inner.stop.cancelled() => return Ok(SocketExit::Shutdown),
                 completed = handlers.join_next(), if !handlers.is_empty() => {
                     if let Some(completed) = completed { self.receiver_result(completed)?; }
+                    continue;
+                },
+                Some((envelope_id, body)) = pending_acks.recv() => {
+                    let mut ack = json!({"envelope_id": envelope_id});
+                    if let Some(body) = body {
+                        ack["payload"] = body;
+                    }
+                    if !self.send_frame(socket, Frame::Text(ack.to_string().into())).await {
+                        return Ok(SocketExit::Reconnect);
+                    }
                     continue;
                 },
                 _ = heartbeat.tick() => {
@@ -287,8 +309,12 @@ impl Slack {
                 }
                 return Ok(SocketExit::Reconnect);
             }
-            // Events, and interactions such as presses on prompt buttons.
-            if envelope["type"] != "events_api" && envelope["type"] != "interactive" {
+            // Events, interactions such as button presses and view submissions, and
+            // slash commands.
+            if !matches!(
+                envelope["type"].as_str(),
+                Some("events_api" | "interactive" | "slash_commands")
+            ) {
                 continue;
             }
             let Some(envelope_id) = super::events::nonempty(&envelope["envelope_id"]) else {
@@ -300,6 +326,31 @@ impl Slack {
                 // Leave overflow unacknowledged so Slack can apply its retry policy.
                 continue;
             }
+            let slack = self.clone();
+            let payload = envelope["payload"].clone();
+            let scope = slack.inner.clone();
+            // The acknowledgement of a view submission, options request or slash command
+            // carries the handler's answer, so it waits for the handler, within a deadline.
+            if super::interaction::responds(&payload) {
+                let late_acks = late_acks.clone();
+                let envelope_id = envelope_id.to_owned();
+                handlers.spawn(DELIVERY_SCOPE.scope(scope, async move {
+                    let mut answer = std::pin::pin!(slack.respond(payload));
+                    match timeout(super::ACK_DEADLINE, &mut answer).await {
+                        Ok(result) => {
+                            let body = result.as_ref().ok().cloned().flatten();
+                            let _ = late_acks.send((envelope_id, body));
+                            result.map(|_| ())
+                        }
+                        Err(_) => {
+                            tracing::warn!("Slack handler missed the acknowledgement deadline");
+                            let _ = late_acks.send((envelope_id, None));
+                            answer.await.map(|_| ())
+                        }
+                    }
+                }));
+                continue;
+            }
             if !self
                 .send_frame(
                     socket,
@@ -309,50 +360,76 @@ impl Slack {
             {
                 return Ok(SocketExit::Reconnect);
             }
-            let slack = self.clone();
-            let payload = envelope["payload"].clone();
             let receive = receiver.clone();
-            let scope = slack.inner.clone();
             handlers.spawn(DELIVERY_SCOPE.scope(scope, async move {
                 // Accepted work remains valid during shutdown and is drained before CLOSED.
-                if let Some(message) = slack.prepare_event(&payload).await? {
-                    let _admitted = AdmittedMessage::new(slack.inner.clone(), &message)?;
-                    let press = message
-                        .metadata
-                        .contains_key(agentchat_core::ANSWER_METADATA);
-                    if let Some(emoji) = slack
-                        .inner
-                        .config
-                        .ack_emoji
-                        .as_deref()
-                        .filter(|v| !v.is_empty() && !press)
-                    {
-                        let _ = slack
-                            .inner
-                            .client
-                            .call(
-                                "reactions.add",
-                                &ack_request(
-                                    message
-                                        .metadata
-                                        .get("channel_id")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default(),
-                                    emoji,
-                                    message
-                                        .metadata
-                                        .get("message_timestamp")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default(),
-                                ),
-                            )
-                            .await;
+                let inbound = slack.classify(&payload).await?;
+                let mut result = Ok(());
+                if let Some(message) = inbound.message {
+                    let stop = agentchat_core::is_stop_request(&message).then(|| message.clone());
+                    result = slack.deliver(message, receive.as_ref()).await;
+                    if let Some(stop) = stop {
+                        slack.after_stop(&stop).await;
                     }
-                    receive(message).await?;
                 }
-                Ok(())
+                if inbound.application {
+                    result = result.and(slack.dispatch(payload).await.map(|_| ()));
+                }
+                result
             }));
         }
+    }
+
+    /// Run the application's handler for a payload whose acknowledgement may carry
+    /// its answer.
+    async fn respond(&self, payload: Value) -> Result<Option<Value>> {
+        if !self.classify(&payload).await?.application {
+            return Ok(None);
+        }
+        self.dispatch(payload).await
+    }
+
+    /// Admit a message and hand it to the receiver, adding the acknowledgement
+    /// reaction to chat messages.
+    async fn deliver<F, Fut>(&self, message: Message, receive: &F) -> Result<()>
+    where
+        F: Fn(Message) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let _admitted = AdmittedMessage::new(self.inner.clone(), &message)?;
+        let control = message
+            .metadata
+            .contains_key(agentchat_core::ANSWER_METADATA)
+            || agentchat_core::is_stop_request(&message);
+        if let Some(emoji) = self
+            .inner
+            .config
+            .ack_emoji
+            .as_deref()
+            .filter(|v| !v.is_empty() && !control)
+        {
+            let _ = self
+                .inner
+                .client
+                .call(
+                    "reactions.add",
+                    &ack_request(
+                        message
+                            .metadata
+                            .get("channel_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        emoji,
+                        message
+                            .metadata
+                            .get("message_timestamp")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                )
+                .await;
+        }
+        receive(message).await
     }
 
     async fn send_frame(&self, socket: &mut Socket, frame: Frame) -> bool {

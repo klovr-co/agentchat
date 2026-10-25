@@ -4,10 +4,12 @@
 //! provider receipt; a failed write may have an uncertain delivery outcome.
 //! Socket acknowledgements accept bounded in-memory work, not a durable queue.
 
+mod apps;
 pub mod events;
 pub mod file_transfers;
 mod files;
 pub mod host;
+pub mod interaction;
 pub mod message_request;
 pub mod policy;
 pub mod rendering;
@@ -27,7 +29,7 @@ use std::time::Duration;
 
 use agentchat_core::{
     Answer, Attachment, Channel, ConversationId, DownloadedFile, Error, Message, MessageId, Prompt,
-    Result, RichReply, StreamHandle, StreamOptions, UploadFile, UploadedFile,
+    Result, RichReply, StreamHandle, StreamOptions, StreamUpdate, UploadFile, UploadedFile,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -35,8 +37,11 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+pub use apps::{AppHandler, Matcher};
+pub use interaction::{Route, ViewTarget, ACK_DEADLINE};
+pub use regex::Regex;
 use route::Destination;
-use transport::WebClient;
+use transport::{RequestError, WebClient};
 
 const NEW: u8 = 0;
 const RUNNING: u8 = 1;
@@ -58,6 +63,10 @@ pub struct SlackConfig {
     pub stop_on_handler_error: bool,
     /// Override for a trusted API proxy or loopback test server. Never agent-controlled.
     pub api_base_url: String,
+    /// Report working status through Slack agent sessions
+    /// (`agents.sessions.setStatus`) instead of `assistant.threads.setStatus`.
+    /// Needs an app declared as an agent; off by default.
+    pub agent_sessions: bool,
 }
 
 impl SlackConfig {
@@ -72,6 +81,7 @@ impl SlackConfig {
             shutdown_timeout: Duration::from_secs(20),
             stop_on_handler_error: false,
             api_base_url: "https://slack.com/api/".into(),
+            agent_sessions: false,
         }
     }
 
@@ -91,6 +101,7 @@ impl fmt::Debug for SlackConfig {
             .field("app_token", &"[REDACTED]")
             .field("workspace_id", &self.workspace_id)
             .field("max_pending_events", &self.max_pending_events)
+            .field("agent_sessions", &self.agent_sessions)
             .finish_non_exhaustive()
     }
 }
@@ -134,6 +145,22 @@ impl ThreadSubscriptions for MemoryThreadSubscriptions {
     }
 }
 
+/// What an authenticated payload is for: a message for the runtime (a chat
+/// message, prompt answer or stop request), the application's handlers, or both.
+#[derive(Debug, Default)]
+pub struct Inbound {
+    pub message: Option<Message>,
+    pub application: bool,
+}
+
+/// The result of host ingress: the message for the runtime, if any, and the
+/// acknowledgement body to return to Slack, if any.
+#[derive(Debug, Default)]
+pub struct Handled {
+    pub message: Option<Message>,
+    pub ack: Option<Value>,
+}
+
 struct Admission {
     id: u64,
     source: Message,
@@ -153,6 +180,7 @@ struct Inner {
     done: CancellationToken,
     admitted: std::sync::Mutex<HashMap<(MessageId, ConversationId), Vec<Admission>>>,
     next_admission: AtomicU64,
+    routes: std::sync::RwLock<apps::Routes>,
 }
 
 #[derive(Clone)]
@@ -202,6 +230,7 @@ impl Slack {
                 done: CancellationToken::new(),
                 admitted: std::sync::Mutex::new(HashMap::new()),
                 next_admission: AtomicU64::new(0),
+                routes: std::sync::RwLock::new(apps::Routes::default()),
             }),
         })
     }
@@ -303,39 +332,197 @@ impl Slack {
     }
 
     /// The caller must authenticate HTTP requests before using this host-ingress hook.
+    /// Returns the message for the runtime; see [`Self::handle_payload`] to also run
+    /// the application's handlers.
     pub async fn handle_event(&self, payload: &Value) -> Result<Option<Message>> {
+        self.check_accepting()?;
+        Ok(self.classify(payload).await?.message)
+    }
+
+    /// Host ingress for any authenticated payload. Runs the application's handler and
+    /// returns the message for the runtime, if any, with the acknowledgement body.
+    /// For payloads whose acknowledgement can carry a body (see
+    /// [`interaction::responds`]) it waits at most [`ACK_DEADLINE`]; a slower handler
+    /// keeps running and Slack gets an empty acknowledgement. Acknowledge other
+    /// payloads before calling this: it waits for their handler.
+    pub async fn handle_payload(&self, payload: &Value) -> Result<Handled> {
+        self.check_accepting()?;
+        let inbound = self.classify(payload).await?;
+        let mut handled = Handled {
+            message: inbound.message,
+            ack: None,
+        };
+        if !inbound.application {
+            return Ok(handled);
+        }
+        if interaction::responds(payload) {
+            let slack = self.clone();
+            let payload = payload.clone();
+            let mut task = tokio::spawn(async move { slack.dispatch(payload).await });
+            if let Ok(result) = tokio::time::timeout(ACK_DEADLINE, &mut task).await {
+                handled.ack =
+                    result.map_err(|_| Error::Handler("Slack handler failed".into()))??;
+            }
+        } else {
+            self.dispatch(payload.clone()).await?;
+        }
+        Ok(handled)
+    }
+
+    fn check_accepting(&self) -> Result<()> {
         if self.inner.stop.is_cancelled() || !self.inner.accepting.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
-        self.prepare_event(payload).await
+        Ok(())
     }
 
-    async fn prepare_event(&self, payload: &Value) -> Result<Option<Message>> {
+    /// Decide what an authenticated payload is for. Payloads from another workspace
+    /// are ignored. Events that do not become a message go to the application.
+    pub(crate) async fn classify(&self, payload: &Value) -> Result<Inbound> {
         let identity = self.identity().await?;
-        // Interactivity payloads: a press on a prompt button answers that prompt.
+        if !interaction::in_workspace(payload, Some(&identity.workspace_id)) {
+            return Ok(Inbound::default());
+        }
+        if payload.get("event").is_some_and(Value::is_object) {
+            // Slack's native stop is a stop request, and the application sees it too.
+            if let Some(stop) =
+                interaction::normalize_stop(payload, Some(&identity.workspace_id), "slack")
+            {
+                return Ok(Inbound {
+                    message: Some(stop),
+                    application: true,
+                });
+            }
+            let message =
+                match events::normalize(payload, &identity.bot_user_id, &identity.workspace_id) {
+                    Some(message)
+                        if message.metadata.get("requires_subscription")
+                            == Some(&Value::Bool(true))
+                            && !self
+                                .inner
+                                .subscriptions
+                                .contains(message.conversation_id.as_ref())
+                                .await? =>
+                    {
+                        None
+                    }
+                    message => message,
+                };
+            return Ok(Inbound {
+                application: message.is_none(),
+                message,
+            });
+        }
+        // A press on a prompt button answers that prompt; other presses are the app's.
         if payload["type"] == "block_actions" {
-            return Ok(events::normalize_action(
+            if let Some(press) = events::normalize_action(
                 payload,
                 Some(&identity.bot_user_id),
                 Some(&identity.workspace_id),
                 "slack",
-            ));
+            ) {
+                return Ok(Inbound {
+                    message: Some(press),
+                    application: false,
+                });
+            }
         }
-        let Some(message) =
-            events::normalize(payload, &identity.bot_user_id, &identity.workspace_id)
-        else {
-            return Ok(None);
-        };
-        if message.metadata.get("requires_subscription") == Some(&Value::Bool(true))
-            && !self
-                .inner
-                .subscriptions
-                .contains(message.conversation_id.as_ref())
-                .await?
-        {
-            return Ok(None);
+        Ok(Inbound {
+            message: None,
+            application: true,
+        })
+    }
+
+    /// Run the application's handler for `payload`, if one is registered.
+    pub(crate) async fn dispatch(&self, payload: Value) -> Result<Option<Value>> {
+        let route = interaction::route(&payload);
+        let handler = self
+            .inner
+            .routes
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .find(&route);
+        match handler {
+            Some(handler) => handler(payload).await,
+            None => Ok(None),
         }
-        Ok(Some(message))
+    }
+
+    fn routes(&self) -> std::sync::RwLockWriteGuard<'_, apps::Routes> {
+        self.inner
+            .routes
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Handle Events API events of `event_type` that AgentChat does not turn into
+    /// a message, such as `app_home_opened` or `member_joined_channel`. The handler
+    /// receives the whole event envelope; the event is `payload["event"]`.
+    pub fn on_event<F, Fut>(&self, event_type: impl Into<String>, handler: F)
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<Value>>> + Send + 'static,
+    {
+        self.routes()
+            .event(event_type.into(), apps::handler(handler));
+    }
+
+    /// Handle button presses and other `block_actions` whose `action_id` matches.
+    /// AgentChat's own prompt buttons never reach it.
+    pub fn on_action<F, Fut>(&self, action_id: impl Into<Matcher>, handler: F)
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<Value>>> + Send + 'static,
+    {
+        self.routes()
+            .action(action_id.into(), apps::handler(handler));
+    }
+
+    /// Handle `view_submission` and `view_closed` for views whose `callback_id`
+    /// matches. A submission handler's return value, such as
+    /// `{"response_action": "errors", "errors": {...}}`, is the acknowledgement body.
+    pub fn on_view<F, Fut>(&self, callback_id: impl Into<Matcher>, handler: F)
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<Value>>> + Send + 'static,
+    {
+        self.routes()
+            .view(callback_id.into(), apps::handler(handler));
+    }
+
+    /// Handle a slash command, such as `/deploy`; the return value is the response.
+    pub fn on_command<F, Fut>(&self, command: impl Into<String>, handler: F)
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<Value>>> + Send + 'static,
+    {
+        self.routes()
+            .command(command.into(), apps::handler(handler));
+    }
+
+    /// Handle every other payload that no handler above matched, for example
+    /// shortcuts and options requests. Without handlers, payloads are acknowledged
+    /// and ignored.
+    pub fn on_raw<F, Fut>(&self, handler: F)
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<Value>>> + Send + 'static,
+    {
+        self.routes().raw(apps::handler(handler));
+    }
+
+    /// Remove every registered handler, for example when a foreign-language host
+    /// that registered them stops.
+    pub fn clear_handlers(&self) {
+        self.routes().clear();
+    }
+
+    /// After Slack's native stop, move its agent session out of `processing`; Slack
+    /// leaves that to the app. Best effort: the stop itself already happened.
+    pub(crate) async fn after_stop(&self, stop: &Message) {
+        if self.set_status(stop, "").await.is_err() {
+            tracing::warn!("Could not clear the Slack status after a stop");
+        }
     }
 
     /// Subscribe only after the application authorizes the sender and conversation.
@@ -478,15 +665,102 @@ impl Slack {
         let Some(thread) = destination.thread_timestamp else {
             return Ok(false);
         };
-        self.inner
-            .client
-            .call(
-                "assistant.threads.setStatus",
-                &json!({"channel_id":destination.channel_id,
-            "thread_ts":thread,"status":status}),
-            )
-            .await?;
+        let (method, request) = policy::status_request(
+            &destination.channel_id,
+            thread.as_str(),
+            status,
+            self.inner.config.agent_sessions,
+        );
+        self.inner.client.call(method, &request).await?;
         Ok(true)
+    }
+
+    /// Post a notice in the source conversation that only `user_id` can see. It is
+    /// never posted publicly instead.
+    pub async fn send_ephemeral(
+        &self,
+        source: &Message,
+        user_id: &str,
+        content: &RichReply,
+    ) -> Result<Message> {
+        let destination = self.destination(source).await?;
+        let thread = destination.thread_timestamp.as_ref().map(|ts| ts.as_str());
+        let request =
+            interaction::ephemeral_request(&destination.channel_id, thread, user_id, content)?;
+        let response = self
+            .inner
+            .client
+            .call("chat.postEphemeral", &request)
+            .await?;
+        interaction::ephemeral_message(
+            source,
+            &destination.channel_id,
+            thread,
+            user_id,
+            &content.text,
+            &response,
+        )
+    }
+
+    /// Delete a message this app sent (`chat.delete`).
+    pub async fn delete(&self, message: &Message) -> Result<()> {
+        let identity = self.identity().await?;
+        let request = interaction::delete_request(message, Some(&identity.workspace_id))?;
+        self.inner.client.call("chat.delete", &request).await?;
+        Ok(())
+    }
+
+    async fn view_call(&self, method: &str, request: Value) -> Result<Value> {
+        self.check_open()?;
+        let response = self.inner.client.call(method, &request).await?;
+        interaction::view_of(&response)
+    }
+
+    /// Open a modal with the `trigger_id` of an interaction, which expires three
+    /// seconds after Slack sends it. Returns the opened view.
+    pub async fn open_view(&self, trigger_id: &str, view: &Value) -> Result<Value> {
+        self.view_call(
+            "views.open",
+            interaction::open_view_request(trigger_id, view)?,
+        )
+        .await
+    }
+
+    /// Push a view onto an open modal, with the `trigger_id` of an interaction in it.
+    pub async fn push_view(&self, trigger_id: &str, view: &Value) -> Result<Value> {
+        self.view_call(
+            "views.push",
+            interaction::open_view_request(trigger_id, view)?,
+        )
+        .await
+    }
+
+    /// Replace a view; `hash` (from the view's payload) guards against races.
+    pub async fn update_view(
+        &self,
+        view: &Value,
+        target: &ViewTarget,
+        hash: Option<&str>,
+    ) -> Result<Value> {
+        self.view_call(
+            "views.update",
+            interaction::update_view_request(view, target, hash)?,
+        )
+        .await
+    }
+
+    /// Publish a user's App Home tab.
+    pub async fn publish_home(
+        &self,
+        user_id: &str,
+        view: &Value,
+        hash: Option<&str>,
+    ) -> Result<Value> {
+        self.view_call(
+            "views.publish",
+            interaction::publish_home_request(user_id, view, hash)?,
+        )
+        .await
     }
 
     /// Start a native stream in the source thread. Outside a thread the answer is
@@ -503,6 +777,58 @@ impl Slack {
         Ok(json!({"channel": destination.channel_id, "ts": response["ts"], "sent": text}))
     }
 
+    /// Show task and plan updates. A stream started with them uses Slack's chunks,
+    /// so its text can be followed by more updates. If Slack refuses the chunks, the
+    /// answer streams as plain text without them.
+    pub async fn update_stream_tasks(
+        &self,
+        source: &Message,
+        stream: Option<StreamHandle>,
+        updates: &[StreamUpdate],
+    ) -> Result<StreamHandle> {
+        let destination = self.destination(source).await?;
+        let Some(stream) = stream else {
+            let Some(thread) = destination.thread_timestamp else {
+                return Ok(json!({"post": true}));
+            };
+            let request = policy::stream_start_tasks_request(
+                &destination.channel_id,
+                thread.as_str(),
+                source,
+                updates,
+            );
+            return match self.inner.client.call("chat.startStream", &request).await {
+                Ok(response) => {
+                    policy::MessageReceipt::confirmed_timestamp(
+                        &response,
+                        policy::DeliveryKind::Stream,
+                    )?;
+                    Ok(policy::chunk_stream_handle(
+                        &destination.channel_id,
+                        &response["ts"],
+                    ))
+                }
+                // Nothing was started; the answer starts as plain text with its first text.
+                Err(RequestError::Api(code)) if policy::retry_without_chunks(&code) => {
+                    tracing::warn!("Slack refused task updates; streaming plain text");
+                    Ok(json!({"defer": true}))
+                }
+                Err(error) => Err(error.into()),
+            };
+        };
+        let Some(request) = policy::stream_tasks_request(&stream, updates) else {
+            return Ok(stream);
+        };
+        // Task updates are secondary: a refused update never fails the answer.
+        match self.inner.client.call("chat.appendStream", &request).await {
+            Ok(_) => Ok(stream),
+            Err(_) => {
+                tracing::warn!("Slack refused task updates; the answer continues without them");
+                Ok(policy::without_tasks(&stream))
+            }
+        }
+    }
+
     pub async fn append_stream(
         &self,
         source: &Message,
@@ -512,6 +838,12 @@ impl Slack {
         self.destination(source).await?;
         if stream["post"] == true {
             return Ok(stream);
+        }
+        if stream["defer"] == true {
+            if text.is_empty() {
+                return Ok(stream);
+            }
+            return self.start_stream(source, text).await;
         }
         let (request, next) = policy::stream_request(&stream, text, false)?;
         if let Some(request) = request {
@@ -529,7 +861,7 @@ impl Slack {
         stream: StreamHandle,
         text: &str,
     ) -> Result<Message> {
-        if stream["post"] == true {
+        if stream["post"] == true || stream["defer"] == true {
             return self.reply(source, text).await;
         }
         let destination = self.destination(source).await?;
@@ -690,6 +1022,28 @@ impl Channel for Slack {
         text: &str,
     ) -> Result<Message> {
         Slack::stop_stream(self, source, stream, text).await
+    }
+    fn stream_tasks(&self) -> bool {
+        true
+    }
+    async fn update_stream_tasks(
+        &self,
+        source: &Message,
+        stream: Option<StreamHandle>,
+        updates: &[StreamUpdate],
+    ) -> Result<StreamHandle> {
+        Slack::update_stream_tasks(self, source, stream, updates).await
+    }
+    async fn send_ephemeral(
+        &self,
+        source: &Message,
+        user_id: &str,
+        content: &RichReply,
+    ) -> Result<Message> {
+        Slack::send_ephemeral(self, source, user_id, content).await
+    }
+    async fn delete(&self, message: &Message) -> Result<()> {
+        Slack::delete(self, message).await
     }
     fn supports_prompts(&self) -> bool {
         true

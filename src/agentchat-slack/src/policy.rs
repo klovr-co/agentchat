@@ -1,6 +1,6 @@
 //! Slack policies shared by native transports and foreign SDK adapters.
 use super::{events, route::SlackTimestamp, SlackUser};
-use agentchat_core::{Error, HistoryLimit, Message, Result, Role, Sender};
+use agentchat_core::{Error, HistoryLimit, Message, Result, Role, Sender, StreamUpdate};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 
@@ -258,6 +258,7 @@ pub enum DeliveryKind {
     RichReply,
     Mirror,
     Stream,
+    Ephemeral,
 }
 impl DeliveryKind {
     fn label(self) -> &'static str {
@@ -266,6 +267,7 @@ impl DeliveryKind {
             Self::RichReply => "rich reply",
             Self::Mirror => "mirror",
             Self::Stream => "streamed reply",
+            Self::Ephemeral => "ephemeral message",
         }
     }
 }
@@ -401,7 +403,8 @@ pub fn stream_start_request(channel: &str, thread_ts: &str, text: &str, source: 
 
 /// `chat.appendStream` (`finishing` false) or `chat.stopStream` for the text that
 /// `handle` has not sent yet; `None` when an append has nothing to add. Returns the
-/// request and the handle to use next.
+/// request and the handle to use next. A stream started with task updates sends
+/// its text as `markdown_text` chunks: Slack rejects mixing the two forms.
 pub fn stream_request(
     handle: &Value,
     text: &str,
@@ -411,13 +414,124 @@ pub fn stream_request(
     let delta = stream_delta(sent, text)?;
     let mut request = json!({"channel": handle["channel"], "ts": handle["ts"]});
     if !delta.is_empty() {
-        request["markdown_text"] = json!(delta);
+        if handle["mode"] == "chunks" {
+            request["chunks"] = json!([{"type": "markdown_text", "text": delta}]);
+        } else {
+            request["markdown_text"] = json!(delta);
+        }
     } else if !finishing {
         return Ok((None, handle.clone()));
     }
     let mut next = handle.clone();
     next["sent"] = json!(text);
     Ok((Some(request), next))
+}
+
+/// Task titles and details are shown as text; escape Slack's control characters
+/// so model output cannot create mentions or links.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Slack `plan_update` and `task_update` chunks for stream updates.
+pub fn task_chunks(updates: &[StreamUpdate]) -> Vec<Value> {
+    updates
+        .iter()
+        .map(|update| match update {
+            StreamUpdate::Plan { title } => json!({"type": "plan_update", "title": escape(title)}),
+            StreamUpdate::Task(task) => {
+                let mut chunk = json!({
+                    "type": "task_update",
+                    "id": task.id,
+                    "title": escape(&task.title),
+                    "status": task.status,
+                });
+                if let Some(details) = &task.details {
+                    chunk["details"] = json!(escape(details));
+                }
+                if let Some(output) = &task.output {
+                    chunk["output"] = json!(escape(output));
+                }
+                chunk
+            }
+        })
+        .collect()
+}
+
+/// `chat.startStream` in chunk mode, opening with task and plan updates. Tasks
+/// show together in a plan block when a plan is named, otherwise as a timeline.
+pub fn stream_start_tasks_request(
+    channel: &str,
+    thread_ts: &str,
+    source: &Message,
+    updates: &[StreamUpdate],
+) -> Value {
+    let mut request = stream_start_request(channel, thread_ts, "", source);
+    if let Some(object) = request.as_object_mut() {
+        object.remove("markdown_text");
+    }
+    let plan = updates
+        .iter()
+        .any(|update| matches!(update, StreamUpdate::Plan { .. }));
+    request["task_display_mode"] = json!(if plan { "plan" } else { "timeline" });
+    request["chunks"] = json!(task_chunks(updates));
+    request
+}
+
+/// The handle of a stream that started in chunk mode.
+pub fn chunk_stream_handle(channel: &str, ts: &Value) -> Value {
+    json!({"channel": channel, "ts": ts, "sent": "", "mode": "chunks", "tasks": true})
+}
+
+/// `chat.appendStream` with task updates, or `None` when this stream can no longer
+/// show them (it streams plain text, or Slack refused an earlier update).
+pub fn stream_tasks_request(handle: &Value, updates: &[StreamUpdate]) -> Option<Value> {
+    if handle["mode"] != "chunks" || handle["tasks"] == false || updates.is_empty() {
+        return None;
+    }
+    Some(json!({"channel": handle["channel"], "ts": handle["ts"], "chunks": task_chunks(updates)}))
+}
+
+/// The same stream, without task updates from now on.
+pub fn without_tasks(handle: &Value) -> Value {
+    let mut next = handle.clone();
+    next["tasks"] = json!(false);
+    next
+}
+
+/// Whether a refused chunk-mode start may be retried as a plain text stream: only
+/// for a definite rejection that is not a rate limit.
+pub fn retry_without_chunks(code: &str) -> bool {
+    code != "ratelimited"
+}
+
+/// The working status request. Slack's agent sessions take a lifecycle status
+/// (`processing` while working, `active` when ready) and show their own loading
+/// text; the assistant thread status shows `status` itself.
+pub fn status_request(
+    channel_id: &str,
+    thread_ts: &str,
+    status: &str,
+    agent_sessions: bool,
+) -> (&'static str, Value) {
+    if agent_sessions {
+        let lifecycle = if status.is_empty() {
+            "active"
+        } else {
+            "processing"
+        };
+        (
+            "agents.sessions.setStatus",
+            json!({"channel_id": channel_id, "thread_ts": thread_ts, "status": lifecycle}),
+        )
+    } else {
+        (
+            "assistant.threads.setStatus",
+            json!({"channel_id": channel_id, "thread_ts": thread_ts, "status": status}),
+        )
+    }
 }
 
 pub fn reply_message(
@@ -541,6 +655,73 @@ impl SubscriptionCache {
         }
     }
 }
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use agentchat_core::{TaskStatus, TaskUpdate};
+
+    #[test]
+    fn chunk_streams_send_text_as_chunks_and_escape_task_text() {
+        let handle = chunk_stream_handle("C1", &json!("1.5"));
+        let (request, next) = stream_request(&handle, "Hello", false).unwrap();
+        let request = request.unwrap();
+        assert_eq!(
+            request["chunks"],
+            json!([{"type": "markdown_text", "text": "Hello"}])
+        );
+        assert!(request.get("markdown_text").is_none());
+        assert_eq!(next["mode"], "chunks");
+        let mut task = TaskUpdate::new("t1", "Read <@U1> & co", TaskStatus::InProgress);
+        task.details = Some("<http://x|y>".into());
+        let updates = [
+            StreamUpdate::Plan {
+                title: "Plan".into(),
+            },
+            StreamUpdate::Task(task),
+        ];
+        let chunks = task_chunks(&updates);
+        assert_eq!(chunks[0], json!({"type": "plan_update", "title": "Plan"}));
+        assert_eq!(chunks[1]["title"], "Read &lt;@U1&gt; &amp; co");
+        assert_eq!(chunks[1]["status"], "in_progress");
+        assert_eq!(chunks[1]["details"], "&lt;http://x|y&gt;");
+        let source = Message {
+            id: "m".into(),
+            conversation_id: "c".into(),
+            channel: "slack".into(),
+            sender: Sender {
+                id: "U1".into(),
+                display_name: None,
+            },
+            text: "x".into(),
+            role: Role::User,
+            metadata: json!({"team_id": "T1"}).as_object().unwrap().clone(),
+            thread_id: None,
+            addressed: true,
+            attachments: vec![],
+        };
+        let start = stream_start_tasks_request("C1", "1.0", &source, &updates);
+        assert_eq!(start["task_display_mode"], "plan");
+        assert!(start.get("markdown_text").is_none());
+        assert_eq!(start["recipient_team_id"], "T1");
+        assert!(stream_tasks_request(&handle, &updates).is_some());
+        assert!(stream_tasks_request(&without_tasks(&handle), &updates).is_none());
+        let text = json!({"channel": "C1", "ts": "1.5", "sent": ""});
+        assert!(stream_tasks_request(&text, &updates).is_none());
+        assert!(!retry_without_chunks("ratelimited") && retry_without_chunks("invalid_arguments"));
+    }
+
+    #[test]
+    fn agent_sessions_take_a_lifecycle_status() {
+        let (method, body) = status_request("C1", "1.0", "is reading…", true);
+        assert_eq!(method, "agents.sessions.setStatus");
+        assert_eq!(body["status"], "processing");
+        assert_eq!(status_request("C1", "1.0", "", true).1["status"], "active");
+        let (method, body) = status_request("C1", "1.0", "is reading…", false);
+        assert_eq!(method, "assistant.threads.setStatus");
+        assert_eq!(body["status"], "is reading…");
+    }
+}
+
 #[cfg(test)]
 mod subscription_tests {
     use super::SubscriptionCache;
