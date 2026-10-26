@@ -204,19 +204,21 @@ instead; this is never done after an error that leaves delivery uncertain.
 ## Deleting messages
 
 `await app.delete(channel, message)` deletes a message the application sent and
-returns `"deleted"`; history keeps it. Slack, Telegram (messages up to 48 hours
+returns what happened; it never raises because a message could not be deleted.
+History keeps the message. Slack, Telegram (messages up to 48 hours
 old, and notices), Discord and Teams support it. iMessage unsends the message
 through the BlueBubbles Private API; Apple allows that within two minutes of
 sending, and the chat shows that a message was unsent. WhatsApp and YCloud have no
-way to delete a sent message and raise `TypeError`; use the typing indicator
-instead of a temporary message there.
+way to delete a sent message. When the delete is not possible or is refused,
+`delete` logs a warning and returns `"failed"`. On WhatsApp and YCloud, use the
+typing indicator instead of a temporary message.
 
 Where a message cannot be deleted, `fallback` hides it as well as the channel can,
 and the result says what happened:
 
 ```python
 outcome = await app.delete(channel, sent, fallback="notice")
-# "deleted", "edited" (text replaced) or "noticed" (a correction was sent)
+# "deleted", "edited" (text replaced), "noticed" (a correction was sent) or "failed"
 ```
 
 - `fallback="edit"`: when the delete is refused, or the channel cannot delete,
@@ -231,7 +233,7 @@ outcome = await app.delete(channel, sent, fallback="notice")
 - A failed delete is followed only by an edit, never by a notice: when the
   outcome is uncertain, an edit of a deleted message just fails, while a notice
   could correct a message that is already gone. If the edit fails too, the
-  delete's error is raised.
+  result is `"failed"`.
 
 `await app.edit(channel, message, text)` replaces the text of a message the
 application sent on Telegram, Discord, Teams and iMessage; history keeps the

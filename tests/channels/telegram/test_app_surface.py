@@ -277,8 +277,7 @@ async def test_a_message_that_cannot_be_deleted_is_edited_when_asked():
     app = AgentChat(channels=[channel])
     await channel._load_bot_identity()
     sent = await channel.reply(channel._normalize(telegram_update()), "Old news")
-    with pytest.raises(TelegramError):
-        await app.delete(channel, sent)
+    assert await app.delete(channel, sent) == "failed"
     assert await app.delete(channel, sent, fallback="edit") == "edited"
     edit = client.method_calls("editMessageText")[-1]
     assert (edit["text"], edit["chat_id"], edit["message_id"]) == (

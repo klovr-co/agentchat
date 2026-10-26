@@ -69,7 +69,7 @@ structurally; no capability registry is needed.
 | `TaskStreamingChannel` | `StreamingChannel` and `TaskProgressChannel` | Task updates start or join the stream |
 | `HomeChannel` | `publish_home()` | No home screen |
 | `EphemeralChannel` | `send_ephemeral()` | Raises `TypeError`; never posted publicly instead |
-| `DeletingChannel` | `delete()` | Raises `TypeError`, or uses `fallback` |
+| `DeletingChannel` | `delete()` | `app.delete()` returns `"failed"`, or uses `fallback` |
 | `EditingChannel` | `edit()` | `app.edit()` raises `TypeError`; `delete(fallback="edit")` cannot edit |
 
 Read exact signatures in [`channels/base.py`](../python/agentchat/channels/base.py).

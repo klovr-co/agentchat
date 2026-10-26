@@ -416,12 +416,13 @@ impl AgentChat {
             .await
         })
     }
-    /// Delete a message this application sent; returns `"deleted"`. History keeps
-    /// it. Channels that cannot delete raise `TypeError`, and a refused delete
-    /// raises. Where a message cannot be deleted, `fallback` hides it instead:
-    /// `"edit"` replaces its text with `text` on channels that can edit, and
-    /// `"notice"` also sends `text` as a reply to it on channels that can neither
-    /// delete nor edit (returning `"edited"` or `"noticed"`). A notice is never
+    /// Delete a message this application sent, as well as the channel allows,
+    /// and return what happened; it never raises for a message that cannot be
+    /// deleted. History keeps the message. Returns `"deleted"`, or `"failed"`
+    /// (logged) when the channel cannot or will not delete it. `fallback` hides
+    /// such a message instead: `"edit"` replaces its text with `text` on channels
+    /// that can edit (`"edited"`), and `"notice"` also replies to it with `text` on
+    /// channels that can neither delete nor edit (`"noticed"`). A notice is never
     /// sent after a failed delete or edit, whose outcome may be uncertain.
     #[pyo3(signature=(channel,message,*,fallback=None,text=None))]
     fn delete(
@@ -445,9 +446,6 @@ impl AgentChat {
             capability(py, channel.bind(py), "DeletingChannel")?,
             capability(py, channel.bind(py), "EditingChannel")?,
         );
-        let outcome = |name: &str| {
-            Python::attach(|py| Ok::<Object, PyErr>(name.into_pyobject(py)?.into_any().unbind()))
-        };
         coroutine(py, async move {
             let replacement = |default: &str| {
                 Python::attach(|py| {
@@ -457,46 +455,55 @@ impl AgentChat {
                         .map(|t| t.into_any().unbind())
                 })
             };
-            if deleting {
-                let deleted = call(copy(&channel), "delete", vec![copy(&message)], vec![]).await;
-                return match deleted {
-                    Ok(_) => outcome("deleted"),
-                    // Editing a message that was deleted after all only fails.
-                    Err(error) if fallback.is_some() && editing => {
-                        let text = replacement(REMOVED_TEXT)?;
-                        match call(channel, "edit", vec![message, text], vec![]).await {
-                            Ok(_) => outcome("edited"),
-                            Err(_) => Err(error),
+            let attempt = async {
+                if deleting {
+                    let deleted =
+                        call(copy(&channel), "delete", vec![copy(&message)], vec![]).await;
+                    return match deleted {
+                        Ok(_) => Ok("deleted"),
+                        // Editing a message that was deleted after all only fails.
+                        Err(error) if fallback.is_some() && editing => {
+                            let text = replacement(REMOVED_TEXT)?;
+                            match call(copy(&channel), "edit", vec![copy(&message), text], vec![])
+                                .await
+                            {
+                                Ok(_) => Ok("edited"),
+                                Err(_) => Err(error),
+                            }
                         }
+                        Err(error) => Err(error),
+                    };
+                }
+                match fallback.as_deref() {
+                    Some(_) if editing => {
+                        let text = replacement(REMOVED_TEXT)?;
+                        call(copy(&channel), "edit", vec![copy(&message), text], vec![]).await?;
+                        Ok("edited")
                     }
-                    Err(error) => Err(error),
-                };
-            }
-            match fallback.as_deref() {
-                Some(_) if editing => {
-                    call(
-                        channel,
-                        "edit",
-                        vec![message, replacement(REMOVED_TEXT)?],
-                        vec![],
-                    )
-                    .await?;
-                    outcome("edited")
+                    Some("notice") => {
+                        let text = replacement(NOTICE_TEXT)?;
+                        call(copy(&channel), "reply", vec![copy(&message), text], vec![]).await?;
+                        Ok("noticed")
+                    }
+                    _ => Err(PyTypeError::new_err(
+                        "This channel does not support deleting messages",
+                    )),
                 }
-                Some("notice") => {
-                    call(
-                        channel,
-                        "reply",
-                        vec![message, replacement(NOTICE_TEXT)?],
-                        vec![],
-                    )
-                    .await?;
-                    outcome("noticed")
-                }
-                _ => Err(PyTypeError::new_err(
-                    "This channel does not support deleting messages",
-                )),
-            }
+            };
+            let outcome = match attempt.await {
+                Ok(outcome) => outcome,
+                Err(error) => Python::attach(|py| {
+                    // Cancellation and other non-errors still propagate.
+                    if !error.is_instance_of::<pyo3::exceptions::PyException>(py) {
+                        return Err(error);
+                    }
+                    py.import("logging")?
+                        .call_method1("getLogger", ("agentchat",))?
+                        .call_method1("warning", ("Message not deleted (%s)", error.to_string()))?;
+                    Ok("failed")
+                })?,
+            };
+            Python::attach(|py| Ok(outcome.into_pyobject(py)?.into_any().unbind()))
         })
     }
     /// Replace the text of a message this application sent; returns the edited

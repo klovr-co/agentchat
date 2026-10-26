@@ -312,8 +312,8 @@ async def test_ephemeral_notices_are_private_and_fail_closed():
     assert (method, request["channel"], request["user"], request["thread_ts"]) == (
         "chat.postEphemeral", "C1", "U1", "1.0")
     assert await app.state.history(source.conversation_id) == ()
-    with pytest.raises(ValueError, match="ephemeral"):
-        await app.delete(slack, sent)
+    # A notice cannot be deleted; delete reports that instead of raising.
+    assert await app.delete(slack, sent) == "failed"
     client.refuse["chat.postEphemeral"] = "user_not_in_channel"
     with pytest.raises(SlackApiError):
         await slack.send_ephemeral(source, "U1", "Only you")
@@ -330,8 +330,7 @@ async def test_ephemeral_notices_are_private_and_fail_closed():
 
     with pytest.raises(TypeError, match="ephemeral"):
         await AgentChat(channels=[Public()]).send_ephemeral(Public(), source, "U1", "x")
-    with pytest.raises(TypeError, match="deleting"):
-        await AgentChat(channels=[Public()]).delete(Public(), source)
+    assert await AgentChat(channels=[Public()]).delete(Public(), source) == "failed"
 
 
 @pytest.mark.asyncio

@@ -145,8 +145,7 @@ async def test_unsend_progress_edits_and_notices_by_direct_message():
     assert await app.delete(channel, sent, fallback="notice", text="(gone)") == "edited"
     assert client.edits[-1] == ("g1", "(gone)")
     del client.unsend
-    with pytest.raises(ValueError):
-        await app.delete(channel, direct)
+    assert await app.delete(channel, direct) == "failed"
 
     notice = await app.send_ephemeral(channel, group, "+15550000000", "Only you", fallback="dm")
     assert client.sent[-1] == ("iMessage;-;+15550000000", "Only you")
