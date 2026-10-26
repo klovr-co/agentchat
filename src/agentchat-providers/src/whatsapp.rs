@@ -680,6 +680,19 @@ mod app_tests {
     use agentchat_core::Route;
 
     #[test]
+    fn direct_sources_send_without_replying() {
+        let source = direct_source("123", "15550000000").unwrap();
+        let route = destination(&source, "123").unwrap();
+        assert_eq!(route.message_id, "");
+        let payload = text_payload(Some("hi"), &route.recipient, &route.message_id).unwrap();
+        assert!(payload.get("context").is_none());
+        assert_eq!(payload["to"], "15550000000");
+        assert!(direct_source("123", "+1 555").is_err());
+        let reply = text_payload(Some("hi"), "1555", "wamid.1").unwrap();
+        assert_eq!(reply["context"]["message_id"], "wamid.1");
+    }
+
+    #[test]
     fn messages_and_statuses_route_for_the_application() {
         let flow = json!({"id": "w1", "type": "interactive", "interactive": {"type": "nfm_reply",
             "nfm_reply": {"name": "flow", "body": "Sent", "response_json": "{\"flow_token\": \"signup\"}"}}});

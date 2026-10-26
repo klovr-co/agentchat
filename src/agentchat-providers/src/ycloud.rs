@@ -1005,6 +1005,27 @@ mod app_tests {
     use agentchat_core::Route;
 
     #[test]
+    fn direct_and_reply_sources() {
+        let source = direct_source("+15550001111", "+15550000000").unwrap();
+        let route = destination(&source, "+15550001111").unwrap();
+        let payload = text_payload(
+            Some("hi"),
+            "+15550001111",
+            &route.recipient,
+            &route.message_id,
+            None,
+        )
+        .unwrap();
+        assert!(payload.get("context").is_none());
+        assert!(direct_source("+15550001111", "15550000000").is_err());
+        let event = json!({"type": "whatsapp.inbound_message.received", "whatsappInboundMessage": {
+            "wamid": "wamid.1", "from": "+15550000000", "to": "+15550001111"}});
+        let reply = reply_source(&event, "+15550001111").unwrap();
+        assert_eq!(reply.metadata["message_id"], "wamid.1");
+        assert!(reply_source(&event, "+15559999999").is_none());
+    }
+
+    #[test]
     fn events_route_by_type_and_messages_like_whatsapp() {
         let press = json!({"type": "whatsapp.inbound_message.received", "whatsappInboundMessage": {
             "to": "+1555", "type": "interactive",
