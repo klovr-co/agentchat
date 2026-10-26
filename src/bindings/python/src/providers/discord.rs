@@ -466,8 +466,9 @@ impl Discord {
     /// A notice only `user_id` sees. Discord shows those only in reply to an
     /// interaction, so return `{"type": 4, "data": {"content": ..., "flags": 64}}`
     /// from an `on_action` or `on_command` handler instead. In a direct message
-    /// with that user, this is an ordinary reply; elsewhere it raises ValueError.
-    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    /// with that user, this is an ordinary reply; elsewhere it raises ValueError,
+    /// or with `fallback="dm"` sends the notice as a direct message to that user.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None,fallback=None))]
     fn send_ephemeral(
         slf: Py<Self>,
         py: Python<'_>,
@@ -475,19 +476,132 @@ impl Discord {
         user_id: String,
         text: String,
         blocks: Option<Py<PyAny>>,
+        fallback: Option<String>,
     ) -> Output {
         let _ = blocks;
+        let dm = apps::dm_fallback(fallback.as_deref())?;
         let message = convert::from_message(source.bind(py))?;
-        if !policy::private_reply_allowed(&message, &user_id) {
+        if policy::private_reply_allowed(&message, &user_id) {
+            return slf
+                .bind(py)
+                .call_method1("reply", (source, text))
+                .map(Bound::unbind);
+        }
+        if !dm {
             return Err(PyValueError::new_err(
                 "Discord shows private messages only in reply to an interaction: return \
                  {'type': 4, 'data': {'content': ..., 'flags': 64}} from an on_action or \
                  on_command handler",
             ));
         }
-        slf.bind(py)
-            .call_method1("reply", (source, text))
-            .map(Bound::unbind)
+        policy::dm_request(&user_id).map_err(PyValueError::new_err)?;
+        host::coroutine(py, async move {
+            let source = direct(&slf, &user_id).await?;
+            let reply = Python::attach(|py| {
+                slf.bind(py)
+                    .call_method1("reply", (source, text))
+                    .map(Bound::unbind)
+            })?;
+            host::await_py(reply).await
+        })
+    }
+    /// Keep one home message in a direct message with `user_id`: pinned, and edited
+    /// in place by later calls. After a restart the bot's pinned message is reused.
+    fn publish_home(slf: Py<Self>, py: Python<'_>, user_id: String, view: Py<PyAny>) -> Output {
+        let text = discord_text_payload(view.bind(py))?;
+        policy::dm_request(&user_id).map_err(PyValueError::new_err)?;
+        host::coroutine(py, async move {
+            let source = direct(&slf, &user_id).await?;
+            let (channel_id, bot, sender, known) = Python::attach(|py| -> PyResult<_> {
+                let this = slf.borrow(py);
+                let message = convert::from_message(source.bind(py))?;
+                let bot: u64 = this
+                    ._client
+                    .bind(py)
+                    .getattr("user")?
+                    .getattr("id")?
+                    .extract()?;
+                let known = apps::memory(slf.bind(py).as_any(), "_homes")?
+                    .get_item(&user_id)?
+                    .map(|id| id.extract::<u64>())
+                    .transpose()?;
+                Ok((
+                    message.metadata["channel_id"].as_u64().unwrap_or_default(),
+                    bot,
+                    this._sender.clone_ref(py),
+                    known,
+                ))
+            })?;
+            let previous = match known {
+                Some(id) => Some(id),
+                None => {
+                    let pins =
+                        sender_call(&sender, "pins", |py| (channel_id,).into_pyobject(py)).await?;
+                    let pins = Python::attach(|py| convert::to_json(pins.bind(py)))?;
+                    policy::pinned_home(&pins, bot)
+                }
+            };
+            let remember = |id: u64| {
+                Python::attach(|py| {
+                    apps::memory(slf.bind(py).as_any(), "_homes")?.set_item(&user_id, id)
+                })
+            };
+            if let Some(id) = previous {
+                let payload = Python::attach(|py| {
+                    convert::from_json(py, &policy::Destination::edit_payload(&text, false))
+                })?;
+                match sender_call(&sender, "edit_text", |py| {
+                    (channel_id, id, payload).into_pyobject(py)
+                })
+                .await
+                {
+                    Ok(_) => {
+                        remember(id)?;
+                        return Python::attach(|py| {
+                            let message = convert::from_message(source.bind(py))?;
+                            let destination = policy::Destination::from_source(&message, bot)
+                                .map_err(PyValueError::new_err)?;
+                            let reply = destination
+                                .confirmed_reply(&message, text, id, None)
+                                .map_err(PyRuntimeError::new_err)?;
+                            super::transport::receipt_with_metadata(&source, &reply)
+                        });
+                    }
+                    // Deleted: publish a new one.
+                    Err(error) if error.to_string().contains("(HTTP 404)") => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let reply = Python::attach(|py| {
+                slf.bind(py)
+                    .call_method1("reply", (source.bind(py), &text))
+                    .map(Bound::unbind)
+            })?;
+            let sent = host::await_py(reply).await?;
+            let id = Python::attach(|py| {
+                convert::from_message(sent.bind(py))?.metadata["message_id"]
+                    .as_u64()
+                    .ok_or_else(|| PyRuntimeError::new_err("No message receipt"))
+            })?;
+            remember(id)?;
+            if let Err(error) =
+                sender_call(&sender, "pin", |py| (channel_id, id).into_pyobject(py)).await
+            {
+                Python::attach(|py| -> PyResult<()> {
+                    py.import("logging")?
+                        .call_method1("getLogger", ("agentchat.channels.discord.adapter",))?
+                        .call_method1(
+                            "warning",
+                            (
+                                "Discord could not pin the home message (%s)",
+                                error.to_string(),
+                            ),
+                        )?;
+                    Ok(())
+                })?;
+            }
+            Ok(sent)
+        })
     }
     /// Delete a message this bot sent.
     fn delete(slf: Py<Self>, py: Python<'_>, message: Py<PyAny>) -> Output {
@@ -1058,6 +1172,42 @@ impl Discord {
         })
     }
 }
+/// Call an async method of the send client.
+async fn sender_call(
+    sender: &Py<PyAny>,
+    method: &str,
+    args: impl for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyTuple>>,
+) -> PyResult<Py<PyAny>> {
+    let call = Python::attach(|py| {
+        let sender = sender.bind(py);
+        if !sender.hasattr(method)? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "This Discord send client has no {method}()"
+            )));
+        }
+        sender.call_method1(method, args(py)?).map(Bound::unbind)
+    })?;
+    host::await_py(call).await
+}
+/// A source in the direct message channel with `user_id`, opened if needed.
+async fn direct(slf: &Py<Discord>, user_id: &str) -> PyResult<Py<PyAny>> {
+    let (sender, bot) = Python::attach(|py| -> PyResult<_> {
+        let this = slf.borrow(py);
+        let bot = this._client.bind(py).getattr("user")?;
+        if bot.is_none() {
+            return Err(PyRuntimeError::new_err("Discord is not connected"));
+        }
+        Ok((
+            this._sender.clone_ref(py),
+            bot.getattr("id")?.extract::<u64>()?,
+        ))
+    })?;
+    let channel = sender_call(&sender, "open_dm", |py| (user_id,).into_pyobject(py)).await?;
+    Python::attach(|py| {
+        let channel = channel.bind(py).extract::<u64>()?;
+        convert::to_message(py, &policy::direct_source(bot, channel, user_id))
+    })
+}
 /// Delete the task progress reply once the answer is finished; best effort.
 async fn remove_progress(slf: &Py<Discord>, source: &Py<PyAny>, handle: &serde_json::Value) {
     let Some(id) = handle["progress"]["message_id"].as_u64() else {
@@ -1355,6 +1505,40 @@ impl DiscordRESTClient {
                 ));
             }
             rest_request(&slf, "delete", "delete", &path, None).await?;
+            Ok(Python::attach(|py| py.None()))
+        })
+    }
+    /// Open (or find) the direct message channel with a user; returns its ID.
+    fn open_dm(slf: Py<Self>, py: Python<'_>, user_id: String) -> Output {
+        let body = policy::dm_request(&user_id).map_err(PyValueError::new_err)?;
+        host::coroutine(py, async move {
+            let body = Python::attach(|py| convert::from_json(py, &body))?;
+            let data = rest_request(
+                &slf,
+                "post",
+                "direct message",
+                "users/@me/channels",
+                Some(body),
+            )
+            .await?;
+            Python::attach(|py| {
+                let id = policy::dm_channel(&convert::to_json(data.bind(py))?)
+                    .map_err(PyRuntimeError::new_err)?;
+                Ok(id.into_pyobject(py)?.into_any().unbind())
+            })
+        })
+    }
+    /// A channel's pinned messages: `{"items": [{"message": ...}], "has_more": ...}`.
+    fn pins(slf: Py<Self>, py: Python<'_>, channel_id: u64) -> Output {
+        host::coroutine(py, async move {
+            rest_request(&slf, "get", "pins", &policy::pins_path(channel_id), None).await
+        })
+    }
+    /// Pin a message.
+    fn pin(slf: Py<Self>, py: Python<'_>, channel_id: u64, message_id: u64) -> Output {
+        host::coroutine(py, async move {
+            let path = format!("{}/{message_id}", policy::pins_path(channel_id));
+            rest_request(&slf, "put", "pin", &path, None).await?;
             Ok(Python::attach(|py| py.None()))
         })
     }

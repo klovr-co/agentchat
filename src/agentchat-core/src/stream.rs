@@ -182,6 +182,35 @@ impl TaskBoard {
     }
 }
 
+/// For channels that cannot edit a sent message: one line per task that finished
+/// (completed or failed) in `updates`, for a task not already in `sent`, until
+/// `sent` holds `limit` tasks. The tasks are added to `sent`.
+pub fn finished_tasks(
+    updates: &[StreamUpdate],
+    sent: &mut Vec<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for update in updates {
+        let StreamUpdate::Task(task) = update else {
+            continue;
+        };
+        if !matches!(task.status, TaskStatus::Complete | TaskStatus::Error)
+            || sent.contains(&task.id)
+            || sent.len() >= limit
+        {
+            continue;
+        }
+        sent.push(task.id.clone());
+        let board = TaskBoard {
+            plan: None,
+            tasks: vec![task.clone()],
+        };
+        lines.push(board.render(1000));
+    }
+    lines
+}
+
 /// Add a task update to the unsent ones. An update without new details or output
 /// replaces an unsent one for the same task; details and output add text, so
 /// those updates are kept in order.
@@ -466,7 +495,7 @@ impl AnswerStream {
 #[cfg(test)]
 mod tests {
     use super::stream_split as split_at;
-    use super::{StreamUpdate, TaskBoard, TaskStatus, TaskUpdate};
+    use super::{finished_tasks, StreamUpdate, TaskBoard, TaskStatus, TaskUpdate};
 
     #[test]
     fn task_boards_keep_positions_and_render_a_checklist() {
@@ -495,6 +524,25 @@ mod tests {
         }
         assert_eq!(board.tasks.len(), TaskBoard::MAX_TASKS);
         assert_eq!(board.tasks[0].id, "b");
+    }
+
+    #[test]
+    fn finished_tasks_are_reported_once_up_to_a_limit() {
+        let task = |id: &str, status| StreamUpdate::Task(TaskUpdate::new(id, "Step", status));
+        let mut sent = Vec::new();
+        let lines = finished_tasks(
+            &[
+                task("a", TaskStatus::InProgress),
+                task("a", TaskStatus::Complete),
+                task("b", TaskStatus::Error),
+                task("c", TaskStatus::Complete),
+            ],
+            &mut sent,
+            2,
+        );
+        assert_eq!(lines, ["✅ Step", "❌ Step"]);
+        assert_eq!(sent, ["a", "b"]);
+        assert!(finished_tasks(&[task("a", TaskStatus::Complete)], &mut sent, 5).is_empty());
     }
 
     #[test]

@@ -670,7 +670,15 @@ impl Teams {
                     return Ok(py.None());
                 };
                 this.validate_url(py, value["serviceUrl"].as_str().unwrap_or(""))?;
+                let personal =
+                    policy::Destination::from_source(&message, &this._app_id, &this._tenant_id)
+                        .is_ok_and(|d| policy::streams_natively(&d));
+                let sender = message.sender.id.clone();
                 let message = convert::to_message(py, &message)?;
+                // The one-to-one chat to publish this person's home message in.
+                if personal {
+                    apps::memory(slf.bind(py).as_any(), "_personal")?.set_item(sender, &message)?;
+                }
                 if !this
                     ._delivery
                     .bind(py)
@@ -924,6 +932,56 @@ impl Teams {
                     .insert("recipient_user_id".into(), json!(user_id));
             }
             super::transport::receipt_with_metadata(&source, &sent)
+        })
+    }
+    /// Keep one home message in the one-to-one chat with `user_id`, updated in place
+    /// by later calls. A bot can only start that chat with details Teams sent
+    /// earlier, so this works once the person has messaged the app one-to-one
+    /// since the adapter started; otherwise it raises LookupError.
+    fn publish_home(slf: Py<Self>, py: Python<'_>, user_id: String, view: Object) -> Output {
+        let text = teams_text_payload(view.bind(py))?;
+        let source = apps::memory(slf.bind(py).as_any(), "_personal")?
+            .get_item(&user_id)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyLookupError::new_err(
+                    "Teams can publish a home message only after that person has messaged \
+                     the app one-to-one",
+                )
+            })?
+            .unbind();
+        let known = apps::memory(slf.bind(py).as_any(), "_homes")?
+            .get_item(&user_id)?
+            .map(|id| id.extract::<String>())
+            .transpose()?;
+        host::coroutine(py, async move {
+            let mut activity = policy::text_activity(&text);
+            activity["textFormat"] = json!("markdown");
+            if let Some(id) = &known {
+                activity["id"] = json!(id);
+            }
+            let sent = send_activity(&slf, &source, activity, known.is_some()).await;
+            let (message, destination, receipt) = match sent {
+                Ok(sent) => sent,
+                Err(error) => {
+                    // The next call sends a new home message.
+                    Python::attach(|py| {
+                        apps::memory(slf.bind(py).as_any(), "_homes")?.del_item(&user_id)
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
+            let id = match known {
+                Some(id) => id,
+                None => receipt_id(&receipt)?,
+            };
+            Python::attach(|py| {
+                apps::memory(slf.bind(py).as_any(), "_homes")?.set_item(&user_id, &id)
+            })?;
+            let home = destination
+                .confirmed_reply(&message, text, &id)
+                .map_err(PyRuntimeError::new_err)?;
+            super::transport::receipt_with_metadata(&source, &home)
         })
     }
     /// Delete a message this app sent.

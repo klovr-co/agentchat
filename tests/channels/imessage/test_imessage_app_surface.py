@@ -88,3 +88,91 @@ async def test_stop_keyword_stops_the_senders_turn_and_notices_need_a_direct_cha
     with pytest.raises(ValueError):
         await app.send_ephemeral(channel, group, "+15551234567", "Only you")
     await app.close()
+
+
+class EditingClient(BubblesClient):
+    """A server with the Private API: messages can be edited and unsent."""
+
+    def __init__(self):
+        super().__init__(Receipt("sent"))
+        self.sent, self.edits, self.unsent = [], [], []
+
+    async def send_text(self, chat_guid, text):
+        self.sent.append((chat_guid, text))
+        return f"g{len(self.sent)}"
+
+    async def edit_text(self, guid, text):
+        self.edits.append((guid, text))
+
+    async def unsend(self, guid):
+        self.unsent.append(guid)
+
+
+def editing_channel(**options):
+    client = EditingClient()
+    channel = IMessage(server_url="http://localhost:1234", password="fake", instance_id="mac",
+                       client=client, socket_client=Sockets(), **options)
+    return channel, client
+
+
+@pytest.mark.asyncio
+async def test_a_command_handlers_text_answer_is_sent_as_a_reply():
+    channel, client = editing_channel()
+    channel.bind(lambda channel, message: asyncio.sleep(0))
+
+    @channel.on_command("/status")
+    async def status(payload):
+        return {"text": "All good"}
+
+    await channel._socket.handlers["new-message"](imessage_event(text="/status", guid="c1"))
+    await until(lambda: client.sent)
+    assert client.sent == [("iMessage;-;+15551234567", "All good")]
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_unsend_progress_edits_and_notices_by_direct_message():
+    channel, client = editing_channel()
+    app = AgentChat(channels=[channel])
+    direct = normalize(imessage_event(), instance_id="mac")
+    group = normalize(imessage_event(chats=[{"guid": "iMessage;+;chat1"}]), instance_id="mac")
+
+    sent = await channel.reply(direct, "Temporary")
+    await app.delete(channel, sent)
+    assert client.unsent == ["g1"]
+    with pytest.raises(ValueError):
+        await app.delete(channel, direct)
+
+    notice = await app.send_ephemeral(channel, group, "+15550000000", "Only you", fallback="dm")
+    assert client.sent[-1] == ("iMessage;-;+15550000000", "Only you")
+    assert notice.metadata["chat_guid"] == "iMessage;-;+15550000000"
+    with pytest.raises(ValueError):
+        await app.send_ephemeral(channel, group, "+15550000000", "Only you", fallback="email")
+
+    async with app.stream(channel, direct, interval=0) as reply:
+        await reply.plan("Checking")
+        await reply.task("a", "Read the logs")
+        await reply.task("a", "Read the logs", "complete")
+        await reply.append("Done.")
+    progress = [text for chat, text in client.sent if text.startswith("**Checking**")]
+    assert progress == ["**Checking**"]
+    assert client.edits[-1][1] == "**Checking**\n✅ Read the logs"
+    assert client.sent[-1][1] == "Done."
+    history = await app.state.history(direct.conversation_id)
+    assert [message.text for message in history] == ["Done."]
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_home_message_is_edited_until_apple_stops_allowing_it():
+    channel, client = editing_channel()
+    first = await channel.publish_home("+15550000000", "Home 1")
+    assert client.sent == [("iMessage;-;+15550000000", "Home 1")]
+    for number in range(2, 7):
+        home = await channel.publish_home("+15550000000", f"Home {number}")
+        assert home.id == first.id
+    assert len(client.edits) == 5
+    # Apple allows five edits; the sixth change is a new message.
+    await channel.publish_home("+15550000000", "Home 7")
+    assert client.sent[-1] == ("iMessage;-;+15550000000", "Home 7")
+    await channel.close()

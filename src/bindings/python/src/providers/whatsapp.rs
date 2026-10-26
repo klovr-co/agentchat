@@ -77,7 +77,7 @@ impl WhatsApp {
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self { payload: None }
     }
-    #[pyo3(signature=(*,phone_number_id,access_token,app_secret,verify_token,api_version="v23.0",host="127.0.0.1",port=3979,max_pending_events=64,shutdown_timeout=20.0,prompt_style="buttons"))]
+    #[pyo3(signature=(*,phone_number_id,access_token,app_secret,verify_token,api_version="v23.0",host="127.0.0.1",port=3979,max_pending_events=64,shutdown_timeout=20.0,prompt_style="buttons",task_messages=false))]
     #[allow(clippy::too_many_arguments)]
     fn initialize(
         slf: Py<Self>,
@@ -92,6 +92,7 @@ impl WhatsApp {
         max_pending_events: i64,
         shutdown_timeout: f64,
         prompt_style: &str,
+        task_messages: bool,
     ) -> PyResult<()> {
         if !matches!(prompt_style, "reactions" | "buttons") {
             return Err(PyValueError::new_err(
@@ -131,6 +132,7 @@ impl WhatsApp {
         state.set_item("_session", py.None())?;
         state.set_item("_runner", py.None())?;
         state.set_item("_prompt_style", prompt_style)?;
+        state.set_item("_task_messages", task_messages)?;
         // Reaction prompts by sent message ID: {"prompt": id, "choices": [[emoji, id], …]}.
         state.set_item("_reaction_prompts", PyDict::new(py))?;
         state.set_item(
@@ -198,6 +200,46 @@ impl WhatsApp {
                 .map_err(PyRuntimeError::new_err)?;
             receipt_with_metadata(&source_host, &message)
         })
+    }
+    /// With `task_messages=True`, each task that finishes in `reply.task()` is a
+    /// short reply, at most five per answer; WhatsApp messages cannot be edited or
+    /// deleted, so nothing is shown otherwise.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        updates: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let enabled = slf.bind(py).getattr("_task_messages")?.is_truthy()?;
+        host::coroutine(py, async move {
+            crate::stream::finished_task_replies(
+                slf.into_any(),
+                enabled,
+                source,
+                stream,
+                updates,
+                "agentchat.channels.whatsapp.adapter",
+            )
+            .await
+        })
+    }
+    /// WhatsApp has no home screen and cannot edit messages: each call sends `view`
+    /// (text) to `user_id` as a new message. WhatsApp delivers it only within 24
+    /// hours of that person's last message.
+    fn publish_home(
+        slf: Py<Self>,
+        py: Python<'_>,
+        user_id: String,
+        view: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let phone = slf
+            .bind(py)
+            .getattr("_phone_number_id")?
+            .extract::<String>()?;
+        let source = policy::direct_source(&phone, &user_id).map_err(PyValueError::new_err)?;
+        let source = convert::to_message(py, &source)?;
+        Ok(slf.bind(py).call_method1("reply", (source, view))?.unbind())
     }
     /// WhatsApp chats are one-to-one, so a notice for the person this conversation
     /// is with is an ordinary reply; any other recipient raises ValueError.
@@ -429,8 +471,19 @@ impl WhatsApp {
                 let handler = Python::attach(|py| apps::find(this.bind(py), &item.route))?;
                 let Some(handler) = handler else { continue };
                 let payload = j(item.payload)?;
-                if !Python::attach(|py| {
-                    apps::spawn(this.bind(py), delivery.bind(py), &handler, &payload)
+                // A text answer to a press, Flow reply or command is sent as a reply.
+                let source = item
+                    .source
+                    .filter(|_| !matches!(item.route, agentchat_core::Route::Event { .. }));
+                if !Python::attach(|py| match source {
+                    Some(source) => apps::spawn_replying(
+                        this.bind(py),
+                        delivery.bind(py),
+                        &handler,
+                        &payload,
+                        convert::to_message(py, &source)?,
+                    ),
+                    None => apps::spawn(this.bind(py), delivery.bind(py), &handler, &payload),
                 })? {
                     return Err(fail_response(
                         "HTTPServiceUnavailable",

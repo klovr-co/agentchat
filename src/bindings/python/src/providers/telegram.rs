@@ -806,8 +806,9 @@ impl Telegram {
     }
     /// Show a notice only `user_id` can see: an ephemeral message in a group, an
     /// ordinary reply in that user's private chat. `blocks` may hold one
-    /// `reply_markup` mapping.
-    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    /// `reply_markup` mapping. With `fallback="dm"`, a notice Telegram refuses, or
+    /// one for someone else's private chat, goes to `user_id`'s private chat.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None,fallback=None))]
     fn send_ephemeral(
         slf: Py<Self>,
         py: Python<'_>,
@@ -815,16 +816,21 @@ impl Telegram {
         user_id: String,
         text: String,
         blocks: Option<Py<PyAny>>,
+        fallback: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         let markup = blocks
             .map(|blocks| convert::to_json(blocks.bind(py)))
             .transpose()?
             .and_then(|blocks| blocks.as_array().and_then(|b| b.first().cloned()));
+        let dm = apps::dm_fallback(fallback.as_deref())?;
         host::coroutine(py, async move {
             let this = slf.into_any();
             let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
             let bot = extract(&get(&this, "_bot_id")?)?;
             call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            if dm && policy::private_chat_of_other(&message, &user_id) {
+                return send_direct(&this, &user_id, &text, markup.as_ref()).await;
+            }
             match policy::ephemeral_request(&message, bot, &user_id, &text, markup.as_ref())
                 .map_err(PyValueError::new_err)?
             {
@@ -841,7 +847,14 @@ impl Telegram {
                     receipt_with_metadata(&source, &sent)
                 }
                 policy::Ephemeral::Ephemeral(payload) => {
-                    let result = client_call(&this, "sendMessage", Some(payload), None).await?;
+                    let result = match client_call(&this, "sendMessage", Some(payload), None).await
+                    {
+                        // Refused, so certainly not shown: the private chat is safe.
+                        Err(error) if dm && telegram_error(&error) && !transient(&error) => {
+                            return send_direct(&this, &user_id, &text, markup.as_ref()).await
+                        }
+                        result => result?,
+                    };
                     let sent = policy::ephemeral_receipt(
                         &message,
                         bot,
@@ -854,6 +867,89 @@ impl Telegram {
                     receipt_with_metadata(&source, &sent)
                 }
             }
+        })
+    }
+    /// Keep one home message in `user_id`'s private chat with the bot: pinned, and
+    /// edited in place by later calls. After a restart the bot's pinned message is
+    /// reused. Telegram delivers it only to people who have started the bot.
+    fn publish_home(
+        slf: Py<Self>,
+        py: Python<'_>,
+        user_id: String,
+        view: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let text = view.bind(py).extract::<String>().ok();
+        let payload = policy::text_payload(text.as_deref()).map_err(PyValueError::new_err)?;
+        let text = text.unwrap_or_default();
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let bot: i64 = extract(&get(&this, "_bot_id")?)?;
+            let source = policy::private_source(bot, &user_id).map_err(PyValueError::new_err)?;
+            let source_host = Python::attach(|py| convert::to_message(py, &source))?;
+            let chat = destination(&this, &source)?.chat_id;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let known = Python::attach(|py| -> PyResult<Option<i64>> {
+                apps::memory(this.bind(py), "_homes")?
+                    .get_item(&user_id)?
+                    .map(|id| id.extract())
+                    .transpose()
+            })?;
+            let previous = match known {
+                Some(id) => Some(id),
+                None => {
+                    let found =
+                        client_call(&this, "getChat", Some(json!({"chat_id": chat})), None).await?;
+                    policy::pinned_home(&value(&found)?, bot)
+                }
+            };
+            let remember = |id: i64| {
+                Python::attach(|py| apps::memory(this.bind(py), "_homes")?.set_item(&user_id, id))
+            };
+            if let Some(id) = previous {
+                let mut edit = payload.clone();
+                edit["chat_id"] = json!(chat);
+                edit["message_id"] = json!(id);
+                let edited = match client_call(&this, "editMessageText", Some(edit), None).await {
+                    Ok(_) => true,
+                    Err(error) if error.to_string().contains("message is not modified") => true,
+                    // Deleted or no longer editable: publish a new one.
+                    Err(error) if telegram_error(&error) && !transient(&error) => false,
+                    Err(error) => return Err(error),
+                };
+                if edited {
+                    remember(id)?;
+                    let sent = policy::receipt(
+                        &source,
+                        bot,
+                        extract(&get(&this, "_first_name")?)?,
+                        &text,
+                        &json!({"message_id": id}),
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    return receipt_with_metadata(&source_host, &sent);
+                }
+            }
+            let sent = send(&this, &source_host, &source, payload, &text).await?;
+            let id = Python::attach(|py| -> PyResult<i64> {
+                convert::from_message(sent.bind(py))?.metadata["message_id"]
+                    .as_i64()
+                    .ok_or_else(|| PyRuntimeError::new_err("No message receipt"))
+            })?;
+            remember(id)?;
+            if let Err(error) = client_call(
+                &this,
+                "pinChatMessage",
+                Some(policy::pin_request(chat, id)),
+                None,
+            )
+            .await
+            {
+                log_warning(
+                    "agentchat.channels.telegram.adapter",
+                    &format!("Telegram could not pin the home message ({error})"),
+                )?;
+            }
+            Ok(sent)
         })
     }
     /// Delete a message this bot sent (`deleteMessage`, up to 48 hours old) or a
@@ -962,6 +1058,22 @@ impl Telegram {
             download(&slf.into_any(), source, attachment, max_bytes).await
         })
     }
+}
+/// Send a notice to `user_id`'s private chat with the bot.
+async fn send_direct(
+    this: &Py<PyAny>,
+    user_id: &str,
+    text: &str,
+    markup: Option<&Value>,
+) -> PyResult<Py<PyAny>> {
+    let source = policy::private_source(extract(&get(this, "_bot_id")?)?, user_id)
+        .map_err(PyValueError::new_err)?;
+    let source_host = Python::attach(|py| convert::to_message(py, &source))?;
+    let mut payload = policy::text_payload(Some(text)).map_err(PyValueError::new_err)?;
+    if let Some(markup) = markup {
+        payload["reply_markup"] = markup.clone();
+    }
+    send(this, &source_host, &source, payload, text).await
 }
 async fn client_call(
     this: &Py<PyAny>,

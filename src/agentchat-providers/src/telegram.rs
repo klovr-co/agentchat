@@ -289,7 +289,8 @@ pub fn destination(source: &Message, bot: i64) -> Result<Destination, &'static s
 impl Destination {
     pub fn route(&self, mut payload: Value, quote: bool) -> Value {
         payload["chat_id"] = json!(self.chat_id);
-        if quote {
+        // A direct source (see `private_source`) has no message to quote.
+        if quote && self.message_id > 0 {
             payload["reply_parameters"] =
                 json!({"message_id":self.message_id,"allow_sending_without_reply":true});
         }
@@ -299,6 +300,67 @@ impl Destination {
         payload
     }
 }
+/// A source for messages sent to `user_id`'s private chat with the bot, which
+/// need not be answering one of theirs. Telegram delivers them only to people who
+/// have started the bot.
+pub fn private_source(bot: i64, user_id: &str) -> Result<Message, &'static str> {
+    let user: i64 = user_id
+        .parse()
+        .ok()
+        .filter(|user| *user > 0)
+        .ok_or("Expected a numeric Telegram user ID")?;
+    Ok(Message {
+        id: format!("telegram:{bot}:direct:{user}").into(),
+        conversation_id: format!("telegram:{bot}:{user}").into(),
+        channel: "telegram".into(),
+        sender: Sender {
+            id: user.to_string(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+        metadata: [
+            ("bot_id".into(), json!(bot)),
+            ("chat_id".into(), json!(user)),
+            ("chat_type".into(), json!("private")),
+            ("message_id".into(), json!(0)),
+            ("message_thread_id".into(), Value::Null),
+        ]
+        .into_iter()
+        .collect(),
+    })
+}
+
+/// Whether a notice for `user_id` from `source` must go elsewhere: `source` is
+/// another person's private chat.
+pub fn private_chat_of_other(source: &Message, user_id: &str) -> bool {
+    source.metadata.get("chat_type").and_then(Value::as_str) == Some("private")
+        && source
+            .metadata
+            .get("chat_id")
+            .map(Value::to_string)
+            .as_deref()
+            != Some(user_id)
+}
+
+/// The bot's pinned home message in a `getChat` result, if the chat's latest pin
+/// is one of the bot's messages.
+pub fn pinned_home(chat: &Value, bot: i64) -> Option<i64> {
+    let pinned = &chat["pinned_message"];
+    if pinned["from"]["id"].as_i64() != Some(bot) {
+        return None;
+    }
+    pinned["message_id"].as_i64().filter(|id| *id > 0)
+}
+
+/// `pinChatMessage` without notifying the chat.
+pub fn pin_request(chat_id: i64, message_id: i64) -> Value {
+    json!({"chat_id": chat_id, "message_id": message_id, "disable_notification": true})
+}
+
 pub fn receipt(
     source: &Message,
     bot: i64,
@@ -1258,5 +1320,24 @@ mod app_tests {
             (json!(42), json!(true), json!(""))
         );
         assert!(drafts_allowed(&private) && !drafts_allowed(&group));
+    }
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    #[test]
+    fn private_sources_pins_and_other_peoples_chats() {
+        let source = private_source(99, "30").unwrap();
+        assert!(private_source(99, "x").is_err() && private_source(99, "-5").is_err());
+        let dest = destination(&source, 99).unwrap();
+        let payload = dest.route(json!({"text": "hi"}), true);
+        assert_eq!(payload, json!({"text": "hi", "chat_id": 30}));
+        assert!(!private_chat_of_other(&source, "30") && private_chat_of_other(&source, "31"));
+        let chat = json!({"pinned_message": {"message_id": 7, "from": {"id": 99}}});
+        assert_eq!(pinned_home(&chat, 99), Some(7));
+        assert_eq!(pinned_home(&chat, 98), None);
+        assert_eq!(pin_request(30, 7)["disable_notification"], true);
     }
 }

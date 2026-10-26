@@ -147,16 +147,54 @@ pub fn destination(source: &Message, phone: &str) -> Result<Destination, &'stati
         .and_then(Value::as_str)
         .filter(|value| digits(value))
         .ok_or(invalid)?;
-    let id = source
-        .metadata
-        .get("message_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(invalid)?;
+    // A direct source (see `direct_source`) has no message to reply to.
+    let id = match source.metadata.get("message_id") {
+        None | Some(Value::Null) => "",
+        Some(id) => id.as_str().ok_or(invalid)?,
+    };
     Ok(Destination {
         recipient: recipient.into(),
         message_id: id.into(),
     })
+}
+
+/// A source for messages sent to `wa_id` without replying to one of theirs.
+/// WhatsApp delivers them only within 24 hours of that person's last message.
+pub fn direct_source(phone: &str, wa_id: &str) -> Result<Message, &'static str> {
+    if !digits(wa_id) {
+        return Err("Expected a WhatsApp ID (digits only)");
+    }
+    Ok(Message {
+        id: format!("whatsapp:{phone}:direct:{wa_id}").into(),
+        conversation_id: format!("whatsapp:{phone}:{wa_id}").into(),
+        channel: "whatsapp".into(),
+        sender: Sender {
+            id: wa_id.into(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+        metadata: [
+            ("phone_number_id".into(), json!(phone)),
+            ("message_id".into(), Value::Null),
+            ("wa_id".into(), json!(wa_id)),
+        ]
+        .into_iter()
+        .collect(),
+    })
+}
+
+/// `payload` replying to message `id`, or a new message when `id` is empty.
+fn in_reply(mut payload: Value, id: &str) -> Value {
+    if id.is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("context");
+        }
+    }
+    payload
 }
 
 pub fn text_payload(
@@ -170,9 +208,10 @@ pub fn text_payload(
     if content.chars().count() > 4096 {
         return Err("WhatsApp replies must fit 4,096 characters; send separate replies");
     }
-    Ok(
+    Ok(in_reply(
         json!({"messaging_product":"whatsapp","recipient_type":"individual","to":recipient,"type":"text","text":{"body":content,"preview_url":false},"context":{"message_id":id}}),
-    )
+        id,
+    ))
 }
 /// Shows "typing…" for the message being answered. WhatsApp also marks that
 /// message as read, and clears the indicator after 25 seconds or on the reply.
@@ -535,6 +574,8 @@ pub struct AppItem {
     pub route: agentchat_core::Route,
     pub payload: Value,
     pub message_id: Option<String>,
+    /// The message to reply to with the handler's answer; None for statuses.
+    pub source: Option<Message>,
 }
 
 /// The webhook's messages and statuses routed for the application; statuses are
@@ -564,12 +605,22 @@ pub fn app_items(payload: &Value, phone: &str) -> Vec<AppItem> {
             };
             for event in items(&value["messages"]) {
                 if let Some(route) = route_message(event) {
+                    let source = event["from"]
+                        .as_str()
+                        .zip(event["id"].as_str().filter(|id| !id.is_empty()))
+                        .and_then(|(sender, id)| {
+                            let mut source = direct_source(phone, sender).ok()?;
+                            source.id = format!("whatsapp:{phone}:{id}").into();
+                            source.metadata.insert("message_id".into(), json!(id));
+                            Some(source)
+                        });
                     found.push(AppItem {
                         route,
                         payload: only("messages", event),
                         message_id: event["id"]
                             .as_str()
                             .map(|id| format!("whatsapp:{phone}:{id}")),
+                        source,
                     });
                 }
             }
@@ -580,6 +631,7 @@ pub fn app_items(payload: &Value, phone: &str) -> Vec<AppItem> {
                     },
                     payload: only("statuses", status),
                     message_id: None,
+                    source: None,
                 });
             }
         }
@@ -603,14 +655,17 @@ pub fn interactive_object(content: &agentchat_core::RichReply) -> Result<Value, 
 
 /// An `interactive` message replying to the source message.
 pub fn interactive_payload(recipient: &str, id: &str, interactive: Value) -> Value {
-    json!({
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": recipient,
-        "type": "interactive",
-        "interactive": interactive,
-        "context": {"message_id": id},
-    })
+    in_reply(
+        json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "interactive",
+            "interactive": interactive,
+            "context": {"message_id": id},
+        }),
+        id,
+    )
 }
 
 /// Whether a notice for `user_id` can be an ordinary reply: WhatsApp chats are

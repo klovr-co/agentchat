@@ -6,8 +6,9 @@
 //! in a new message. Channels without streaming get one reply when the stream
 //! finishes. Stream errors propagate; nothing is retried or sent twice.
 //!
-//! On a `TaskStreamingChannel`, `task()` and `plan()` show progress next to the
-//! answer; other channels ignore them.
+//! On a `TaskProgressChannel`, `task()` and `plan()` show progress next to the
+//! answer, also on channels that send the answer once at the end; other channels
+//! ignore them.
 use crate::host::coroutine;
 use crate::runtime::{call, copy, none};
 use agentchat_core::{StreamUpdate, TaskStatus, TaskUpdate};
@@ -75,11 +76,10 @@ impl AnswerStream {
             ));
         }
         let limit = attribute::<usize>(bound, "stream_limit").filter(|&limit| limit > 0);
-        let tasks = streaming
-            && bound.is_instance(
-                &py.import("agentchat.channels.base")?
-                    .getattr("TaskStreamingChannel")?,
-            )?;
+        let tasks = bound.is_instance(
+            &py.import("agentchat.channels.base")?
+                .getattr("TaskProgressChannel")?,
+        )?;
         Ok(Self {
             app: Some(app),
             channel: Some(channel),
@@ -154,21 +154,24 @@ async fn send_updates(slf: &Py<AnswerStream>) -> PyResult<()> {
     Ok(())
 }
 
-/// Send an update when the interval has passed.
+/// Send an update when the interval has passed: the answer so far and its
+/// tasks, or only the tasks on a channel that sends the answer at the end.
 async fn tick(slf: &Py<AnswerStream>) -> PyResult<()> {
     let due = Python::attach(|py| {
         let mut this = slf.borrow_mut(py);
-        let due = this.streaming
+        let due = (this.streaming || this.tasks)
             && this
                 .last_flush
                 .is_none_or(|last| last.elapsed() >= this.interval);
         if due {
             this.last_flush = Some(Instant::now());
         }
-        due
+        due.then_some(this.streaming)
     });
-    if due {
-        flush(slf, false).await?;
+    match due {
+        Some(true) => flush(slf, false).await?,
+        Some(false) => send_updates(slf).await?,
+        None => {}
     }
     Ok(())
 }
@@ -299,7 +302,10 @@ async fn finish(slf: &Py<AnswerStream>) -> PyResult<Object> {
     })?;
     if streaming {
         flush(slf, true).await?;
-    } else if !text.trim().is_empty() {
+    } else {
+        send_updates(slf).await?;
+    }
+    if !streaming && !text.trim().is_empty() {
         let text = Python::attach(|py| text_object(py, &text))?;
         let message = call(app, "reply", vec![channel, source, text], vec![]).await?;
         Python::attach(|py| slf.borrow_mut(py).messages.push(message));
@@ -474,6 +480,65 @@ impl AnswerStream {
 
 fn falsy() -> PyResult<Object> {
     Python::attach(|py| Ok(false.into_pyobject(py)?.to_owned().into_any().unbind()))
+}
+
+/// Most task messages one answer sends on a channel that cannot edit them.
+pub const MAX_TASK_MESSAGES: usize = 5;
+
+/// `update_stream_tasks` for a channel that cannot edit a sent message: when
+/// `enabled`, each task that finishes is a short reply, at most
+/// `MAX_TASK_MESSAGES` per answer, kept out of history. A failed message is logged
+/// and never fails the answer.
+pub async fn finished_task_replies(
+    channel: Object,
+    enabled: bool,
+    source: Object,
+    stream: Object,
+    updates: Object,
+    logger: &str,
+) -> PyResult<Object> {
+    let (sent, lines) = Python::attach(|py| -> PyResult<_> {
+        let handle = if stream.is_none(py) {
+            serde_json::Value::Null
+        } else {
+            crate::convert::to_json(stream.bind(py))?
+        };
+        if !enabled || handle["stopped"] == true {
+            return Ok((None, Vec::new()));
+        }
+        let updates: Vec<StreamUpdate> =
+            serde_json::from_value(crate::convert::to_json(updates.bind(py))?)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let mut sent: Vec<String> =
+            serde_json::from_value(handle["sent"].clone()).unwrap_or_default();
+        let lines = agentchat_core::finished_tasks(&updates, &mut sent, MAX_TASK_MESSAGES);
+        Ok((Some(sent), lines))
+    })?;
+    let Some(sent) = sent else {
+        return Ok(stream);
+    };
+    let mut stopped = false;
+    for line in lines {
+        let text = Python::attach(|py| text_object(py, &line))?;
+        let result = call(copy(&channel), "reply", vec![copy(&source), text], vec![]).await;
+        if let Err(error) = result {
+            Python::attach(|py| -> PyResult<()> {
+                py.import("logging")?
+                    .call_method1("getLogger", (logger,))?
+                    .call_method1(
+                        "warning",
+                        ("Task progress message failed (%s)", error.to_string()),
+                    )?;
+                Ok(())
+            })?;
+            // Send no more for this answer rather than skip some.
+            stopped = true;
+            break;
+        }
+    }
+    Python::attach(|py| {
+        crate::convert::from_json(py, &serde_json::json!({"sent": sent, "stopped": stopped}))
+    })
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

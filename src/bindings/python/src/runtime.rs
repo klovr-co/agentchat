@@ -369,8 +369,11 @@ impl AgentChat {
     }
     /// Post a notice in `source`'s conversation that only `user_id` can see. It is
     /// not added to history. Channels without private notices raise `TypeError`;
-    /// the notice is never posted publicly instead.
-    #[pyo3(signature=(channel,source,user_id,text,*,blocks=None))]
+    /// the notice is never posted publicly instead. With `fallback="dm"`, channels
+    /// that support it send a notice they cannot show privately to `user_id`'s
+    /// direct chat instead.
+    #[pyo3(signature=(channel,source,user_id,text,*,blocks=None,fallback=None))]
+    #[allow(clippy::too_many_arguments)]
     fn send_ephemeral(
         &self,
         py: Python<'_>,
@@ -379,8 +382,13 @@ impl AgentChat {
         user_id: Object,
         text: Object,
         blocks: Option<Object>,
+        fallback: Option<Object>,
     ) -> PyResult<Object> {
         let blocks = blocks.unwrap_or_else(|| py.None());
+        let mut kwargs = vec![("blocks", blocks)];
+        if let Some(fallback) = fallback.filter(|f| !f.is_none(py)) {
+            kwargs.push(("fallback", fallback));
+        }
         coroutine(py, async move {
             Python::attach(|py| -> PyResult<()> {
                 if !capability(py, channel.bind(py), "EphemeralChannel")? {
@@ -399,7 +407,7 @@ impl AgentChat {
                 channel,
                 "send_ephemeral",
                 vec![source, user_id, text],
-                vec![("blocks", blocks)],
+                kwargs,
             )
             .await
         })
@@ -1002,13 +1010,14 @@ impl MessageContext {
     }
     /// Post a notice in this conversation that only the sender (or `user_id`) can
     /// see; see `AgentChat.send_ephemeral`.
-    #[pyo3(signature=(text,*,blocks=None,user_id=None))]
+    #[pyo3(signature=(text,*,blocks=None,user_id=None,fallback=None))]
     fn reply_ephemeral(
         &self,
         py: Python<'_>,
         text: Object,
         blocks: Option<Object>,
         user_id: Option<Object>,
+        fallback: Option<Object>,
     ) -> PyResult<Object> {
         let user_id = match user_id {
             Some(user_id) => user_id,
@@ -1018,7 +1027,10 @@ impl MessageContext {
             py,
             "send_ephemeral",
             vec![user_id, text],
-            vec![("blocks", blocks.unwrap_or_else(|| py.None()))],
+            vec![
+                ("blocks", blocks.unwrap_or_else(|| py.None())),
+                ("fallback", fallback.unwrap_or_else(|| py.None())),
+            ],
         )
     }
     #[pyo3(signature=(attachment,*,max_bytes=10*1024*1024))]

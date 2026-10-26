@@ -32,7 +32,7 @@ pub use prompt::{
 pub use runtime::{AgentChat, AskOptions, Handler, Runtime, StopOptions};
 pub use state::{ConversationPermit, MemoryState, MemoryStore, State};
 pub use stream::{
-    queue_plan, queue_task, stream_split, AnswerStream, StreamHandle, StreamOptions, StreamUpdate,
-    TaskBoard, TaskStatus, TaskUpdate,
+    finished_tasks, queue_plan, queue_task, stream_split, AnswerStream, StreamHandle,
+    StreamOptions, StreamUpdate, TaskBoard, TaskStatus, TaskUpdate,
 };
 pub use turn::{Turn, TurnEffect, TurnResult};

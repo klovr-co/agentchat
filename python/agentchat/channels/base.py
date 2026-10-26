@@ -99,20 +99,38 @@ class StreamingChannel(Protocol):
 
 
 @runtime_checkable
-class TaskStreamingChannel(StreamingChannel, Protocol):
-    """Optional task and plan progress shown with a streamed answer.
+class TaskProgressChannel(Protocol):
+    """Optional task and plan progress shown with an answer.
 
     `update_stream_tasks` receives the unsent updates in order, each a mapping:
     `{"type": "plan", "title": ...}` or `{"type": "task", "id": ..., "title": ...,
     "status": "pending" | "in_progress" | "complete" | "error", "details": ...,
-    "output": ...}`. With `stream` None it starts the stream with them; otherwise it
-    adds them. It returns the handle to use next and may drop updates its stream
-    can no longer show. Channels without it ignore `AnswerStream.task` and `plan`.
+    "output": ...}`. `stream` is None on the first call; afterwards it is the handle
+    the previous call returned. It returns the handle to use next and may drop
+    updates it can no longer show. On a `StreamingChannel` the handle is the
+    stream's: with `stream` None it starts the stream with the updates. Channels
+    without it ignore `AnswerStream.task` and `plan`.
     """
 
     async def update_stream_tasks(
         self, source: Message, stream: object | None, updates: Sequence[Mapping[str, object]],
     ) -> object: ...
+
+
+@runtime_checkable
+class TaskStreamingChannel(StreamingChannel, TaskProgressChannel, Protocol):
+    """Task and plan progress shown with a streamed answer; see `TaskProgressChannel`."""
+
+
+@runtime_checkable
+class HomeChannel(Protocol):
+    """Optional home screen for one person, replaced by each `publish_home`.
+
+    Slack publishes an App Home view. Other channels keep one home message in the
+    person's direct chat and edit it in place where they can.
+    """
+
+    async def publish_home(self, user_id: str, view: Any) -> object: ...
 
 
 @runtime_checkable

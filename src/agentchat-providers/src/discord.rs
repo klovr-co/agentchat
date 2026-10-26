@@ -153,6 +153,10 @@ impl Destination {
         })
     }
     pub fn payload(&self, content: &str) -> Value {
+        // A direct source (see `direct_source`) has no message to reply to.
+        if self.message_id == 0 {
+            return json!({"content":content,"allowed_mentions":{"parse":[],"replied_user":false}});
+        }
         let mut reference = json!({"message_id":self.message_id.to_string(),"channel_id":self.channel_id.to_string(),"fail_if_not_exists":false});
         if let Some(guild) = self.guild_id {
             reference["guild_id"] = guild.to_string().into();
@@ -298,6 +302,66 @@ pub fn delete_path(message: &Message, bot_id: u64) -> Result<String, &'static st
 
 /// Whether a notice for `user_id` can be an ordinary reply: only in a direct
 /// message with that user, where every message is already private.
+/// `POST users/@me/channels` with this body opens (or finds) the direct message
+/// channel with `user_id`.
+pub fn dm_request(user_id: &str) -> Result<Value, &'static str> {
+    if user_id.is_empty() || !user_id.bytes().all(|c| c.is_ascii_digit()) {
+        return Err("Expected a Discord user ID");
+    }
+    Ok(json!({"recipient_id": user_id}))
+}
+
+/// The channel ID in a `users/@me/channels` response.
+pub fn dm_channel(response: &Value) -> Result<u64, &'static str> {
+    receipt(response).map_err(|_| "Discord did not return a direct message channel")
+}
+
+/// A source for messages sent to the direct message `channel_id` with `user_id`,
+/// which need not be answering one of theirs.
+pub fn direct_source(bot_id: u64, channel_id: u64, user_id: &str) -> Message {
+    Message {
+        id: format!("discord:{bot_id}:{channel_id}:direct").into(),
+        conversation_id: conversation(bot_id, None, channel_id).into(),
+        channel: "discord".into(),
+        sender: Sender {
+            id: user_id.into(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        metadata: json!({
+            "bot_id": bot_id,
+            "channel_id": channel_id,
+            "guild_id": null,
+            "message_id": 0,
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+    }
+}
+
+/// `GET` lists a channel's pins (`{"items": [{"message": ...}], "has_more"}`);
+/// `PUT /{message_id}` pins one.
+pub fn pins_path(channel_id: u64) -> String {
+    format!("channels/{channel_id}/messages/pins")
+}
+
+/// The newest pinned message the bot wrote, in a `pins_path` listing.
+pub fn pinned_home(pins: &Value, bot_id: u64) -> Option<u64> {
+    let bot = bot_id.to_string();
+    pins["items"].as_array()?.iter().find_map(|pin| {
+        let message = &pin["message"];
+        if message["author"]["id"].as_str() != Some(bot.as_str()) {
+            return None;
+        }
+        receipt(message).ok()
+    })
+}
+
 pub fn private_reply_allowed(source: &Message, user_id: &str) -> bool {
     source.metadata.get("guild_id").is_none_or(Value::is_null) && source.sender.id == user_id
 }
@@ -305,6 +369,23 @@ pub fn private_reply_allowed(source: &Message, user_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use agentchat_core::Route;
+
+    #[test]
+    fn direct_messages_and_pinned_homes() {
+        let source = direct_source(99, 5, "7");
+        let destination = Destination::from_source(&source, 99).unwrap();
+        assert!(destination.payload("hi").get("message_reference").is_none());
+        assert!(private_reply_allowed(&source, "7"));
+        assert_eq!(dm_request("7").unwrap(), json!({"recipient_id": "7"}));
+        assert!(dm_request("x").is_err());
+        assert_eq!(dm_channel(&json!({"id": "5"})), Ok(5));
+        let pins = json!({"items": [
+            {"message": {"id": "11", "author": {"id": "3"}}},
+            {"message": {"id": "12", "author": {"id": "99"}}}]});
+        assert_eq!(pinned_home(&pins, 99), Some(12));
+        assert_eq!(pinned_home(&json!({"items": []}), 99), None);
+        assert_eq!(pins_path(5), "channels/5/messages/pins");
+    }
 
     #[test]
     fn interactions_route_by_type_and_get_a_response() {

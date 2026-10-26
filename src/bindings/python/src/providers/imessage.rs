@@ -3,14 +3,17 @@ use crate::{
     apps, convert, host,
     runtime::{call, copy, exit_scope, none},
 };
+use agentchat_core::TaskBoard;
 use agentchat_providers::{imessage as policy, wire::strip};
 use pyo3::{
     exceptions::{
-        PyAttributeError, PyException, PyModuleNotFoundError, PyRuntimeError, PyValueError,
+        PyAttributeError, PyException, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
+        PyValueError,
     },
     prelude::*,
     types::{PyDict, PyFrozenSet, PyTuple, PyType},
 };
+use serde_json::{json, Value};
 type Object = Py<PyAny>;
 type Output = PyResult<Object>;
 fn sdk(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
@@ -351,7 +354,8 @@ impl IMessage {
         apps::decorator(slf.as_any(), "view", callback_id)
     }
     /// Handle messages starting with this command, such as "/start", instead of
-    /// passing them to the message handler.
+    /// passing them to the message handler. A text answer (`"..."` or
+    /// `{"text": "..."}`) is sent as a reply.
     fn on_command(slf: &Bound<'_, Self>, command: Object) -> Output {
         apps::decorator(slf.as_any(), "command", command)
     }
@@ -383,8 +387,9 @@ impl IMessage {
         })
     }
     /// iMessage has no private notices; in a one-to-one chat with that person an
-    /// ordinary reply is already private. Elsewhere this raises ValueError.
-    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    /// ordinary reply is already private. Elsewhere this raises ValueError, or with
+    /// `fallback="dm"` sends the notice to that person's one-to-one chat instead.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None,fallback=None))]
     fn send_ephemeral(
         slf: Py<Self>,
         py: Python<'_>,
@@ -392,22 +397,149 @@ impl IMessage {
         user_id: String,
         text: String,
         blocks: Option<Object>,
+        fallback: Option<String>,
     ) -> Output {
         if blocks.is_some_and(|b| !b.is_none(py)) {
             return Err(PyValueError::new_err("iMessage notices are text only"));
         }
+        let dm = apps::dm_fallback(fallback.as_deref())?;
         let message = convert::from_message(source.bind(py))?;
         let direct = message
             .metadata
             .get("chat_guid")
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .is_some_and(policy::is_direct);
-        if !direct || message.sender.id != user_id {
+        if direct && message.sender.id == user_id {
+            return Ok(slf.bind(py).call_method1("reply", (source, text))?.unbind());
+        }
+        if !dm {
             return Err(PyValueError::new_err(
                 "iMessage can only show a notice as a reply in a one-to-one chat with that person",
             ));
         }
-        Ok(slf.bind(py).call_method1("reply", (source, text))?.unbind())
+        let direct = policy::direct_source(&slf.borrow(py)._instance_id, &user_id)
+            .map_err(PyValueError::new_err)?;
+        let direct = convert::to_message(py, &direct)?;
+        Ok(slf.bind(py).call_method1("reply", (direct, text))?.unbind())
+    }
+    /// Unsend a message this adapter sent. Needs the BlueBubbles Private API;
+    /// Apple allows unsending within two minutes, and the chat shows that a
+    /// message was unsent.
+    fn delete(slf: Py<Self>, py: Python<'_>, message: Object) -> Output {
+        let message = convert::from_message(message.bind(py))?;
+        let this = slf.borrow(py);
+        let guid = policy::sent_guid(&message, &this._instance_id)
+            .map_err(PyValueError::new_err)?
+            .to_owned();
+        this._delivery.bind(py).call_method0("check_reply")?;
+        let client = this._client.bind(py);
+        if !client.hasattr("unsend")? {
+            return Err(PyTypeError::new_err(
+                "This BlueBubbles client cannot unsend messages",
+            ));
+        }
+        Ok(client.call_method1("unsend", (guid,))?.unbind())
+    }
+    /// Seconds between task progress edits: Apple allows five edits of a message.
+    #[classattr]
+    fn stream_interval() -> f64 {
+        5.0
+    }
+    /// Show task progress as one message before the answer, edited in place as
+    /// tasks change and kept afterwards. Apple allows five edits within fifteen
+    /// minutes; later changes are not shown. Editing needs the BlueBubbles Private
+    /// API. A failed update never fails the answer.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Object,
+        stream: Object,
+        updates: Object,
+    ) -> Output {
+        host::coroutine(py, async move {
+            let (mut handle, text, chat, client) = Python::attach(|py| -> PyResult<_> {
+                let updates: Vec<agentchat_core::StreamUpdate> =
+                    serde_json::from_value(convert::to_json(updates.bind(py))?)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let mut handle = if stream.is_none(py) {
+                    json!({})
+                } else {
+                    convert::to_json(stream.bind(py))?
+                };
+                let mut board: TaskBoard =
+                    serde_json::from_value(handle["progress"]["board"].clone()).unwrap_or_default();
+                board.apply(&updates);
+                let text = board.render(2000);
+                handle["progress"]["board"] = json!(board);
+                let message = convert::from_message(source.bind(py))?;
+                let this = slf.borrow(py);
+                let chat = this.destination(py, &message)?.chat_guid;
+                Ok((handle, text, chat, this._client.clone_ref(py)))
+            })?;
+            if !text.is_empty() && handle["progress"]["shown"] != text.as_str() {
+                match show(&client, &chat, &handle["progress"]["sent"], &text, false).await {
+                    Ok(Some(sent)) => {
+                        handle["progress"]["sent"] = sent;
+                        handle["progress"]["shown"] = json!(text);
+                    }
+                    Ok(None) => {}
+                    Err(error) => Python::attach(|py| -> PyResult<()> {
+                        py.import("logging")?
+                            .call_method1("getLogger", ("agentchat.channels.imessage.adapter",))?
+                            .call_method1(
+                                "warning",
+                                (
+                                    "iMessage task progress update failed (%s)",
+                                    error.to_string(),
+                                ),
+                            )?;
+                        Ok(())
+                    })?,
+                }
+            }
+            Python::attach(|py| convert::from_json(py, &handle))
+        })
+    }
+    /// Keep one home message in `user_id`'s one-to-one chat: edited in place while
+    /// Apple allows (five edits within fifteen minutes, with the Private API),
+    /// otherwise sent again. The adapter remembers it until it restarts.
+    fn publish_home(slf: Py<Self>, py: Python<'_>, user_id: String, view: Object) -> Output {
+        let text = imessage_text_payload(view.bind(py))?;
+        host::coroutine(py, async move {
+            let (source, host_source, destination, client, previous) =
+                Python::attach(|py| -> PyResult<_> {
+                    let this = slf.borrow(py);
+                    let source = policy::direct_source(&this._instance_id, &user_id)
+                        .map_err(PyValueError::new_err)?;
+                    let destination = this.destination(py, &source)?;
+                    let previous = apps::memory(slf.bind(py).as_any(), "_homes")?
+                        .get_item(&user_id)?
+                        .map(|found| convert::to_json(&found))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    Ok((
+                        source.clone(),
+                        convert::to_message(py, &source)?,
+                        destination,
+                        this._client.clone_ref(py),
+                        previous,
+                    ))
+                })?;
+            let sent = show(&client, &destination.chat_guid, &previous, &text, true)
+                .await?
+                .ok_or_else(|| PyRuntimeError::new_err("BlueBubbles did not return a receipt"))?;
+            Python::attach(|py| {
+                let guid = sent["guid"].as_str().unwrap_or_default().to_owned();
+                apps::memory(slf.bind(py).as_any(), "_homes")?
+                    .set_item(&user_id, convert::from_json(py, &sent)?)?;
+                super::transport::receipt_with_metadata(
+                    &host_source,
+                    &destination
+                        .confirmed_reply(&source, text, &guid)
+                        .map_err(PyRuntimeError::new_err)?,
+                )
+            })
+        })
     }
     #[classmethod]
     fn from_env(cls: &Bound<'_, PyType>) -> Output {
@@ -558,11 +690,12 @@ impl IMessage {
                 if let Some(command) = agentchat_core::command_of(&message.text) {
                     let route = agentchat_core::Route::Command { command };
                     if let Some(handler) = apps::find(slf.bind(py).as_any(), &route)? {
-                        apps::spawn(
+                        apps::spawn_replying(
                             slf.bind(py).as_any(),
                             this._delivery.bind(py),
                             &handler,
                             &event,
+                            convert::to_message(py, &message)?,
                         )?;
                         return Ok(py.None());
                     }
@@ -730,6 +863,67 @@ async fn stop_typing(socket: Object, chat: &str) {
     if let Ok(Some(pending)) = emitted {
         let _ = host::await_py(pending).await;
     }
+}
+
+fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
+}
+
+/// Show `text` in one message: edit `previous` (`{"guid", "edits", "sent_at"}`)
+/// while Apple allows, else send a new message when `resend`. None when neither.
+async fn show(
+    client: &Object,
+    chat: &str,
+    previous: &Value,
+    text: &str,
+    resend: bool,
+) -> PyResult<Option<Value>> {
+    let text_arg =
+        || Python::attach(|py| Ok::<_, PyErr>(text.into_pyobject(py)?.into_any().unbind()));
+    if let Some(guid) = previous["guid"].as_str() {
+        let edits = previous["edits"].as_u64().unwrap_or(0);
+        let fresh = now() - previous["sent_at"].as_f64().unwrap_or(0.0) < policy::EDIT_WINDOW;
+        let editable = Python::attach(|py| client.bind(py).hasattr("edit_text"))?;
+        if editable && fresh && edits < policy::MAX_EDITS {
+            let guid_arg =
+                Python::attach(|py| Ok::<_, PyErr>(guid.into_pyobject(py)?.into_any().unbind()))?;
+            match call(
+                copy(client),
+                "edit_text",
+                vec![guid_arg, text_arg()?],
+                vec![],
+            )
+            .await
+            {
+                Ok(_) => {
+                    return Ok(Some(
+                        json!({"guid": guid, "edits": edits + 1, "sent_at": previous["sent_at"]}),
+                    ))
+                }
+                Err(error) if !resend => return Err(error),
+                Err(_) => {}
+            }
+        }
+        if !resend {
+            return Ok(None);
+        }
+    }
+    let chat_arg =
+        Python::attach(|py| Ok::<_, PyErr>(chat.into_pyobject(py)?.into_any().unbind()))?;
+    let receipt = call(
+        copy(client),
+        "send_text",
+        vec![chat_arg, text_arg()?],
+        vec![],
+    )
+    .await?;
+    let guid = Python::attach(|py| receipt.bind(py).extract::<String>())
+        .ok()
+        .filter(|guid| !guid.is_empty())
+        .ok_or_else(|| PyRuntimeError::new_err("BlueBubbles did not return a message receipt"))?;
+    Ok(Some(json!({"guid": guid, "edits": 0, "sent_at": now()})))
 }
 
 #[pyclass(
@@ -907,6 +1101,20 @@ impl BlueBubblesClient {
             })
         })
     }
+    /// Unsend a message (Private API).
+    fn unsend(slf: Py<Self>, py: Python<'_>, guid: String) -> Output {
+        host::coroutine(py, async move {
+            post(slf, policy::unsend_path(&guid), policy::unsend_request()).await?;
+            Ok(none())
+        })
+    }
+    /// Replace a sent message's text (Private API, macOS 13 or later).
+    fn edit_text(slf: Py<Self>, py: Python<'_>, guid: String, text: String) -> Output {
+        host::coroutine(py, async move {
+            post(slf, policy::edit_path(&guid), policy::edit_request(&text)).await?;
+            Ok(none())
+        })
+    }
     fn close(slf: Py<Self>, py: Python<'_>) -> Output {
         host::coroutine(py, async move {
             let session = Python::attach(|py| {
@@ -920,6 +1128,19 @@ impl BlueBubblesClient {
             Ok(none())
         })
     }
+}
+/// `POST` a JSON body through the client's `request`.
+async fn post(slf: Py<BlueBubblesClient>, path: String, body: Value) -> PyResult<Object> {
+    let (args, payload) = Python::attach(|py| {
+        Ok::<_, PyErr>((
+            vec![
+                "POST".into_pyobject(py)?.into_any().unbind(),
+                path.into_pyobject(py)?.into_any().unbind(),
+            ],
+            convert::from_json(py, &body)?,
+        ))
+    })?;
+    call(slf.into_any(), "request", args, vec![("json", payload)]).await
 }
 /// One BlueBubbles request: its HTTP status and JSON body (None if not JSON).
 async fn exchange(

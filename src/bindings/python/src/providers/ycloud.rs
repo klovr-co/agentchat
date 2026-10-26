@@ -320,7 +320,7 @@ impl YCloud {
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self { payload: None }
     }
-    #[pyo3(signature=(*,phone_number,api_key,webhook_secret,host="127.0.0.1",port=3981,smb_echoes=false,max_media_bytes=policy::DEFAULT_MAX_MEDIA_BYTES,max_pending_events=64,shutdown_timeout=20.0))]
+    #[pyo3(signature=(*,phone_number,api_key,webhook_secret,host="127.0.0.1",port=3981,smb_echoes=false,max_media_bytes=policy::DEFAULT_MAX_MEDIA_BYTES,max_pending_events=64,shutdown_timeout=20.0,task_messages=false))]
     #[allow(clippy::too_many_arguments)]
     fn initialize(
         slf: Py<Self>,
@@ -334,6 +334,7 @@ impl YCloud {
         max_media_bytes: usize,
         max_pending_events: i64,
         shutdown_timeout: f64,
+        task_messages: bool,
     ) -> PyResult<()> {
         policy::validate_config(phone_number, api_key, webhook_secret)
             .map_err(PyValueError::new_err)?;
@@ -351,6 +352,7 @@ impl YCloud {
         }
         state.set_item("_port", port)?;
         state.set_item("_smb_echoes", smb_echoes)?;
+        state.set_item("_task_messages", task_messages)?;
         state.set_item("_max_media_bytes", max_media_bytes)?;
         state.set_item("_event_handler", py.None())?;
         let asyncio = py.import("asyncio")?;
@@ -435,6 +437,43 @@ impl YCloud {
                 .map_err(PyRuntimeError::new_err)?;
             receipt_with_metadata(&source_host, &message)
         })
+    }
+    /// With `task_messages=True`, each task that finishes in `reply.task()` is a
+    /// short reply, at most five per answer; WhatsApp messages cannot be edited or
+    /// deleted, so nothing is shown otherwise.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        updates: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let enabled = slf.bind(py).getattr("_task_messages")?.is_truthy()?;
+        host::coroutine(py, async move {
+            crate::stream::finished_task_replies(
+                slf.into_any(),
+                enabled,
+                source,
+                stream,
+                updates,
+                ADAPTER,
+            )
+            .await
+        })
+    }
+    /// WhatsApp has no home screen and cannot edit messages: each call sends `view`
+    /// (text) to `user_id` as a new message. WhatsApp delivers it only within 24
+    /// hours of that person's last message.
+    fn publish_home(
+        slf: Py<Self>,
+        py: Python<'_>,
+        user_id: String,
+        view: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let phone = slf.bind(py).getattr("_phone_number")?.extract::<String>()?;
+        let source = policy::direct_source(&phone, &user_id).map_err(PyValueError::new_err)?;
+        let source = convert::to_message(py, &source)?;
+        Ok(slf.bind(py).call_method1("reply", (source, view))?.unbind())
     }
     /// WhatsApp chats are one-to-one, so a notice for the person this conversation
     /// is with is an ordinary reply; any other recipient raises ValueError.
@@ -633,8 +672,18 @@ impl YCloud {
                 if let Some(handler) = Python::attach(|py| apps::find(this.bind(py), &route))? {
                     let delivery = get(&this, "_delivery")?;
                     let raw = j(payload.clone())?;
-                    if !Python::attach(|py| {
-                        apps::spawn(this.bind(py), delivery.bind(py), &handler, &raw)
+                    // A text answer to a press, Flow reply or command is sent as a reply.
+                    let source = policy::reply_source(&payload, &phone)
+                        .filter(|_| !matches!(route, agentchat_core::Route::Event { .. }));
+                    if !Python::attach(|py| match source {
+                        Some(source) => apps::spawn_replying(
+                            this.bind(py),
+                            delivery.bind(py),
+                            &handler,
+                            &raw,
+                            convert::to_message(py, &source)?,
+                        ),
+                        None => apps::spawn(this.bind(py), delivery.bind(py), &handler, &raw),
                     })? {
                         return Err(fail_response(
                             "HTTPServiceUnavailable",

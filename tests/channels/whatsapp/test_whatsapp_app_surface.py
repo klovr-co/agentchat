@@ -162,3 +162,80 @@ async def test_ycloud_presses_and_events_reach_handlers(monkeypatch):
         await channel.close()
     assert sorted(seen) == ["whatsapp.inbound_message.received", "whatsapp.message.updated"]
     assert messages == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_answers_handlers_reports_finished_tasks_and_sends_home(monkeypatch):
+    receipt = Receipt("wamid.sent")
+    session = WhatsAppSession(receipt)
+    channel = WhatsApp(phone_number_id="123", access_token="token", app_secret="secret",
+                       verify_token="verify", task_messages=True)
+    app = AgentChat(channels=[channel])
+    channel.bind(lambda channel, message: asyncio.sleep(0))
+
+    @channel.on_command("/start")
+    async def start(payload):
+        return {"text": "Started"}
+
+    payload = whatsapp_event(messages=[
+        {"id": "wamid.cmd", "from": "15551234567", "type": "text", "text": {"body": "/start"}}])
+    try:
+        async with TestClient(TestServer(channel.create_app())) as client:
+            monkeypatch.setattr("agentchat.channels.whatsapp.adapter.aiohttp.ClientSession",
+                                lambda **kw: session)
+            response = await client.post("/webhooks/whatsapp", **signed(payload))
+            assert response.status == 200
+            await until(lambda: receipt.calls)
+        answer = receipt.calls[-1][1]["json"]
+        assert answer["text"]["body"] == "Started"
+        assert answer["context"] == {"message_id": "wamid.cmd"}
+
+        source = normalize(whatsapp_event(), phone_number_id="123")[0]
+        async with app.stream(channel, source, interval=0) as reply:
+            await reply.task("a", "Read the logs")
+            await reply.task("a", "Read the logs", "complete", output="1 error")
+            await reply.task("b", "Fix it", "error")
+            await reply.append("Done.")
+        bodies = [call[1]["json"]["text"]["body"] for call in receipt.calls[1:]]
+        assert bodies == ["✅ Read the logs — 1 error", "❌ Fix it", "Done."]
+        history = await app.state.history(source.conversation_id)
+        assert [message.text for message in history] == ["Done."]
+
+        home = await channel.publish_home("15550000000", "Your home")
+        request = receipt.calls[-1][1]["json"]
+        assert request["to"] == "15550000000" and "context" not in request
+        assert home.conversation_id == "whatsapp:123:15550000000"
+        with pytest.raises(ValueError):
+            await channel.publish_home("+1 555", "Your home")
+    finally:
+        await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_ycloud_answers_handlers_and_sends_home(monkeypatch):
+    receipt = Receipt("wamid.sent")
+    session = YCloudSession(receipt)
+    monkeypatch.setattr("agentchat.channels.ycloud.adapter.aiohttp.ClientSession",
+                        lambda **kw: session)
+    channel = YCloud(phone_number=BUSINESS, api_key="key", webhook_secret="whsec_secret")
+    channel.bind(lambda channel, message: asyncio.sleep(0))
+
+    @channel.on_action("retry")
+    async def retry(payload):
+        return "Retrying"
+
+    press = ycloud_event(ycloud_message(type="interactive", interactive={
+        "type": "button_reply", "button_reply": {"id": "retry", "title": "Retry"}}))
+    try:
+        async with TestClient(TestServer(channel.create_app())) as client:
+            response = await client.post("/webhooks/ycloud", **ycloud_signed(press))
+            assert response.status == 200
+            await until(lambda: receipt.calls)
+        answer = receipt.calls[-1][1]["json"]
+        assert answer["text"]["body"] == "Retrying"
+        assert answer["context"] == {"message_id": "wamid.incoming"}
+        await channel.publish_home("+15550000000", "Your home")
+        request = receipt.calls[-1][1]["json"]
+        assert request["to"] == "+15550000000" and "context" not in request
+    finally:
+        await channel.close()

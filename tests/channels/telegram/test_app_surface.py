@@ -6,6 +6,7 @@ import re
 import pytest
 
 from agentchat import AgentChat
+from agentchat.channels.telegram.transport import TelegramError
 from tests.support.telegram import (
     GROUP,
     TelegramClient,
@@ -161,3 +162,60 @@ async def test_drafts_stream_in_private_chats_and_their_stop_button_stops_the_tu
     finally:
         await channel.close()
         await task
+
+
+class RefusingClient(Client):
+    """Refuses group notices, as when the bot is not an administrator."""
+
+    def __init__(self, pinned=None):
+        super().__init__()
+        self.pinned = pinned
+
+    async def call(self, method, payload=None, **options):
+        if method == "sendMessage" and payload and "ephemeral_message_parameters" in payload:
+            self.calls.append((method, payload))
+            raise TelegramError("Bad Request: not enough rights", error_code=400)
+        if method == "getChat":
+            self.calls.append((method, payload))
+            return {"id": payload["chat_id"], "type": "private", "pinned_message": self.pinned}
+        return await super().call(method, payload, **options)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_notice_falls_back_to_the_private_chat_when_asked():
+    client = RefusingClient()
+    channel = faked(client)
+    app = AgentChat(channels=[channel])
+    await channel._load_bot_identity()
+    group = channel._normalize(group_update())
+    with pytest.raises(TelegramError):
+        await app.send_ephemeral(channel, group, "30", "Only you")
+    notice = await app.send_ephemeral(channel, group, "30", "Only you", fallback="dm")
+    request = client.method_calls("sendMessage")[-1]
+    assert request["chat_id"] == 30 and "reply_parameters" not in request
+    assert notice.conversation_id == "telegram:99:30"
+    private = channel._normalize(telegram_update())
+    await app.send_ephemeral(channel, private, "31", "Elsewhere", fallback="dm")
+    assert client.method_calls("sendMessage")[-1]["chat_id"] == 31
+
+
+@pytest.mark.asyncio
+async def test_home_message_is_pinned_then_edited_and_found_again_after_a_restart():
+    client = RefusingClient()
+    channel = faked(client)
+    await channel._load_bot_identity()
+    home = await channel.publish_home("30", "Welcome")
+    assert client.method_calls("sendMessage")[-1]["text"] == "Welcome"
+    assert client.method_calls("pinChatMessage") == [
+        {"chat_id": 30, "message_id": 101, "disable_notification": True}]
+    again = await channel.publish_home("30", "Welcome back")
+    assert again.id == home.id
+    assert client.method_calls("editMessageText")[-1]["text"] == "Welcome back"
+    assert len(client.method_calls("getChat")) == 1
+
+    restarted = RefusingClient(pinned={"message_id": 101, "from": {"id": 99}})
+    channel = faked(restarted)
+    await channel._load_bot_identity()
+    await channel.publish_home("30", "Still here")
+    assert restarted.method_calls("sendMessage") == []
+    assert restarted.method_calls("editMessageText")[-1]["message_id"] == 101

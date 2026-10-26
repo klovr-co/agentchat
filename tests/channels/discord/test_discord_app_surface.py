@@ -129,3 +129,47 @@ async def test_notices_delete_and_task_progress():
     assert client.edits[0][2] == "**Fixing the build**\n⏳ Read the logs"
     assert client.deleted[-1] == "channels/10/messages/101"
     await channel.close()
+
+
+class DirectClient(Client):
+    """Opens direct message channels and keeps pins."""
+
+    def __init__(self, pins=()):
+        super().__init__()
+        self.pins_listed, self.pinned = [], []
+        self.pins_listing = {"items": list(pins), "has_more": False}
+
+    async def open_dm(self, user_id):
+        return 500 + int(user_id)
+
+    async def pins(self, channel_id):
+        self.pins_listed.append(channel_id)
+        return self.pins_listing
+
+    async def pin(self, channel_id, message_id):
+        self.pinned.append((channel_id, message_id))
+
+
+@pytest.mark.asyncio
+async def test_notices_fall_back_to_a_direct_message_and_home_is_a_pinned_dm():
+    client = DirectClient()
+    channel = Discord(bot_token="fake", client=client, send_client=client)
+    app = AgentChat(channels=[channel])
+    guild = discord_message(
+        discord_event(direct=False, mentions=[SimpleNamespace(id=99)]), bot_id=99)
+    with pytest.raises(ValueError):
+        await app.send_ephemeral(channel, guild, "30", "Only you")
+    notice = await app.send_ephemeral(channel, guild, "30", "Only you", fallback="dm")
+    channel_id, payload = client.receipt.calls[-1][0]
+    assert channel_id == 530 and "message_reference" not in payload
+    assert notice.metadata["channel_id"] == 530
+
+    home = await channel.publish_home("30", "Welcome")
+    assert client.pins_listed == [530] and client.pinned == [(530, 101)]
+    again = await channel.publish_home("30", "Welcome back")
+    assert again.id == home.id and client.edits[-1] == (530, 101, "Welcome back")
+
+    restarted = DirectClient(pins=[{"message": {"id": "88", "author": {"id": "99"}}}])
+    channel = Discord(bot_token="fake", client=restarted, send_client=restarted)
+    await channel.publish_home("30", "Still here")
+    assert restarted.edits == [(530, 88, "Still here")] and restarted.receipt.calls == []

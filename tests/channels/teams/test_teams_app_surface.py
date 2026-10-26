@@ -197,3 +197,23 @@ async def test_teams_stop_button_stops_the_turn():
     # Nothing is sent after Stop: no final message.
     assert all(a.entities[0].stream_type != "final" for a in connector.sent if a.entities)
     await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_home_message_needs_a_one_to_one_chat_then_updates_in_place():
+    channel, connector = make_channel()
+    channel.bind(lambda channel, message: asyncio.sleep(0))
+    with pytest.raises(LookupError):
+        await channel.publish_home("29:alice", "Welcome")
+    # A group message does not give a one-to-one chat.
+    await channel.on_turn(turn(teams_event(kind="groupChat")))
+    with pytest.raises(LookupError):
+        await channel.publish_home("29:alice", "Welcome")
+    await channel.on_turn(turn(teams_event()))
+    home = await channel.publish_home("29:alice", "Welcome")
+    assert connector.sent[-1].text == "Welcome"
+    again = await channel.publish_home("29:alice", "Welcome back")
+    assert again.id == home.id
+    assert connector.updated[-1][0] == home.metadata["activity_id"]
+    assert connector.updated[-1][1].text == "Welcome back"
+    await channel.close()

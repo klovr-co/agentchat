@@ -191,6 +191,50 @@ pub fn spawn(
         .is_truthy()
 }
 
+/// The text of a handler's answer to send as a reply: a string, or a mapping's
+/// nonempty `"text"`.
+fn reply_text(answer: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    let text = if let Ok(text) = answer.extract::<String>() {
+        Some(text)
+    } else if answer.hasattr("get")? {
+        let value = answer.call_method1("get", ("text",))?;
+        value.extract::<Option<String>>().unwrap_or(None)
+    } else {
+        None
+    };
+    Ok(text.filter(|text| !text.trim().is_empty()))
+}
+
+/// Like `spawn`, on a channel whose provider takes no answer: a text answer
+/// (`"..."` or `{"text": "..."}`) is sent as a reply to `source`, the message that
+/// triggered the handler.
+pub fn spawn_replying(
+    channel: &Bound<'_, PyAny>,
+    delivery: &Bound<'_, PyAny>,
+    handler: &Object,
+    payload: &Object,
+    source: Object,
+) -> PyResult<bool> {
+    let py = channel.py();
+    let pending = handler.bind(py).call1((payload.bind(py),))?.unbind();
+    let target = channel.clone().unbind();
+    let work = crate::host::coroutine(py, async move {
+        let answer = await_py(pending).await?;
+        let text = Python::attach(|py| reply_text(answer.bind(py)))?;
+        if let Some(text) = text {
+            let sent = Python::attach(|py| -> PyResult<Object> {
+                Ok(target
+                    .bind(py)
+                    .call_method1("reply", (source.bind(py), text))?
+                    .unbind())
+            })?;
+            await_py(sent).await?;
+        }
+        Ok(Python::attach(|py| py.None()))
+    })?;
+    delivery.call_method1("spawn", (channel, work))?.is_truthy()
+}
+
 /// Run `handler(payload)` and return its answer if it arrives within the
 /// acknowledgement deadline; otherwise None, and the handler keeps running as
 /// drained work. A handler that fails in time raises.
@@ -225,6 +269,30 @@ pub async fn answer(delivery: Object, handler: Object, payload: Object) -> PyRes
         delivery.bind(py).call_method1("track", (pending,))?;
         Ok(py.None())
     })
+}
+
+/// Whether a notice may fall back to the person's direct chat: `fallback` is None
+/// or `"dm"`.
+pub fn dm_fallback(fallback: Option<&str>) -> PyResult<bool> {
+    match fallback {
+        None => Ok(false),
+        Some("dm") => Ok(true),
+        Some(_) => Err(pyo3::exceptions::PyValueError::new_err(
+            "fallback must be None or \"dm\"",
+        )),
+    }
+}
+
+/// A dictionary the channel keeps in attribute `name`, created on first use.
+pub fn memory<'py>(channel: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyDict>> {
+    if let Ok(found) = channel.getattr(name) {
+        if let Ok(found) = found.cast_into::<PyDict>() {
+            return Ok(found);
+        }
+    }
+    let created = PyDict::new(channel.py());
+    channel.setattr(name, &created)?;
+    Ok(created)
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
