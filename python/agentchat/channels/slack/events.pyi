@@ -5,6 +5,9 @@ from collections.abc import Mapping
 from agentchat.models import Attachment, Message
 
 FILE_ID: re.Pattern[str]
+ACK_DEADLINE: float
+
+def responds(payload: Mapping[str, object]) -> bool: ...
 
 def slack_attachments(files: object, *, limit: int = ...) -> tuple[Attachment, ...]: ...
 def _filename(value: str) -> str: ...

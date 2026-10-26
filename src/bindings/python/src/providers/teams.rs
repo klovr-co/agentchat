@@ -1,9 +1,10 @@
 //! Teams SDK authentication and continuation I/O driven from Rust.
 use crate::prompts::PromptFields;
 use crate::{
-    convert, host,
+    apps, convert, host,
     runtime::{call, copy, exit_scope, none},
 };
+use agentchat_core::TaskBoard;
 use agentchat_providers::teams as policy;
 use pyo3::{
     exceptions::{
@@ -637,7 +638,7 @@ impl Teams {
     }
     fn on_turn(slf: Py<Self>, py: Python<'_>, context: Object) -> Output {
         host::coroutine(py, async move {
-            Python::attach(|py| {
+            let (value, handler) = Python::attach(|py| -> PyResult<_> {
                 let kw = PyDict::new(py);
                 kw.set_item("by_alias", true)?;
                 kw.set_item("exclude_none", true)?;
@@ -648,12 +649,36 @@ impl Teams {
                 )?;
                 let value = convert::to_json(&event)?;
                 let this = slf.borrow(py);
+                let mut handler = None;
+                if policy::in_tenant(&value, &this._app_id, &this._tenant_id) {
+                    if let Some(route) = policy::route(&value) {
+                        handler = apps::find(slf.bind(py).as_any(), &route)?;
+                        if handler.is_some() {
+                            this.validate_url(py, value["serviceUrl"].as_str().unwrap_or(""))?;
+                        }
+                    }
+                }
+                Ok((value, handler))
+            })?;
+            if let Some(handler) = handler {
+                return Self::handle_app(&slf, context, value, handler).await;
+            }
+            Python::attach(|py| {
+                let this = slf.borrow(py);
                 let Some(message) = policy::normalize(&value, &this._app_id, &this._tenant_id)
                 else {
                     return Ok(py.None());
                 };
                 this.validate_url(py, value["serviceUrl"].as_str().unwrap_or(""))?;
+                let personal =
+                    policy::Destination::from_source(&message, &this._app_id, &this._tenant_id)
+                        .is_ok_and(|d| policy::streams_natively(&d));
+                let sender = message.sender.id.clone();
                 let message = convert::to_message(py, &message)?;
+                // The one-to-one chat to publish this person's home message in.
+                if personal {
+                    apps::memory(slf.bind(py).as_any(), "_personal")?.set_item(sender, &message)?;
+                }
                 if !this
                     ._delivery
                     .bind(py)
@@ -669,6 +694,31 @@ impl Teams {
                 Ok(py.None())
             })
         })
+    }
+    /// Handle activities AgentChat does not turn into messages, by activity type,
+    /// such as "conversationUpdate" or "installationUpdate".
+    fn on_event(slf: &Bound<'_, Self>, event_type: Object) -> Output {
+        apps::decorator(slf.as_any(), "event", event_type)
+    }
+    /// Handle card actions: an `adaptiveCard/action` verb, a dialog-opening
+    /// `task/fetch` or an `Action.Submit` whose data has this `action_id`. For an
+    /// invoke, the return value is the invoke response body, such as a dialog.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Object) -> Output {
+        apps::decorator(slf.as_any(), "action", action_id)
+    }
+    /// Handle dialog submissions (`task/submit`) whose data has this `callback_id`;
+    /// the return value is the invoke response body.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Object) -> Output {
+        apps::decorator(slf.as_any(), "view", callback_id)
+    }
+    /// Handle messages starting with this command, such as "/deploy", instead of
+    /// passing them to the message handler.
+    fn on_command(slf: &Bound<'_, Self>, command: Object) -> Output {
+        apps::decorator(slf.as_any(), "command", command)
+    }
+    /// Handle every other routed activity, such as other invokes.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Object) -> Output {
+        apps::raw(slf.as_any(), handler)
     }
     fn _validate_service_url(&self, py: Python<'_>, url: &str) -> PyResult<()> {
         self.validate_url(py, url)
@@ -766,10 +816,55 @@ impl Teams {
         text: String,
     ) -> Output {
         host::coroutine(py, async move {
-            let handle = Python::attach(|py| convert::to_json(stream.bind(py)))?;
-            let (activity, update, next) = policy::stream_update_activity(&handle, &text);
-            send_activity(&slf, &source, activity, update).await?;
-            Python::attach(|py| convert::from_json(py, &next))
+            let mut handle = Python::attach(|py| convert::to_json(stream.bind(py)))?;
+            if handle["stopped"] == true {
+                return Ok(stream);
+            }
+            if handle.get("id").is_none() {
+                // Only task progress has been shown so far; the answer starts now.
+                if text.is_empty() {
+                    return Ok(stream);
+                }
+                let started = Python::attach(|py| {
+                    slf.bind(py)
+                        .call_method1("start_stream", (source.bind(py), &text))
+                        .map(Bound::unbind)
+                })?;
+                let started = host::await_py(started).await?;
+                return Python::attach(|py| {
+                    let mut started = convert::to_json(started.bind(py))?;
+                    started["progress"] = handle["progress"].take();
+                    started["board"] = handle["board"].take();
+                    started["shown"] = json!(text);
+                    convert::from_json(py, &started)
+                });
+            }
+            let (activity, update, mut next) = policy::stream_update_activity(&handle, &text);
+            match send_activity(&slf, &source, activity, update).await {
+                Ok(_) => {
+                    next["shown"] = json!(text);
+                    next["text_started"] = json!(true);
+                    Python::attach(|py| convert::from_json(py, &next))
+                }
+                Err(error) if handle["native"] == true && canceled(&error) => {
+                    // The person pressed Teams' Stop button: stop the turn, keep what was shown.
+                    let stop = Python::attach(|py| -> PyResult<Object> {
+                        let message = convert::from_message(source.bind(py))?;
+                        let id = handle["id"].as_str().unwrap_or_default();
+                        convert::to_message(py, &policy::stop_request(&message, id))
+                    })?;
+                    Python::attach(|py| {
+                        slf.borrow(py)
+                            ._delivery
+                            .bind(py)
+                            .call_method1("submit", (slf.clone_ref(py), stop))
+                            .map(|_| ())
+                    })?;
+                    handle["stopped"] = json!(true);
+                    Python::attach(|py| convert::from_json(py, &handle))
+                }
+                Err(error) => Err(error),
+            }
         })
     }
     fn stop_stream(
@@ -780,22 +875,256 @@ impl Teams {
         text: String,
     ) -> Output {
         host::coroutine(py, async move {
-            policy::text_payload(&text).map_err(PyValueError::new_err)?;
-            let content = text;
             let handle = Python::attach(|py| convert::to_json(stream.bind(py)))?;
-            let id = handle["id"].clone();
-            let (activity, update) = policy::stream_final_activity(&handle, &content);
+            let result = finish_stream(&slf, &source, &handle, text).await;
+            remove_progress(&slf, &source, &handle).await;
+            result
+        })
+    }
+    /// Show a notice only `user_id` can see: a targeted message in a channel or group
+    /// chat ("Only you can see this message", gone after 24 hours), or an ordinary
+    /// reply in that user's one-to-one chat. `blocks` are card attachments.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Object,
+        user_id: String,
+        text: String,
+        blocks: Option<Object>,
+    ) -> Output {
+        let attachments = blocks
+            .map(|blocks| convert::to_json(blocks.bind(py)))
+            .transpose()?;
+        let message = convert::from_message(source.bind(py))?;
+        policy::text_payload(&text).map_err(PyValueError::new_err)?;
+        let personal = {
+            let this = slf.borrow(py);
+            let destination =
+                policy::Destination::from_source(&message, &this._app_id, &this._tenant_id)
+                    .map_err(PyValueError::new_err)?;
+            policy::streams_natively(&destination)
+        };
+        if personal && message.sender.id != user_id {
+            return Err(PyValueError::new_err(
+                "A one-to-one Teams chat can only show notices to its own user",
+            ));
+        }
+        host::coroutine(py, async move {
+            let mut activity = if personal {
+                text_activity(&text)
+            } else {
+                policy::targeted_activity(&text, &user_id, None)
+            };
+            if let Some(attachments) =
+                attachments.filter(|a| a.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                activity["attachments"] = attachments;
+            }
             let (message, destination, receipt) =
-                send_activity(&slf, &source, activity, update).await?;
-            let receipt = receipt_id(&receipt)
-                .or_else(|_| id.as_str().map(str::to_owned).ok_or(()))
-                .map_err(|_| PyRuntimeError::new_err("Teams did not return a message receipt"))?;
-            super::transport::receipt_with_metadata(
-                &source,
-                &destination
-                    .confirmed_reply(&message, content, &receipt)
-                    .map_err(PyRuntimeError::new_err)?,
+                send_activity(&slf, &source, activity, false).await?;
+            let mut sent = destination
+                .confirmed_reply(&message, text, &receipt_id(&receipt)?)
+                .map_err(PyRuntimeError::new_err)?;
+            if !personal {
+                sent.metadata.insert("ephemeral".into(), json!(true));
+                sent.metadata
+                    .insert("recipient_user_id".into(), json!(user_id));
+            }
+            super::transport::receipt_with_metadata(&source, &sent)
+        })
+    }
+    /// Keep one home message in the one-to-one chat with `user_id`, updated in place
+    /// by later calls. A bot can only start that chat with details Teams sent
+    /// earlier, so this works once the person has messaged the app one-to-one
+    /// since the adapter started; otherwise it raises LookupError.
+    fn publish_home(slf: Py<Self>, py: Python<'_>, user_id: String, view: Object) -> Output {
+        let text = teams_text_payload(view.bind(py))?;
+        let source = apps::memory(slf.bind(py).as_any(), "_personal")?
+            .get_item(&user_id)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyLookupError::new_err(
+                    "Teams can publish a home message only after that person has messaged \
+                     the app one-to-one",
+                )
+            })?
+            .unbind();
+        let known = apps::memory(slf.bind(py).as_any(), "_homes")?
+            .get_item(&user_id)?
+            .map(|id| id.extract::<String>())
+            .transpose()?;
+        host::coroutine(py, async move {
+            let mut activity = policy::text_activity(&text);
+            activity["textFormat"] = json!("markdown");
+            if let Some(id) = &known {
+                activity["id"] = json!(id);
+            }
+            let sent = send_activity(&slf, &source, activity, known.is_some()).await;
+            let (message, destination, receipt) = match sent {
+                Ok(sent) => sent,
+                Err(error) => {
+                    // The next call sends a new home message.
+                    Python::attach(|py| {
+                        apps::memory(slf.bind(py).as_any(), "_homes")?.del_item(&user_id)
+                    })
+                    .ok();
+                    return Err(error);
+                }
+            };
+            let id = match known {
+                Some(id) => id,
+                None => receipt_id(&receipt)?,
+            };
+            Python::attach(|py| {
+                apps::memory(slf.bind(py).as_any(), "_homes")?.set_item(&user_id, &id)
+            })?;
+            let home = destination
+                .confirmed_reply(&message, text, &id)
+                .map_err(PyRuntimeError::new_err)?;
+            super::transport::receipt_with_metadata(&source, &home)
+        })
+    }
+    /// Replace the text of a message this app sent.
+    fn edit(slf: Py<Self>, py: Python<'_>, message: Object, text: String) -> Output {
+        let text = teams_text_payload(text.into_pyobject(py)?.as_any())?;
+        let id = convert::from_message(message.bind(py))?
+            .metadata
+            .get("activity_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| PyValueError::new_err("Expected a Teams message to edit"))?;
+        host::coroutine(py, async move {
+            let mut activity = policy::text_activity(&text);
+            activity["id"] = json!(id);
+            let (sent, destination, _) =
+                send_activity(&slf, &message, activity, Send::Update).await?;
+            let edited = destination
+                .confirmed_reply(&sent, text, &id)
+                .map_err(PyRuntimeError::new_err)?;
+            super::transport::receipt_with_metadata(&message, &edited)
+        })
+    }
+    /// Delete a message this app sent.
+    fn delete(slf: Py<Self>, py: Python<'_>, message: Object) -> Output {
+        let id = convert::from_message(message.bind(py))?
+            .metadata
+            .get("activity_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| PyValueError::new_err("Expected a Teams message to delete"))?;
+        host::coroutine(py, async move {
+            send_activity(
+                &slf,
+                &message,
+                json!({"type": "message", "id": id}),
+                Send::Delete,
             )
+            .await?;
+            Ok(none())
+        })
+    }
+    /// Show task progress: in a one-to-one chat as Teams' informative stream updates
+    /// before the answer starts; elsewhere as a separate message updated in place and
+    /// deleted when the answer is finished. A failed update never fails the answer.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Object,
+        stream: Object,
+        updates: Object,
+    ) -> Output {
+        host::coroutine(py, async move {
+            let (updates, handle, native) = Python::attach(|py| -> PyResult<_> {
+                let updates: Vec<agentchat_core::StreamUpdate> =
+                    serde_json::from_value(convert::to_json(updates.bind(py))?)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let handle = (!stream.is_none(py))
+                    .then(|| convert::to_json(stream.bind(py)))
+                    .transpose()?;
+                let message = convert::from_message(source.bind(py))?;
+                let this = slf.borrow(py);
+                let native =
+                    policy::Destination::from_source(&message, &this._app_id, &this._tenant_id)
+                        .map(|d| policy::streams_natively(&d))
+                        .map_err(PyValueError::new_err)?;
+                Ok((updates, handle, native))
+            })?;
+            let mut board: TaskBoard = handle
+                .as_ref()
+                .and_then(|h| serde_json::from_value(h["board"].clone()).ok())
+                .unwrap_or_default();
+            board.apply(&updates);
+            let mut next = handle.clone().unwrap_or_else(|| json!({}));
+            next["board"] = serde_json::to_value(&board).unwrap_or_default();
+            let result = if native {
+                if next["text_started"] == true || next["stopped"] == true {
+                    Ok(())
+                } else {
+                    let text = policy::informative_text(&board);
+                    if text.is_empty() {
+                        Ok(())
+                    } else {
+                        let (activity, informative) = policy::informative_activity(
+                            handle.as_ref().filter(|h| h.get("id").is_some()),
+                            &text,
+                        );
+                        match send_activity(&slf, &source, activity, false).await {
+                            Ok((_, _, receipt)) => {
+                                if next.get("id").is_none() {
+                                    next = informative;
+                                    next["id"] = json!(receipt_id(&receipt)?);
+                                    next["board"] =
+                                        serde_json::to_value(&board).unwrap_or_default();
+                                } else {
+                                    next["sequence"] = informative["sequence"].clone();
+                                }
+                                next["shown"] = json!(text);
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+            } else {
+                let text = board.render(4000);
+                let progress = next["progress"].clone();
+                if text.is_empty() || progress["shown"] == text.as_str() {
+                    Ok(())
+                } else {
+                    let mut activity = text_activity(&text);
+                    activity["textFormat"] = json!("markdown");
+                    let update = progress["id"].is_string();
+                    if update {
+                        activity["id"] = progress["id"].clone();
+                    }
+                    match send_activity(&slf, &source, activity, update).await {
+                        Ok((_, _, receipt)) => {
+                            let id = if update {
+                                progress["id"].clone()
+                            } else {
+                                json!(receipt_id(&receipt)?)
+                            };
+                            next["progress"] = json!({"id": id, "shown": text});
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            if let Err(error) = result {
+                Python::attach(|py| -> PyResult<()> {
+                    py.import("logging")?
+                        .call_method1("getLogger", ("agentchat.channels.teams.adapter",))?
+                        .call_method1(
+                            "warning",
+                            ("Teams task progress update failed (%s)", error.to_string()),
+                        )?;
+                    Ok(())
+                })?;
+            }
+            Python::attach(|py| convert::from_json(py, &next))
         })
     }
     /// Show "typing…" in the source conversation until cleared with "" or the keeper
@@ -838,18 +1167,183 @@ impl Teams {
         })
     }
 }
+/// Whether a failed stream update means the person pressed Teams' Stop button.
+fn canceled(error: &PyErr) -> bool {
+    Python::attach(|py| {
+        let value = error.value(py);
+        let status = value
+            .getattr("status")
+            .ok()
+            .and_then(|status| status.extract::<u16>().ok());
+        let body = value
+            .getattr("message")
+            .ok()
+            .and_then(|message| message.extract::<String>().ok())
+            .unwrap_or_default();
+        status.is_some_and(|status| policy::stream_canceled(status, &body))
+    })
+}
+/// Delete the task progress message once the answer is finished; best effort.
+async fn remove_progress(slf: &Py<Teams>, source: &Object, handle: &serde_json::Value) {
+    let Some(id) = handle["progress"]["id"].as_str() else {
+        return;
+    };
+    let _ = send_activity(
+        slf,
+        source,
+        json!({"type": "message", "id": id}),
+        Send::Delete,
+    )
+    .await;
+}
+/// Finish a streamed answer and confirm it.
+async fn finish_stream(
+    slf: &Py<Teams>,
+    source: &Object,
+    handle: &serde_json::Value,
+    text: String,
+) -> Output {
+    let confirm = |content: String, receipt: &str| {
+        Python::attach(|py| -> Output {
+            let message = convert::from_message(source.bind(py))?;
+            let this = slf.borrow(py);
+            let destination =
+                policy::Destination::from_source(&message, &this._app_id, &this._tenant_id)
+                    .map_err(PyValueError::new_err)?;
+            let sent = destination
+                .confirmed_reply(&message, content, receipt)
+                .map_err(PyRuntimeError::new_err)?;
+            super::transport::receipt_with_metadata(source, &sent)
+        })
+    };
+    let id = handle["id"].as_str().map(str::to_owned);
+    if handle["stopped"] == true {
+        // Teams keeps what was streamed before Stop; nothing more can be sent.
+        let shown = handle["shown"].as_str().unwrap_or_default().to_owned();
+        return confirm(shown, id.as_deref().unwrap_or_default());
+    }
+    if id.is_none() {
+        if let Some(progress) = handle["progress"]["id"]
+            .as_str()
+            .filter(|_| text.trim().is_empty())
+        {
+            // Only task progress was shown: confirm it without text.
+            return confirm(String::new(), progress);
+        }
+        policy::text_payload(&text).map_err(PyValueError::new_err)?;
+        let (message, destination, receipt) =
+            send_activity(slf, source, text_activity(&text), false).await?;
+        let sent = destination
+            .confirmed_reply(&message, text, &receipt_id(&receipt)?)
+            .map_err(PyRuntimeError::new_err)?;
+        return Python::attach(|_| super::transport::receipt_with_metadata(source, &sent));
+    }
+    // A stream that only showed informative updates ends with that text.
+    let shown_only = text.trim().is_empty() && handle["text_started"] != true;
+    let content = if shown_only {
+        handle["shown"].as_str().unwrap_or("…").to_owned()
+    } else {
+        policy::text_payload(&text).map_err(PyValueError::new_err)?;
+        text.clone()
+    };
+    let (activity, update) = policy::stream_final_activity(handle, &content);
+    let (message, destination, receipt) = send_activity(slf, source, activity, update).await?;
+    let receipt = receipt_id(&receipt)
+        .or_else(|_| id.clone().ok_or(()))
+        .map_err(|_| PyRuntimeError::new_err("Teams did not return a message receipt"))?;
+    let sent = destination
+        .confirmed_reply(
+            &message,
+            if shown_only { String::new() } else { text },
+            &receipt,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+    Python::attach(|_| super::transport::receipt_with_metadata(source, &sent))
+}
+impl Teams {
+    /// Run the application's handler for an activity. An invoke gets the handler's
+    /// answer as its invoke response, within the acknowledgement deadline.
+    async fn handle_app(
+        slf: &Py<Self>,
+        context: Object,
+        value: serde_json::Value,
+        handler: Object,
+    ) -> Output {
+        let (payload, delivery) = Python::attach(|py| -> PyResult<_> {
+            Ok((
+                convert::from_json(py, &value)?,
+                slf.borrow(py)._delivery.clone_ref(py),
+            ))
+        })?;
+        if value["type"] != "invoke" {
+            let spawned = Python::attach(|py| {
+                apps::spawn(slf.bind(py).as_any(), delivery.bind(py), &handler, &payload)
+            })?;
+            if !spawned {
+                return Err(Python::attach(|py| {
+                    http_error(py, "HTTPServiceUnavailable", Some("Teams receiver is busy"))
+                }));
+            }
+            return Ok(none());
+        }
+        let answer = apps::answer(delivery, handler, payload).await;
+        let response = match &answer {
+            Ok(body) => policy::invoke_response(
+                &Python::attach(|py| convert::to_json(body.bind(py))).unwrap_or_default(),
+            ),
+            Err(_) => json!({"type": "invokeResponse", "value": {"status": 500}}),
+        };
+        let activity = Python::attach(|py| -> PyResult<Object> {
+            Ok(py
+                .import("microsoft_agents.activity")?
+                .getattr("Activity")?
+                .call_method1("model_validate", (convert::from_json(py, &response)?,))?
+                .unbind())
+        })?;
+        call(context, "send_activity", vec![activity], vec![]).await?;
+        if let Err(error) = answer {
+            Python::attach(|py| -> PyResult<()> {
+                py.import("logging")?
+                    .call_method1("getLogger", ("agentchat.channels.teams.adapter",))?
+                    .call_method1(
+                        "warning",
+                        ("Teams invoke handler failed (%s)", error.to_string()),
+                    )?;
+                Ok(())
+            })?;
+        }
+        Ok(none())
+    }
+}
 use policy::text_activity;
 fn receipt_id(receipt: &Object) -> PyResult<String> {
     Python::attach(|py| receipt.bind(py).extract::<String>())
         .map_err(|_| PyRuntimeError::new_err("Teams did not return a message receipt"))
 }
 /// Send one activity to the conversation `source` came from; returns its receipt.
+/// How an activity is sent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Send {
+    New,
+    Update,
+    Delete,
+}
+impl From<bool> for Send {
+    fn from(update: bool) -> Self {
+        if update {
+            Send::Update
+        } else {
+            Send::New
+        }
+    }
+}
 async fn send_activity(
     slf: &Py<Teams>,
     source: &Object,
     activity: serde_json::Value,
-    update: bool,
+    update: impl Into<Send>,
 ) -> PyResult<(agentchat_core::Message, policy::Destination, Object)> {
+    let update = update.into();
     let (message, destination, adapter, reference, callback, send) = Python::attach(|py| {
         let message = convert::from_message(source.bind(py))?;
         let this = slf.borrow(py);
@@ -870,7 +1364,8 @@ async fn send_activity(
                     .call_method1("model_validate", (convert::from_json(py, &activity)?,))?
                     .unbind(),
                 receipt: py.None(),
-                update,
+                update: update == Send::Update,
+                delete: update == Send::Delete,
             },
         )?;
         let callback = host::callback(py, send.bind(py).getattr("send")?.unbind())?;
@@ -906,20 +1401,28 @@ struct TeamsSend {
     receipt: Object,
     /// Replace the message with the activity's ID instead of sending a new one.
     update: bool,
+    /// Delete the message with the activity's ID instead.
+    delete: bool,
 }
 #[pymethods]
 impl TeamsSend {
     fn send(slf: Py<Self>, py: Python<'_>, context: Object) -> Output {
         host::coroutine(py, async move {
-            let (activity, method) = Python::attach(|py| {
+            let (activity, method) = Python::attach(|py| -> PyResult<_> {
                 let this = slf.borrow(py);
+                if this.delete {
+                    return Ok((
+                        this.activity.bind(py).getattr("id")?.unbind(),
+                        "delete_activity",
+                    ));
+                }
                 let method = if this.update {
                     "update_activity"
                 } else {
                     "send_activity"
                 };
-                (this.activity.clone_ref(py), method)
-            });
+                Ok((this.activity.clone_ref(py), method))
+            })?;
             let receipt = call(context, method, vec![activity], vec![]).await?;
             Python::attach(|py| {
                 slf.borrow_mut(py).receipt = if receipt.bind(py).is_truthy()? {

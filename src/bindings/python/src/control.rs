@@ -51,6 +51,9 @@ impl Busy {
 #[pyclass(module = "agentchat._native")]
 pub struct RunningTurn {
     stop: Option<Object>,
+    /// Who sent the message this turn answers; only they may stop it from the
+    /// provider's own stop control.
+    pub starter: String,
     steered: Option<Py<PyList>>,
     /// Messages to run after this turn without showing them to its handler.
     queued: Option<Py<PyList>>,
@@ -60,11 +63,12 @@ pub struct RunningTurn {
 
 impl RunningTurn {
     /// A turn for the running event loop; `waiting` are messages already steered to it.
-    pub fn create(py: Python<'_>, waiting: Vec<Object>) -> PyResult<Py<Self>> {
+    pub fn create(py: Python<'_>, waiting: Vec<Object>, starter: String) -> PyResult<Py<Self>> {
         Py::new(
             py,
             Self {
                 stop: Some(py.import("asyncio")?.getattr("Event")?.call0()?.unbind()),
+                starter,
                 steered: Some(PyList::new(py, waiting)?.unbind()),
                 queued: Some(PyList::empty(py).unbind()),
                 prompts: Vec::new(),
@@ -148,8 +152,9 @@ impl Running {
         py: Python<'_>,
         conversation: &Object,
         waiting: Vec<Object>,
+        starter: String,
     ) -> PyResult<Py<RunningTurn>> {
-        let turn = RunningTurn::create(py, waiting)?;
+        let turn = RunningTurn::create(py, waiting, starter)?;
         self.0.bind(py).set_item(conversation.bind(py), &turn)?;
         Ok(turn)
     }

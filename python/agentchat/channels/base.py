@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Protocol, runtime_checkable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import Any, Protocol, runtime_checkable
 
 from agentchat.models import (
     Answer,
@@ -15,6 +15,10 @@ from agentchat.models import (
 )
 
 MessageReceiver = Callable[["Channel", Message], Awaitable[None]]
+AppPayload = Mapping[str, Any]
+"""A raw provider payload that AgentChat does not turn into a message."""
+AppHandler = Callable[[AppPayload], Awaitable[Mapping[str, Any] | None]]
+"""Handles an `AppPayload`; where the provider takes an answer, the result is it."""
 
 
 class Channel(Protocol):
@@ -92,6 +96,69 @@ class StreamingChannel(Protocol):
     async def append_stream(self, source: Message, stream: object, text: str) -> object: ...
 
     async def stop_stream(self, source: Message, stream: object, text: str) -> Message: ...
+
+
+@runtime_checkable
+class TaskProgressChannel(Protocol):
+    """Optional task and plan progress shown with an answer.
+
+    `update_stream_tasks` receives the unsent updates in order, each a mapping:
+    `{"type": "plan", "title": ...}` or `{"type": "task", "id": ..., "title": ...,
+    "status": "pending" | "in_progress" | "complete" | "error", "details": ...,
+    "output": ...}`. `stream` is None on the first call; afterwards it is the handle
+    the previous call returned. It returns the handle to use next and may drop
+    updates it can no longer show. On a `StreamingChannel` the handle is the
+    stream's: with `stream` None it starts the stream with the updates. Channels
+    without it ignore `AnswerStream.task` and `plan`.
+    """
+
+    async def update_stream_tasks(
+        self, source: Message, stream: object | None, updates: Sequence[Mapping[str, object]],
+    ) -> object: ...
+
+
+@runtime_checkable
+class TaskStreamingChannel(StreamingChannel, TaskProgressChannel, Protocol):
+    """Task and plan progress shown with a streamed answer; see `TaskProgressChannel`."""
+
+
+@runtime_checkable
+class HomeChannel(Protocol):
+    """Optional home screen for one person, replaced by each `publish_home`.
+
+    Slack publishes an App Home view. Other channels keep one home message in the
+    person's direct chat and edit it in place where they can.
+    """
+
+    async def publish_home(self, user_id: str, view: Any) -> object: ...
+
+
+@runtime_checkable
+class EphemeralChannel(Protocol):
+    """Optional notices in the source conversation that only one person can see.
+
+    A channel without truly private notices must not implement this; AgentChat
+    then raises `TypeError` rather than posting publicly.
+    """
+
+    async def send_ephemeral(
+        self, source: Message, user_id: str, text: str, *,
+        blocks: Sequence[Mapping[str, object]] | None = None,
+    ) -> Message: ...
+
+
+@runtime_checkable
+class DeletingChannel(Protocol):
+    """Optional deletion of a message this application sent."""
+
+    async def delete(self, message: Message) -> None: ...
+
+
+@runtime_checkable
+class EditingChannel(Protocol):
+    """Optional replacement of the text of a message this application sent."""
+
+    async def edit(self, message: Message, text: str) -> Message: ...
 
 
 @runtime_checkable

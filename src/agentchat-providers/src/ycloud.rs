@@ -359,16 +359,67 @@ pub fn destination(source: &Message, phone: &str) -> Result<Destination, &'stati
         .and_then(Value::as_str)
         .filter(|value| e164(value))
         .ok_or(invalid)?;
-    let id = source
-        .metadata
-        .get("message_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(invalid)?;
+    // A direct source (see `direct_source`) has no message to reply to.
+    let id = match source.metadata.get("message_id") {
+        None | Some(Value::Null) => "",
+        Some(id) => id.as_str().ok_or(invalid)?,
+    };
     Ok(Destination {
         recipient: recipient.into(),
         message_id: id.into(),
     })
+}
+
+/// A source for messages sent to `to` (E.164) without replying to one of theirs.
+/// WhatsApp delivers them only within 24 hours of that person's last message.
+pub fn direct_source(phone: &str, to: &str) -> Result<Message, &'static str> {
+    if !e164(to) {
+        return Err("Expected a phone number in E.164 format");
+    }
+    Ok(Message {
+        id: format!("ycloud:{phone}:direct:{to}").into(),
+        conversation_id: format!("ycloud:{phone}:{to}").into(),
+        channel: "ycloud".into(),
+        sender: Sender {
+            id: to.into(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+        metadata: [
+            ("phone_number".into(), json!(phone)),
+            ("message_id".into(), Value::Null),
+            ("from".into(), json!(to)),
+        ]
+        .into_iter()
+        .collect(),
+    })
+}
+
+/// The inbound message to reply to with an application handler's answer.
+pub fn reply_source(payload: &Value, phone: &str) -> Option<Message> {
+    let event = &payload["whatsappInboundMessage"];
+    if payload["type"] != "whatsapp.inbound_message.received" || event["to"] != phone {
+        return None;
+    }
+    let id = event["wamid"].as_str().filter(|id| !id.is_empty())?;
+    let mut source = direct_source(phone, event["from"].as_str()?).ok()?;
+    source.id = format!("ycloud:{phone}:{id}").into();
+    source.metadata.insert("message_id".into(), json!(id));
+    Some(source)
+}
+
+/// `payload` replying to message `id`, or a new message when `id` is empty.
+fn in_reply(mut payload: Value, id: &str) -> Value {
+    if id.is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("context");
+        }
+    }
+    payload
 }
 fn with_external_id(mut payload: Value, external_id: Option<&str>) -> Result<Value, &'static str> {
     if let Some(external_id) = external_id {
@@ -394,7 +445,10 @@ pub fn text_payload(
         return Err("YCloud replies must fit 4,096 characters; send separate replies");
     }
     with_external_id(
-        json!({"from":sender,"to":recipient,"type":"text","text":{"body":content,"preview_url":false},"context":{"message_id":id}}),
+        in_reply(
+            json!({"from":sender,"to":recipient,"type":"text","text":{"body":content,"preview_url":false},"context":{"message_id":id}}),
+            id,
+        ),
         external_id,
     )
 }
@@ -415,6 +469,42 @@ pub fn prompt_payload(
         "context": {"message_id": id},
     }))
 }
+/// Where a webhook event goes when the application has a handler for it: an inbound
+/// message routes like a WhatsApp message (see `whatsapp::route_message`); any other
+/// event type, such as `whatsapp.message.updated`, is an event by type.
+pub fn app_route(payload: &Value, phone: &str) -> Option<agentchat_core::Route> {
+    match payload["type"].as_str()? {
+        "whatsapp.inbound_message.received" => {
+            let event = &payload["whatsappInboundMessage"];
+            if event["to"] != phone {
+                return None;
+            }
+            crate::whatsapp::route_message(event)
+        }
+        kind => Some(agentchat_core::Route::Event {
+            event_type: kind.into(),
+        }),
+    }
+}
+
+/// An `interactive` message (buttons, list, CTA URL or Flow) replying to the source.
+pub fn interactive_payload(
+    sender: &str,
+    recipient: &str,
+    id: &str,
+    interactive: Value,
+    external_id: Option<&str>,
+) -> Result<Value, &'static str> {
+    with_external_id(
+        in_reply(
+            json!({"from": sender, "to": recipient, "type": "interactive",
+                   "interactive": interactive, "context": {"message_id": id}}),
+            id,
+        ),
+        external_id,
+    )
+}
+
 pub fn template_payload(
     sender: &str,
     recipient: &str,
@@ -906,5 +996,55 @@ mod tests {
         let (templates, more) = template_page(&page, 100).unwrap();
         assert_eq!(templates[0].body.as_deref(), Some("Hi {{1}}"));
         assert!(!more);
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+    use agentchat_core::Route;
+
+    #[test]
+    fn direct_and_reply_sources() {
+        let source = direct_source("+15550001111", "+15550000000").unwrap();
+        let route = destination(&source, "+15550001111").unwrap();
+        let payload = text_payload(
+            Some("hi"),
+            "+15550001111",
+            &route.recipient,
+            &route.message_id,
+            None,
+        )
+        .unwrap();
+        assert!(payload.get("context").is_none());
+        assert!(direct_source("+15550001111", "15550000000").is_err());
+        let event = json!({"type": "whatsapp.inbound_message.received", "whatsappInboundMessage": {
+            "wamid": "wamid.1", "from": "+15550000000", "to": "+15550001111"}});
+        let reply = reply_source(&event, "+15550001111").unwrap();
+        assert_eq!(reply.metadata["message_id"], "wamid.1");
+        assert!(reply_source(&event, "+15559999999").is_none());
+    }
+
+    #[test]
+    fn events_route_by_type_and_messages_like_whatsapp() {
+        let press = json!({"type": "whatsapp.inbound_message.received", "whatsappInboundMessage": {
+            "to": "+1555", "type": "interactive",
+            "interactive": {"type": "button_reply", "button_reply": {"id": "retry"}}}});
+        assert_eq!(
+            app_route(&press, "+1555"),
+            Some(Route::Action {
+                action_ids: vec!["retry".into()]
+            })
+        );
+        assert_eq!(app_route(&press, "+1666"), None);
+        assert_eq!(
+            app_route(&json!({"type": "whatsapp.message.updated"}), "+1555"),
+            Some(Route::Event {
+                event_type: "whatsapp.message.updated".into()
+            })
+        );
+        let payload =
+            interactive_payload("+1555", "+1777", "w1", json!({"type": "flow"}), None).unwrap();
+        assert_eq!(payload["interactive"]["type"], "flow");
     }
 }

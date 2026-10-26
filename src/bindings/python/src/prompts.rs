@@ -398,6 +398,19 @@ pub fn answer_of(message: &Bound<'_, PyAny>) -> PyResult<Option<(String, String)
     )
 }
 
+/// Whether `message` asks to stop its conversation's running turn from the
+/// provider's own stop control (`metadata["agentchat_stop"] is True`).
+pub fn stop_request(message: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let metadata = message.getattr("metadata")?;
+    Ok(metadata
+        .call_method1("get", (agentchat_core::STOP_METADATA,))
+        .ok()
+        .is_some_and(|value| {
+            value.is_exact_instance_of::<pyo3::types::PyBool>()
+                && value.is_truthy().unwrap_or(false)
+        }))
+}
+
 /// Apply a button press; a press that does not match an open prompt is ignored.
 pub async fn resolve(
     prompts: Prompts,

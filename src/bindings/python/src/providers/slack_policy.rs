@@ -132,7 +132,24 @@ fn slack_read_mirror(
         None => Ok(py.None()),
     }
 }
+/// Whether Slack accepts a response body in this payload's acknowledgement (view
+/// submissions, options requests and slash commands). A host-owned source awaits
+/// the receiver for these and returns its answer as the response.
+#[pyfunction]
+fn slack_responds(payload: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(agentchat_slack::interaction::responds(&convert::to_json(
+        payload,
+    )?))
+}
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(slack_responds, module)?)?;
+    module.add(
+        "SLACK_ACK_DEADLINE",
+        agentchat_slack::interaction::ACK_DEADLINE.as_secs_f64(),
+    )?;
+    module
+        .getattr("slack_responds")?
+        .setattr("__module__", "agentchat.channels.slack.events")?;
     module.add_function(wrap_pyfunction!(slack_attachments, module)?)?;
     module.add_function(wrap_pyfunction!(slack_filename, module)?)?;
     module.add_function(wrap_pyfunction!(slack_to_message, module)?)?;

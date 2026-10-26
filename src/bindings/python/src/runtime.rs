@@ -33,6 +33,10 @@ pub async fn call(
     })?;
     await_py(pending).await
 }
+/// What a message hidden by `delete(fallback="edit")` says instead.
+const REMOVED_TEXT: &str = "(This message was removed.)";
+/// The reply `delete(fallback="notice")` sends where nothing can hide a message.
+const NOTICE_TEXT: &str = "Please disregard my previous message.";
 fn capability(py: Python<'_>, channel: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
     channel.is_instance(&py.import("agentchat.channels.base")?.getattr(name)?)
 }
@@ -367,6 +371,179 @@ impl AgentChat {
             .await
         })
     }
+    /// Post a notice in `source`'s conversation that only `user_id` can see. It is
+    /// not added to history. Channels without private notices raise `TypeError`;
+    /// the notice is never posted publicly instead. With `fallback="dm"`, channels
+    /// that support it send a notice they cannot show privately to `user_id`'s
+    /// direct chat instead.
+    #[pyo3(signature=(channel,source,user_id,text,*,blocks=None,fallback=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn send_ephemeral(
+        &self,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        user_id: Object,
+        text: Object,
+        blocks: Option<Object>,
+        fallback: Option<Object>,
+    ) -> PyResult<Object> {
+        let blocks = blocks.unwrap_or_else(|| py.None());
+        let mut kwargs = vec![("blocks", blocks)];
+        if let Some(fallback) = fallback.filter(|f| !f.is_none(py)) {
+            kwargs.push(("fallback", fallback));
+        }
+        coroutine(py, async move {
+            Python::attach(|py| -> PyResult<()> {
+                if !capability(py, channel.bind(py), "EphemeralChannel")? {
+                    return Err(PyTypeError::new_err(
+                        "This channel does not support ephemeral messages",
+                    ));
+                }
+                if user_id.bind(py).extract::<String>()?.trim().is_empty() {
+                    return Err(PyValueError::new_err(
+                        "An ephemeral message needs a recipient",
+                    ));
+                }
+                Ok(())
+            })?;
+            call(
+                channel,
+                "send_ephemeral",
+                vec![source, user_id, text],
+                kwargs,
+            )
+            .await
+        })
+    }
+    /// Delete a message this application sent, as well as the channel allows,
+    /// and return what happened; it never raises for a message that cannot be
+    /// deleted. History keeps the message. Returns `"deleted"`, or `"failed"`
+    /// (logged) when the channel cannot or will not delete it. `fallback` hides
+    /// such a message instead: `"edit"` replaces its text with `text` on channels
+    /// that can edit (`"edited"`), and `"notice"` also replies to it with `text` on
+    /// channels that can neither delete nor edit (`"noticed"`). A notice is never
+    /// sent after a failed delete or edit, whose outcome may be uncertain.
+    #[pyo3(signature=(channel,message,*,fallback=None,text=None))]
+    fn delete(
+        &self,
+        py: Python<'_>,
+        channel: Object,
+        message: Object,
+        fallback: Option<String>,
+        text: Option<String>,
+    ) -> PyResult<Object> {
+        let fallback = match fallback.as_deref() {
+            None => None,
+            Some(mode @ ("edit" | "notice")) => Some(mode.to_owned()),
+            Some(_) => {
+                return Err(PyValueError::new_err(
+                    "fallback must be None, \"edit\" or \"notice\"",
+                ))
+            }
+        };
+        let (deleting, editing) = (
+            capability(py, channel.bind(py), "DeletingChannel")?,
+            capability(py, channel.bind(py), "EditingChannel")?,
+        );
+        coroutine(py, async move {
+            let replacement = |default: &str| {
+                Python::attach(|py| {
+                    text.as_deref()
+                        .unwrap_or(default)
+                        .into_pyobject(py)
+                        .map(|t| t.into_any().unbind())
+                })
+            };
+            let attempt = async {
+                if deleting {
+                    let deleted =
+                        call(copy(&channel), "delete", vec![copy(&message)], vec![]).await;
+                    return match deleted {
+                        Ok(_) => Ok("deleted"),
+                        // Editing a message that was deleted after all only fails.
+                        Err(error) if fallback.is_some() && editing => {
+                            let text = replacement(REMOVED_TEXT)?;
+                            match call(copy(&channel), "edit", vec![copy(&message), text], vec![])
+                                .await
+                            {
+                                Ok(_) => Ok("edited"),
+                                Err(_) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                }
+                match fallback.as_deref() {
+                    Some(_) if editing => {
+                        let text = replacement(REMOVED_TEXT)?;
+                        call(copy(&channel), "edit", vec![copy(&message), text], vec![]).await?;
+                        Ok("edited")
+                    }
+                    Some("notice") => {
+                        let text = replacement(NOTICE_TEXT)?;
+                        call(copy(&channel), "reply", vec![copy(&message), text], vec![]).await?;
+                        Ok("noticed")
+                    }
+                    _ => Err(PyTypeError::new_err(
+                        "This channel does not support deleting messages",
+                    )),
+                }
+            };
+            let outcome = match attempt.await {
+                Ok(outcome) => outcome,
+                Err(error) => Python::attach(|py| {
+                    // Cancellation and other non-errors still propagate.
+                    if !error.is_instance_of::<pyo3::exceptions::PyException>(py) {
+                        return Err(error);
+                    }
+                    py.import("logging")?
+                        .call_method1("getLogger", ("agentchat",))?
+                        .call_method1("warning", ("Message not deleted (%s)", error.to_string()))?;
+                    Ok("failed")
+                })?,
+            };
+            Python::attach(|py| Ok(outcome.into_pyobject(py)?.into_any().unbind()))
+        })
+    }
+    /// Replace the text of a message this application sent; returns the edited
+    /// message. History keeps the original. Channels that cannot edit raise
+    /// `TypeError`.
+    fn edit(
+        &self,
+        py: Python<'_>,
+        channel: Object,
+        message: Object,
+        text: Object,
+    ) -> PyResult<Object> {
+        if !capability(py, channel.bind(py), "EditingChannel")? {
+            return Err(PyTypeError::new_err(
+                "This channel does not support editing messages",
+            ));
+        }
+        coroutine(py, async move {
+            call(channel, "edit", vec![message, text], vec![]).await
+        })
+    }
+    /// Ask `form` of `source`'s sender in its conversation, one field at a time,
+    /// on any channel: buttons for choices where the channel has them, numbered
+    /// options otherwise. Their next messages answer it. The values reach the
+    /// channel's `on_view(form["callback_id"])` handler, as `{"type":
+    /// "form_submission", "values": ...}`, or `{"type": "form_closed", "reason":
+    /// "cancelled" | "timeout"}`. A form already open for that person is replaced.
+    fn open_form(
+        slf: Py<Self>,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        form: Object,
+    ) -> PyResult<Object> {
+        let app = slf.into_any();
+        coroutine(py, async move {
+            crate::forms::open(app, channel, source, form).await?;
+            Ok(none())
+        })
+    }
     #[pyo3(signature=(channel,source,message,*,origin="web"))]
     fn mirror(
         slf: Py<Self>,
@@ -513,10 +690,15 @@ enum Arrival {
     Asking(Py<RunningTurn>),
 }
 async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Object> {
-    let (state, handler, id, conversation, press) = Python::attach(|py| -> PyResult<_> {
+    let (state, handler, id, conversation, press, stop) = Python::attach(|py| -> PyResult<_> {
         let press = prompts::answer_of(message.bind(py))?;
+        let stop = prompts::stop_request(message.bind(py))?;
         let handler = app.bind(py).getattr("_handler")?;
-        if handler.is_none() && press.is_none() {
+        if handler.is_none()
+            && press.is_none()
+            && !stop
+            && !crate::forms::is_open(app.bind(py), message.bind(py))?
+        {
             return Err(PyRuntimeError::new_err(
                 "Register a message handler with @app.on_message",
             ));
@@ -527,6 +709,7 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
             message.bind(py).getattr("id")?.unbind(),
             message.bind(py).getattr("conversation_id")?.unbind(),
             press,
+            stop,
         ))
     })?;
     let (busy, running, registry) = native_app(&app)?;
@@ -534,9 +717,31 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
     if !Python::attach(|py| claimed.bind(py).is_truthy())? {
         return Ok(none());
     }
+    // A form waiting for this person takes their messages and its buttons.
+    if crate::forms::intercept(&app, &channel, &message, press.as_ref(), stop).await? {
+        return Ok(none());
+    }
     // A button press answers a prompt; it never starts or joins a turn.
     if let Some((prompt, choice)) = press {
         prompts::resolve(registry, copy(&state), message, prompt, choice).await?;
+        return Ok(none());
+    }
+    // So does a provider's own stop control, which stops only its starter's turn.
+    if stop {
+        Python::attach(|py| -> PyResult<()> {
+            let sender = message
+                .bind(py)
+                .getattr("sender")?
+                .getattr("id")?
+                .extract::<String>()?;
+            if let Some(turn) = running.get(py, &conversation)? {
+                let turn = turn.borrow(py);
+                if turn.starter == sender {
+                    turn.request_stop(py)?;
+                }
+            }
+            Ok(())
+        })?;
         return Ok(none());
     }
     // Decide before awaiting anything, so the running turn cannot finish in between.
@@ -611,8 +816,14 @@ async fn run_turns(
     let mut appended = false;
     let mut first_error = None;
     loop {
-        let turn =
-            Python::attach(|py| running.start(py, conversation, std::mem::take(&mut waiting)))?;
+        let turn = Python::attach(|py| -> PyResult<_> {
+            let starter = current
+                .bind(py)
+                .getattr("sender")?
+                .getattr("id")?
+                .extract::<String>()?;
+            running.start(py, conversation, std::mem::take(&mut waiting), starter)
+        })?;
         let result = run_turn(app, channel, &current, state, handler, &turn, appended).await;
         let (mut unread, owned) = Python::attach(|py| -> PyResult<_> {
             let unread = running.finish(py, conversation, &turn)?;
@@ -921,6 +1132,35 @@ impl MessageContext {
     }
     fn set_status(&self, py: Python<'_>, status: Object) -> PyResult<Object> {
         self.forward(py, "set_status", vec![status], vec![])
+    }
+    /// Post a notice in this conversation that only the sender (or `user_id`) can
+    /// see; see `AgentChat.send_ephemeral`.
+    #[pyo3(signature=(text,*,blocks=None,user_id=None,fallback=None))]
+    fn reply_ephemeral(
+        &self,
+        py: Python<'_>,
+        text: Object,
+        blocks: Option<Object>,
+        user_id: Option<Object>,
+        fallback: Option<Object>,
+    ) -> PyResult<Object> {
+        let user_id = match user_id {
+            Some(user_id) => user_id,
+            None => self.sender.bind(py).getattr("id")?.unbind(),
+        };
+        self.forward(
+            py,
+            "send_ephemeral",
+            vec![user_id, text],
+            vec![
+                ("blocks", blocks.unwrap_or_else(|| py.None())),
+                ("fallback", fallback.unwrap_or_else(|| py.None())),
+            ],
+        )
+    }
+    /// Ask a form of this message's sender; see `AgentChat.open_form`.
+    fn open_form(&self, py: Python<'_>, form: Object) -> PyResult<Object> {
+        self.forward(py, "open_form", vec![form], vec![])
     }
     #[pyo3(signature=(attachment,*,max_bytes=10*1024*1024))]
     fn download_attachment(

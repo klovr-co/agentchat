@@ -3,7 +3,8 @@
 mod transport;
 use super::transport::*;
 use crate::prompts::PromptFields;
-use crate::{convert, host};
+use crate::{apps, convert, host};
+use agentchat_core::{Route, TaskBoard};
 use agentchat_providers::telegram as policy;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -144,7 +145,7 @@ impl Telegram {
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self { payload: None }
     }
-    #[pyo3(signature=(*,bot_token,webhook_url=None,webhook_secret=None,host="127.0.0.1",port=3980,client=None,max_pending_events=64,shutdown_timeout=20.0))]
+    #[pyo3(signature=(*,bot_token,webhook_url=None,webhook_secret=None,host="127.0.0.1",port=3980,client=None,max_pending_events=64,shutdown_timeout=20.0,stream_drafts=false))]
     #[allow(clippy::too_many_arguments)]
     fn initialize(
         slf: Py<Self>,
@@ -157,6 +158,7 @@ impl Telegram {
         client: Option<Py<PyAny>>,
         max_pending_events: i64,
         shutdown_timeout: f64,
+        stream_drafts: bool,
     ) -> PyResult<()> {
         let bot = policy::validate_config(bot_token, webhook_url, webhook_secret)
             .map_err(PyValueError::new_err)?;
@@ -193,6 +195,7 @@ impl Telegram {
             py.import("asyncio")?.getattr("Lock")?.call0()?,
         )?;
         state.set_item("_closed", false)?;
+        state.set_item("_stream_drafts", stream_drafts)?;
         slf.borrow_mut(py).payload = Some(Box::new(TelegramState {
             state: state.unbind(),
         }));
@@ -201,6 +204,30 @@ impl Telegram {
     #[classattr]
     fn name() -> &'static str {
         "telegram"
+    }
+    /// Handle updates AgentChat does not turn into messages, by kind, such as
+    /// "my_chat_member" or "edited_message". Telegram sends those kinds only once a
+    /// handler for them is registered before `run()`.
+    fn on_event(slf: &Bound<'_, Self>, event_type: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "event", event_type)
+    }
+    /// Handle presses on inline buttons whose `callback_data` matches. The returned
+    /// mapping answers the press: `text`, `show_alert`, `url`, `cache_time`.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "action", action_id)
+    }
+    /// Telegram has no forms; registered view handlers never run.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "view", callback_id)
+    }
+    /// Handle messages that start with this command, such as "/start", instead
+    /// of passing them to the message handler.
+    fn on_command(slf: &Bound<'_, Self>, command: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "command", command)
+    }
+    /// Handle every routed update no other handler matched.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::raw(slf.as_any(), handler)
     }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(payload) = self.payload.as_deref() {
@@ -325,8 +352,7 @@ impl Telegram {
             let mut attempt = 0;
             loop {
                 let offset = extract::<Option<i64>>(&get(&this, "_offset")?)?;
-                let mut payload =
-                    json!({"timeout":30,"allowed_updates":["message","callback_query"]});
+                let mut payload = json!({"timeout":30,"allowed_updates":allowed_updates(&this)?});
                 if let Some(offset) = offset {
                     payload["offset"] = json!(offset);
                 }
@@ -420,7 +446,7 @@ impl Telegram {
                 None,
             )?;
             acall(&site, "start", vec![], None).await?;
-            client_call(&this,"setWebhook",Some(json!({"url":value(&get(&this,"_webhook_url")?)?,"secret_token":value(&get(&this,"_webhook_secret")?)?,"allowed_updates":["message","callback_query"]})),None).await?;
+            client_call(&this,"setWebhook",Some(json!({"url":value(&get(&this,"_webhook_url")?)?,"secret_token":value(&get(&this,"_webhook_secret")?)?,"allowed_updates":allowed_updates(&this)?})),None).await?;
             let event = call(&module("asyncio")?, "Event", vec![], None)?;
             acall(&event, "wait", vec![], None).await
         })
@@ -470,14 +496,11 @@ impl Telegram {
                     ));
                 }
             }
-            if let Some(message) = normalized(&this, &update)? {
-                let message = Python::attach(|py| convert::to_message(py, &message))?;
-                if !submit(&this, message)? {
-                    return Err(fail_response(
-                        "HTTPServiceUnavailable",
-                        "Telegram receiver is busy",
-                    ));
-                }
+            if !admit(&this, &update)? {
+                return Err(fail_response(
+                    "HTTPServiceUnavailable",
+                    "Telegram receiver is busy",
+                ));
             }
             error_response("Response", "OK")
         })
@@ -513,7 +536,8 @@ impl Telegram {
     fn stream_limit() -> usize {
         4096
     }
-    /// Send the first part of a streamed answer; later parts edit it in place.
+    /// Send the first part of a streamed answer; later parts edit it in place. With
+    /// `stream_drafts=True`, private chats show a draft with a stop button instead.
     fn start_stream(
         slf: Py<Self>,
         py: Python<'_>,
@@ -521,20 +545,8 @@ impl Telegram {
         text: String,
     ) -> PyResult<Py<PyAny>> {
         host::coroutine(py, async move {
-            let this = slf.into_any();
-            let source = Python::attach(|py| convert::from_message(source.bind(py)))?;
-            let dest = destination(&this, &source)?;
-            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
-            let payload = stream_payload(&text)?;
-            let result =
-                client_call(&this, "sendMessage", Some(dest.route(payload, true)), None).await?;
-            let id = value(&result)?["message_id"]
-                .as_i64()
-                .filter(|id| *id > 0)
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err("Telegram did not return a message receipt")
-                })?;
-            j(json!({"message_id": id, "shown": text}))
+            let handle = start_main(&slf.into_any(), &source, &text).await?;
+            j(handle)
         })
     }
     fn append_stream(
@@ -545,7 +557,21 @@ impl Telegram {
         text: String,
     ) -> PyResult<Py<PyAny>> {
         host::coroutine(py, async move {
-            let (_, stream) = edit_streamed(&slf.into_any(), &source, &stream, &text).await?;
+            let this = slf.into_any();
+            let mut handle = value(&stream)?;
+            if handle.get("draft_id").is_some() {
+                return j(show_draft(&this, &source, handle, &text).await?);
+            }
+            if handle.get("message_id").is_none() {
+                // Only task progress has been shown so far; the answer starts now.
+                if text.is_empty() {
+                    return Ok(stream);
+                }
+                let mut started = start_main(&this, &source, &text).await?;
+                started["progress"] = handle["progress"].take();
+                return j(started);
+            }
+            let (_, stream) = edit_streamed(&this, &source, &stream, &text).await?;
             Ok(stream)
         })
     }
@@ -558,18 +584,49 @@ impl Telegram {
     ) -> PyResult<Py<PyAny>> {
         host::coroutine(py, async move {
             let this = slf.into_any();
-            policy::text_payload(Some(&text)).map_err(PyValueError::new_err)?;
-            let (id, _) = edit_streamed(&this, &source, &stream, &text).await?;
+            let handle = value(&stream)?;
             let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
-            let sent = policy::receipt(
-                &message,
-                extract(&get(&this, "_bot_id")?)?,
-                extract(&get(&this, "_first_name")?)?,
-                &text,
-                &json!({"message_id": id}),
-            )
-            .map_err(PyRuntimeError::new_err)?;
-            receipt_with_metadata(&source, &sent)
+            let sent = if handle.get("draft_id").is_some()
+                || (handle.get("message_id").is_none() && !text.trim().is_empty())
+            {
+                // A draft is only a preview; the finished answer is sent as a message.
+                send(
+                    &this,
+                    &source,
+                    &message,
+                    policy::text_payload(Some(&text)).map_err(PyValueError::new_err)?,
+                    &text,
+                )
+                .await?
+            } else if let Some(progress) = handle["progress"]["message_id"]
+                .as_i64()
+                .filter(|_| handle.get("message_id").is_none())
+            {
+                // Only task progress was shown: confirm it without text.
+                let sent = policy::receipt(
+                    &message,
+                    extract(&get(&this, "_bot_id")?)?,
+                    extract(&get(&this, "_first_name")?)?,
+                    "",
+                    &json!({"message_id": progress}),
+                )
+                .map_err(PyRuntimeError::new_err)?;
+                receipt_with_metadata(&source, &sent)?
+            } else {
+                policy::text_payload(Some(&text)).map_err(PyValueError::new_err)?;
+                let (id, _) = edit_streamed(&this, &source, &stream, &text).await?;
+                let sent = policy::receipt(
+                    &message,
+                    extract(&get(&this, "_bot_id")?)?,
+                    extract(&get(&this, "_first_name")?)?,
+                    &text,
+                    &json!({"message_id": id}),
+                )
+                .map_err(PyRuntimeError::new_err)?;
+                receipt_with_metadata(&source, &sent)?
+            };
+            remove_progress(&this, &message, &handle).await;
+            Ok(sent)
         })
     }
     /// Show a prompt with one inline button per choice, quoting the source.
@@ -716,6 +773,300 @@ impl Telegram {
             result
         })
     }
+    /// Run an action handler, then answer the press with its result.
+    fn _answer_action(
+        slf: Py<Self>,
+        py: Python<'_>,
+        handler: Py<PyAny>,
+        payload: Py<PyAny>,
+        callback_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let answer = apps::answer(get(&this, "_delivery")?, handler, payload).await;
+            let body = match &answer {
+                Ok(body) => value(body).unwrap_or(Value::Null),
+                Err(_) => Value::Null,
+            };
+            if let Err(error) = client_call(
+                &this,
+                "answerCallbackQuery",
+                Some(policy::callback_answer(&callback_id, &body)),
+                Some(5.),
+            )
+            .await
+            {
+                log_warning(
+                    "agentchat.channels.telegram.adapter",
+                    &format!("Telegram callback answer failed ({error})"),
+                )?;
+            }
+            answer.map(|_| none())
+        })
+    }
+    /// Show a notice only `user_id` can see: an ephemeral message in a group, an
+    /// ordinary reply in that user's private chat. `blocks` may hold one
+    /// `reply_markup` mapping. With `fallback="dm"`, a notice Telegram refuses, or
+    /// one for someone else's private chat, goes to `user_id`'s private chat.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None,fallback=None))]
+    fn send_ephemeral(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        user_id: String,
+        text: String,
+        blocks: Option<Py<PyAny>>,
+        fallback: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let markup = blocks
+            .map(|blocks| convert::to_json(blocks.bind(py)))
+            .transpose()?
+            .and_then(|blocks| blocks.as_array().and_then(|b| b.first().cloned()));
+        let dm = apps::dm_fallback(fallback.as_deref())?;
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let bot = extract(&get(&this, "_bot_id")?)?;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            if dm && policy::private_chat_of_other(&message, &user_id) {
+                return send_direct(&this, &user_id, &text, markup.as_ref()).await;
+            }
+            match policy::ephemeral_request(&message, bot, &user_id, &text, markup.as_ref())
+                .map_err(PyValueError::new_err)?
+            {
+                policy::Ephemeral::Reply(payload) => {
+                    let result = client_call(&this, "sendMessage", Some(payload), None).await?;
+                    let sent = policy::receipt(
+                        &message,
+                        bot,
+                        extract(&get(&this, "_first_name")?)?,
+                        &text,
+                        &value(&result)?,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    receipt_with_metadata(&source, &sent)
+                }
+                policy::Ephemeral::Ephemeral(payload) => {
+                    let result = match client_call(&this, "sendMessage", Some(payload), None).await
+                    {
+                        // Refused, so certainly not shown: the private chat is safe.
+                        Err(error) if dm && telegram_error(&error) && !transient(&error) => {
+                            return send_direct(&this, &user_id, &text, markup.as_ref()).await
+                        }
+                        result => result?,
+                    };
+                    let sent = policy::ephemeral_receipt(
+                        &message,
+                        bot,
+                        extract(&get(&this, "_first_name")?)?,
+                        &user_id,
+                        &text,
+                        &value(&result)?,
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    receipt_with_metadata(&source, &sent)
+                }
+            }
+        })
+    }
+    /// Keep one home message in `user_id`'s private chat with the bot: pinned, and
+    /// edited in place by later calls. After a restart the bot's pinned message is
+    /// reused. Telegram delivers it only to people who have started the bot.
+    fn publish_home(
+        slf: Py<Self>,
+        py: Python<'_>,
+        user_id: String,
+        view: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let text = view.bind(py).extract::<String>().ok();
+        let payload = policy::text_payload(text.as_deref()).map_err(PyValueError::new_err)?;
+        let text = text.unwrap_or_default();
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let bot: i64 = extract(&get(&this, "_bot_id")?)?;
+            let source = policy::private_source(bot, &user_id).map_err(PyValueError::new_err)?;
+            let source_host = Python::attach(|py| convert::to_message(py, &source))?;
+            let chat = destination(&this, &source)?.chat_id;
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let known = Python::attach(|py| -> PyResult<Option<i64>> {
+                apps::memory(this.bind(py), "_homes")?
+                    .get_item(&user_id)?
+                    .map(|id| id.extract())
+                    .transpose()
+            })?;
+            let previous = match known {
+                Some(id) => Some(id),
+                None => {
+                    let found =
+                        client_call(&this, "getChat", Some(json!({"chat_id": chat})), None).await?;
+                    policy::pinned_home(&value(&found)?, bot)
+                }
+            };
+            let remember = |id: i64| {
+                Python::attach(|py| apps::memory(this.bind(py), "_homes")?.set_item(&user_id, id))
+            };
+            if let Some(id) = previous {
+                let mut edit = payload.clone();
+                edit["chat_id"] = json!(chat);
+                edit["message_id"] = json!(id);
+                let edited = match client_call(&this, "editMessageText", Some(edit), None).await {
+                    Ok(_) => true,
+                    Err(error) if error.to_string().contains("message is not modified") => true,
+                    // Deleted or no longer editable: publish a new one.
+                    Err(error) if telegram_error(&error) && !transient(&error) => false,
+                    Err(error) => return Err(error),
+                };
+                if edited {
+                    remember(id)?;
+                    let sent = policy::receipt(
+                        &source,
+                        bot,
+                        extract(&get(&this, "_first_name")?)?,
+                        &text,
+                        &json!({"message_id": id}),
+                    )
+                    .map_err(PyRuntimeError::new_err)?;
+                    return receipt_with_metadata(&source_host, &sent);
+                }
+            }
+            let sent = send(&this, &source_host, &source, payload, &text).await?;
+            let id = Python::attach(|py| -> PyResult<i64> {
+                convert::from_message(sent.bind(py))?.metadata["message_id"]
+                    .as_i64()
+                    .ok_or_else(|| PyRuntimeError::new_err("No message receipt"))
+            })?;
+            remember(id)?;
+            if let Err(error) = client_call(
+                &this,
+                "pinChatMessage",
+                Some(policy::pin_request(chat, id)),
+                None,
+            )
+            .await
+            {
+                log_warning(
+                    "agentchat.channels.telegram.adapter",
+                    &format!("Telegram could not pin the home message ({error})"),
+                )?;
+            }
+            Ok(sent)
+        })
+    }
+    /// Delete a message this bot sent (`deleteMessage`, up to 48 hours old) or a
+    /// notice (`deleteEphemeralMessage`).
+    fn delete(slf: Py<Self>, py: Python<'_>, message: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let message = Python::attach(|py| convert::from_message(message.bind(py)))?;
+            let (method, payload) =
+                policy::delete_request(&message, extract(&get(&this, "_bot_id")?)?)
+                    .map_err(PyValueError::new_err)?;
+            client_call(&this, method, Some(payload), None).await?;
+            Ok(none())
+        })
+    }
+    /// Replace the text of a message this bot sent (`editMessageText`). Notices
+    /// cannot be edited.
+    fn edit(
+        slf: Py<Self>,
+        py: Python<'_>,
+        message: Py<PyAny>,
+        text: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let sent = Python::attach(|py| convert::from_message(message.bind(py)))?;
+            let bot = extract(&get(&this, "_bot_id")?)?;
+            let payload = policy::edit_request(&sent, bot, &text).map_err(PyValueError::new_err)?;
+            let id = payload["message_id"].clone();
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            match client_call(&this, "editMessageText", Some(payload), None).await {
+                Err(error) if !error.to_string().contains("message is not modified") => {
+                    return Err(error)
+                }
+                _ => {}
+            }
+            let edited = policy::receipt(
+                &sent,
+                bot,
+                extract(&get(&this, "_first_name")?)?,
+                &text,
+                &json!({"message_id": id}),
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            receipt_with_metadata(&message, &edited)
+        })
+    }
+    /// Show task progress as a separate message above the answer, edited in place
+    /// and deleted when the answer is finished. A failed update never fails the answer.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        updates: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let updates: Vec<agentchat_core::StreamUpdate> =
+                serde_json::from_value(value(&updates)?)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let mut handle = if is_none(&stream) {
+                json!({})
+            } else {
+                value(&stream)?
+            };
+            let mut board: TaskBoard =
+                serde_json::from_value(handle["progress"]["board"].clone()).unwrap_or_default();
+            board.apply(&updates);
+            let text = board.render(3500);
+            if text.is_empty() {
+                return j(handle);
+            }
+            let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+            let dest = destination(&this, &message)?;
+            let progress = &handle["progress"];
+            let shown = match progress["message_id"].as_i64() {
+                Some(id) if progress["shown"] == text.as_str() => Ok(id),
+                Some(id) => {
+                    let mut payload = stream_payload(&text)?;
+                    payload["chat_id"] = json!(dest.chat_id);
+                    payload["message_id"] = json!(id);
+                    match client_call(&this, "editMessageText", Some(payload), None).await {
+                        Err(error) if !error.to_string().contains("message is not modified") => {
+                            Err(error)
+                        }
+                        _ => Ok(id),
+                    }
+                }
+                None => {
+                    match client_call(
+                        &this,
+                        "sendMessage",
+                        Some(dest.route(stream_payload(&text)?, true)),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(result) => value(&result)?["message_id"]
+                            .as_i64()
+                            .ok_or_else(|| PyRuntimeError::new_err("No message receipt")),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            match shown {
+                Ok(id) => {
+                    handle["progress"] = json!({"message_id": id, "board": board, "shown": text});
+                }
+                Err(error) => log_warning(
+                    "agentchat.channels.telegram.adapter",
+                    &format!("Telegram task progress update failed ({error})"),
+                )?,
+            }
+            j(handle)
+        })
+    }
     fn upload_files(
         slf: Py<Self>,
         py: Python<'_>,
@@ -739,6 +1090,22 @@ impl Telegram {
             download(&slf.into_any(), source, attachment, max_bytes).await
         })
     }
+}
+/// Send a notice to `user_id`'s private chat with the bot.
+async fn send_direct(
+    this: &Py<PyAny>,
+    user_id: &str,
+    text: &str,
+    markup: Option<&Value>,
+) -> PyResult<Py<PyAny>> {
+    let source = policy::private_source(extract(&get(this, "_bot_id")?)?, user_id)
+        .map_err(PyValueError::new_err)?;
+    let source_host = Python::attach(|py| convert::to_message(py, &source))?;
+    let mut payload = policy::text_payload(Some(text)).map_err(PyValueError::new_err)?;
+    if let Some(markup) = markup {
+        payload["reply_markup"] = markup.clone();
+    }
+    send(this, &source_host, &source, payload, text).await
 }
 async fn client_call(
     this: &Py<PyAny>,
@@ -819,17 +1186,67 @@ fn admit_all(this: &Py<PyAny>, updates: &Value) -> PyResult<bool> {
         let Some(id) = update["update_id"].as_i64() else {
             continue;
         };
-        if let Some(message) = normalized(this, update)? {
-            if !submit(
-                this,
-                Python::attach(|py| convert::to_message(py, &message))?,
-            )? {
-                return Ok(false);
-            }
+        if !admit(this, update)? {
+            return Ok(false);
         }
         set(this, "_offset", j(json!(id + 1))?)?;
     }
     Ok(true)
+}
+fn allowed_updates(this: &Py<PyAny>) -> PyResult<Vec<String>> {
+    let events = Python::attach(|py| apps::event_types(this.bind(py)))?;
+    Ok(policy::allowed_updates(
+        &events,
+        extract::<bool>(&get(this, "_stream_drafts")?)?,
+    ))
+}
+/// Hand one update to the application's handler or to AgentChat. A press or
+/// command the application handles never becomes a message. False when busy.
+fn admit(this: &Py<PyAny>, update: &Value) -> PyResult<bool> {
+    if let Some(route) = policy::route(update) {
+        if let Some(handler) = Python::attach(|py| apps::find(this.bind(py), &route))? {
+            let payload = j(update.clone())?;
+            let delivery = get(this, "_delivery")?;
+            let callback = update["callback_query"]["id"]
+                .as_str()
+                .filter(|_| matches!(route, Route::Action { .. }));
+            let spawned = match callback {
+                Some(id) => {
+                    let pending = call(
+                        this,
+                        "_answer_action",
+                        vec![handler, payload, j(json!(id))?],
+                        None,
+                    )?;
+                    extract::<bool>(&call(
+                        &delivery,
+                        "spawn",
+                        vec![clone_obj(this), pending],
+                        None,
+                    )?)?
+                }
+                None => Python::attach(|py| {
+                    apps::spawn(this.bind(py), delivery.bind(py), &handler, &payload)
+                })?,
+            };
+            if !spawned {
+                return Ok(false);
+            }
+            if !matches!(route, Route::Event { .. }) {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(stop) = policy::normalize_stop(update, extract(&get(this, "_bot_id")?)?) {
+        return submit(this, Python::attach(|py| convert::to_message(py, &stop))?);
+    }
+    match normalized(this, update)? {
+        Some(message) => submit(
+            this,
+            Python::attach(|py| convert::to_message(py, &message))?,
+        ),
+        None => Ok(true),
+    }
 }
 async fn confirm_offset(this: &Py<PyAny>) -> PyResult<()> {
     let offset = extract::<Option<i64>>(&get(this, "_offset")?)?;
@@ -919,6 +1336,74 @@ async fn send(
     )
     .map_err(PyRuntimeError::new_err)?;
     receipt_with_metadata(source_host, &message)
+}
+/// Start the visible answer: a draft in a private chat when drafts are on,
+/// otherwise a message later parts edit. Returns the stream handle.
+async fn start_main(this: &Py<PyAny>, source: &Py<PyAny>, text: &str) -> PyResult<Value> {
+    let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+    let dest = destination(this, &message)?;
+    call(&get(this, "_delivery")?, "check_reply", vec![], None)?;
+    if extract::<bool>(&get(this, "_stream_drafts")?)? && policy::drafts_allowed(&message) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |elapsed| elapsed.subsec_nanos() as i64);
+        let draft = ((nanos ^ dest.message_id) & 0x7fff_ffff) | 1;
+        return show_draft(this, source, json!({"draft_id": draft}), text).await;
+    }
+    let payload = stream_payload(text)?;
+    let result = client_call(this, "sendMessage", Some(dest.route(payload, true)), None).await?;
+    let id = value(&result)?["message_id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| PyRuntimeError::new_err("Telegram did not return a message receipt"))?;
+    Ok(json!({"message_id": id, "shown": text}))
+}
+/// Show `text` in the stream's draft; Telegram keeps a draft about 30 seconds.
+async fn show_draft(
+    this: &Py<PyAny>,
+    source: &Py<PyAny>,
+    mut handle: Value,
+    text: &str,
+) -> PyResult<Value> {
+    if handle["shown"] == text {
+        return Ok(handle);
+    }
+    let message = Python::attach(|py| convert::from_message(source.bind(py)))?;
+    let dest = destination(this, &message)?;
+    let draft = handle["draft_id"]
+        .as_i64()
+        .ok_or_else(|| PyValueError::new_err("Expected a Telegram draft handle"))?;
+    client_call(
+        this,
+        "sendMessageDraft",
+        Some(policy::draft_request(&dest, draft, text)),
+        None,
+    )
+    .await?;
+    handle["shown"] = json!(text);
+    Ok(handle)
+}
+/// Delete the task progress message once the answer is finished; best effort.
+async fn remove_progress(this: &Py<PyAny>, message: &agentchat_core::Message, handle: &Value) {
+    let Some(id) = handle["progress"]["message_id"].as_i64() else {
+        return;
+    };
+    let Ok(dest) = destination(this, message) else {
+        return;
+    };
+    if let Err(error) = client_call(
+        this,
+        "deleteMessage",
+        Some(json!({"chat_id": dest.chat_id, "message_id": id})),
+        None,
+    )
+    .await
+    {
+        let _ = log_warning(
+            "agentchat.channels.telegram.adapter",
+            &format!("Telegram task progress cleanup failed ({error})"),
+        );
+    }
 }
 /// A streamed part as a message payload; a part with no visible text shows "…".
 fn stream_payload(text: &str) -> PyResult<Value> {

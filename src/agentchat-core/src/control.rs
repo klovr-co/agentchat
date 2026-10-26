@@ -58,6 +58,16 @@ impl std::str::FromStr for Busy {
     }
 }
 
+/// Message metadata a channel sets when the person who started a turn asks to
+/// stop it with the provider's own control, such as Slack's native stop button.
+/// Such a message never starts a turn or enters history.
+pub const STOP_METADATA: &str = "agentchat_stop";
+
+/// Whether `message` asks to stop its conversation's running turn.
+pub fn is_stop_request(message: &Message) -> bool {
+    message.metadata.get(STOP_METADATA) == Some(&serde_json::Value::Bool(true))
+}
+
 /// Who may answer a prompt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Allowed {
@@ -91,6 +101,9 @@ pub struct TurnControl {
 
 struct TurnInner {
     stop: watch::Sender<bool>,
+    /// Who sent the message this turn answers; only they may stop it from the
+    /// provider's own stop control.
+    starter: String,
     steered: Mutex<Vec<Message>>,
     /// Messages to run after this turn without showing them to its handler.
     queued: Mutex<Vec<Message>>,
@@ -103,10 +116,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl TurnControl {
-    pub(crate) fn new(waiting: Vec<Message>) -> Self {
+    pub(crate) fn new(waiting: Vec<Message>, starter: String) -> Self {
         Self {
             inner: Arc::new(TurnInner {
                 stop: watch::Sender::new(false),
+                starter,
                 steered: Mutex::new(waiting),
                 queued: Mutex::new(Vec::new()),
                 prompts: Mutex::new(Vec::new()),
@@ -123,6 +137,11 @@ impl TurnControl {
     /// True once someone asked this turn to stop.
     pub fn stopped(&self) -> bool {
         *self.inner.stop.borrow()
+    }
+
+    /// The sender ID of the message this turn answers.
+    pub fn starter(&self) -> &str {
+        &self.inner.starter
     }
 
     /// Ask this turn to stop. Stopping is cooperative: the handler decides how.
@@ -247,8 +266,9 @@ impl Control {
         &mut self,
         conversation: &ConversationId,
         waiting: Vec<Message>,
+        starter: &str,
     ) -> TurnControl {
-        let turn = TurnControl::new(waiting);
+        let turn = TurnControl::new(waiting, starter.to_owned());
         self.running.insert(conversation.clone(), turn.clone());
         turn
     }

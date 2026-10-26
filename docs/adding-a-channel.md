@@ -65,9 +65,20 @@ structurally; no capability registry is needed.
 | `MirroringChannel` | `mirror()` | Raises `TypeError` |
 | `StreamingChannel` | `start_stream()`, `append_stream()`, `stop_stream()` | One reply when the stream finishes |
 | `InteractiveChannel` | `send_prompt()`, `close_prompt()` | `ask()` raises `TypeError`; `busy="ask"` steers |
+| `TaskProgressChannel` | `update_stream_tasks()` | `AnswerStream.task()` and `plan()` are ignored |
+| `TaskStreamingChannel` | `StreamingChannel` and `TaskProgressChannel` | Task updates start or join the stream |
+| `HomeChannel` | `publish_home()` | No home screen |
+| `EphemeralChannel` | `send_ephemeral()` | Raises `TypeError`; never posted publicly instead |
+| `DeletingChannel` | `delete()` | `app.delete()` returns `"failed"`, or uses `fallback` |
+| `EditingChannel` | `edit()` | `app.edit()` raises `TypeError`; `delete(fallback="edit")` cannot edit |
 
 Read exact signatures in [`channels/base.py`](../python/agentchat/channels/base.py).
 Streaming and prompt buttons are described in [Live controls](live-controls.md).
+Implement `EphemeralChannel` only when the provider has truly private notices.
+A provider stop control (such as Slack's native stop button) arrives as a
+`Message` in the conversation with `metadata["agentchat_stop"] = True`, sent by
+the person who pressed it; it stops the running turn only when that person sent
+the message the turn answers, and it never starts a turn or enters history.
 Native history returns messages before the current turn; the context appends the
 current message and bounds the result. History errors propagate. Rich content can
 remain provider-specific. Normalize attachment references without downloading

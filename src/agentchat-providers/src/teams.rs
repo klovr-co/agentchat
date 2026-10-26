@@ -409,8 +409,226 @@ pub fn stream_final_activity(handle: &Value, text: &str) -> (Value, bool) {
     (activity, !native)
 }
 
+/// Whether an activity is for this app in this tenant, from Teams.
+pub fn in_tenant(activity: &Value, app_id: &str, tenant_id: &str) -> bool {
+    let recipient = activity["recipient"]["id"].as_str().unwrap_or_default();
+    activity["channelId"] == "msteams"
+        && activity["channelData"]["tenant"]["id"] == tenant_id
+        && (recipient == app_id || recipient == format!("28:{app_id}"))
+        && activity["from"]["role"] != "bot"
+}
+
+/// Where an activity goes when the application has a handler for it:
+/// - an `adaptiveCard/action` invoke is an action by its `verb`;
+/// - a `task/fetch` invoke (a button opening a dialog) is an action by the
+///   button data's `action_id`, and `task/submit` a view by its `callback_id`;
+/// - an `Action.Submit` press whose data has an `action_id` is an action;
+/// - a message starting with `/name` is a command;
+/// - any other activity type is an event, such as `conversationUpdate`.
+pub fn route(activity: &Value) -> Option<agentchat_core::Route> {
+    use agentchat_core::Route;
+    let text = |value: &Value| value.as_str().filter(|v| !v.is_empty()).map(str::to_owned);
+    match activity["type"].as_str()? {
+        "invoke" => Some(match activity["name"].as_str().unwrap_or_default() {
+            "adaptiveCard/action" => match text(&activity["value"]["action"]["verb"]) {
+                Some(verb) => Route::Action {
+                    action_ids: vec![verb],
+                },
+                None => Route::Other,
+            },
+            "task/fetch" => match text(&activity["value"]["data"]["action_id"]) {
+                Some(id) => Route::Action {
+                    action_ids: vec![id],
+                },
+                None => Route::Other,
+            },
+            "task/submit" => match text(&activity["value"]["data"]["callback_id"]) {
+                Some(id) => Route::View { callback_id: id },
+                None => Route::Other,
+            },
+            _ => Route::Other,
+        }),
+        "message" => {
+            if activity["value"]["agentchat"].is_string() {
+                return None;
+            }
+            if let Some(id) = text(&activity["value"]["action_id"]) {
+                return Some(Route::Action {
+                    action_ids: vec![id],
+                });
+            }
+            let raw = activity["text"].as_str()?;
+            let without_mentions = MENTION.replace_all(raw, "");
+            agentchat_core::command_of(&without_mentions).map(|command| Route::Command { command })
+        }
+        kind => Some(Route::Event {
+            event_type: kind.into(),
+        }),
+    }
+}
+
+static MENTION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?s)<at>.*?</at>").expect("static Teams mention expression")
+});
+
+/// The `invokeResponse` activity carrying the handler's answer, such as a dialog
+/// (`{"task": {"type": "continue", "value": ...}}`) or a refreshed card.
+pub fn invoke_response(body: &Value) -> Value {
+    let mut response = json!({"status": 200});
+    if !body.is_null() {
+        response["body"] = body.clone();
+    }
+    json!({"type": "invokeResponse", "value": response})
+}
+
+/// A targeted message: shown in the conversation only to `user_id` ("Only you can
+/// see this message"); it expires after 24 hours.
+pub fn targeted_activity(text: &str, user_id: &str, attachments: Option<&Value>) -> Value {
+    let mut activity = text_activity(text);
+    activity["recipient"] = json!({"id": user_id, "role": "user"});
+    activity["entities"] = json!([{"type": "activityTreatment", "treatment": "targeted"}]);
+    if let Some(attachments) = attachments.filter(|a| a.as_array().is_some_and(|a| !a.is_empty())) {
+        activity["attachments"] = attachments.clone();
+    }
+    activity
+}
+
+/// The line an informative stream update shows: the newest task in progress,
+/// else the plan, else the newest task. Teams allows 1,000 characters.
+pub fn informative_text(board: &agentchat_core::TaskBoard) -> String {
+    let line = board
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.status == agentchat_core::TaskStatus::InProgress)
+        .map(|task| task.title.clone())
+        .or_else(|| board.plan.clone())
+        .or_else(|| board.tasks.last().map(|task| task.title.clone()))
+        .unwrap_or_default();
+    line.trim().chars().take(1000).collect()
+}
+
+/// An informative update of a native stream: the first one starts the stream.
+/// Returns the activity and the next handle.
+pub fn informative_activity(handle: Option<&Value>, text: &str) -> (Value, Value) {
+    match handle {
+        None => (
+            json!({"type": "typing", "text": text, "entities": [
+                {"type": "streaminfo", "streamType": "informative", "streamSequence": 1}]}),
+            json!({"native": true, "sequence": 1}),
+        ),
+        Some(handle) => {
+            let mut next = handle.clone();
+            let sequence = handle["sequence"].as_u64().unwrap_or(1) + 1;
+            next["sequence"] = json!(sequence);
+            let id = handle["id"].clone();
+            (
+                json!({"type": "typing", "id": id, "text": text, "entities": [
+                    {"type": "streaminfo", "streamId": id, "streamType": "informative",
+                     "streamSequence": sequence}]}),
+                next,
+            )
+        }
+    }
+}
+
+/// Whether a failed stream update means the person pressed Teams' Stop button.
+pub fn stream_canceled(status: u16, body: &str) -> bool {
+    status == 403
+        && body.contains("ContentStreamNotAllowed")
+        && body.to_lowercase().contains("canceled by user")
+}
+
+/// A stop request for the conversation of `source`, from its sender: Teams' Stop
+/// button on a streamed answer in a one-to-one chat.
+pub fn stop_request(source: &Message, stream_id: &str) -> Message {
+    let mut stop = source.clone();
+    stop.id = format!("{}:stop:{stream_id}", source.id).into();
+    stop.text = String::new();
+    stop.attachments.clear();
+    stop.metadata
+        .insert(agentchat_core::STOP_METADATA.into(), json!(true));
+    stop
+}
+
 #[cfg(test)]
 mod tests {
+    use agentchat_core::Route;
+
+    fn activity(kind: &str) -> Value {
+        json!({"type": kind, "channelId": "msteams", "recipient": {"id": "28:app"},
+               "from": {"id": "29:user"}, "channelData": {"tenant": {"id": "tenant"}}})
+    }
+
+    #[test]
+    fn activities_route_by_type_and_invoke_name() {
+        let mut action = activity("invoke");
+        action["name"] = json!("adaptiveCard/action");
+        action["value"] = json!({"action": {"verb": "approve"}});
+        assert_eq!(
+            route(&action),
+            Some(Route::Action {
+                action_ids: vec!["approve".into()]
+            })
+        );
+        let mut fetch = activity("invoke");
+        fetch["name"] = json!("task/fetch");
+        fetch["value"] = json!({"data": {"action_id": "settings"}});
+        assert_eq!(
+            route(&fetch),
+            Some(Route::Action {
+                action_ids: vec!["settings".into()]
+            })
+        );
+        let mut submit = activity("invoke");
+        submit["name"] = json!("task/submit");
+        submit["value"] = json!({"data": {"callback_id": "settings"}});
+        assert_eq!(
+            route(&submit),
+            Some(Route::View {
+                callback_id: "settings".into()
+            })
+        );
+        let mut command = activity("message");
+        command["text"] = json!("<at>Bot</at> /deploy api");
+        assert_eq!(
+            route(&command),
+            Some(Route::Command {
+                command: "/deploy".into()
+            })
+        );
+        let mut prompt = activity("message");
+        prompt["value"] = json!({"agentchat": "ac:x:y"});
+        assert_eq!(route(&prompt), None);
+        assert_eq!(
+            route(&activity("conversationUpdate")),
+            Some(Route::Event {
+                event_type: "conversationUpdate".into()
+            })
+        );
+        assert!(in_tenant(&activity("message"), "app", "tenant"));
+        assert!(!in_tenant(&activity("message"), "app", "other"));
+        assert_eq!(
+            invoke_response(&json!({"task": {}}))["value"]["body"],
+            json!({"task": {}})
+        );
+        let targeted = targeted_activity("hi", "29:user", None);
+        assert_eq!(targeted["entities"][0]["treatment"], "targeted");
+        assert_eq!(targeted["recipient"]["id"], "29:user");
+        let (start, handle) = informative_activity(None, "Searching");
+        assert_eq!(start["entities"][0]["streamType"], "informative");
+        let (next, _) = informative_activity(
+            Some(&json!({"id": "s1", "sequence": handle["sequence"]})),
+            "Reading",
+        );
+        assert_eq!(next["entities"][0]["streamSequence"], 2);
+        assert!(stream_canceled(403, "{\"code\":\"ContentStreamNotAllowed\",\"message\":\"Content stream was canceled by user.\"}"));
+        assert!(!stream_canceled(
+            403,
+            "ContentStreamNotAllowed: message size too large"
+        ));
+    }
+
     use super::*;
 
     #[test]

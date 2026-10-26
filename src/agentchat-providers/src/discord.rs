@@ -153,6 +153,10 @@ impl Destination {
         })
     }
     pub fn payload(&self, content: &str) -> Value {
+        // A direct source (see `direct_source`) has no message to reply to.
+        if self.message_id == 0 {
+            return json!({"content":content,"allowed_mentions":{"parse":[],"replied_user":false}});
+        }
         let mut reference = json!({"message_id":self.message_id.to_string(),"channel_id":self.channel_id.to_string(),"fail_if_not_exists":false});
         if let Some(guild) = self.guild_id {
             reference["guild_id"] = guild.to_string().into();
@@ -232,8 +236,200 @@ pub fn receipt(response: &Value) -> Result<u64, &'static str> {
         .filter(|id| *id > 0)
         .ok_or("Discord did not return a message receipt")
 }
+/// Interaction types, from Discord's interaction object.
+pub const APPLICATION_COMMAND: u64 = 2;
+pub const MESSAGE_COMPONENT: u64 = 3;
+pub const AUTOCOMPLETE: u64 = 4;
+pub const MODAL_SUBMIT: u64 = 5;
+
+/// Where an interaction goes: a component press that is not a prompt answer is an
+/// action (by `custom_id`), a modal submission a view (by `custom_id`), an
+/// application command a command (`/name`), and autocomplete anything else.
+pub fn interaction_route(kind: u64, data: &Value) -> Option<agentchat_core::Route> {
+    use agentchat_core::Route;
+    let custom_id = || data["custom_id"].as_str().filter(|id| !id.is_empty());
+    match kind {
+        MESSAGE_COMPONENT => {
+            let id = custom_id()?;
+            if agentchat_core::answer_metadata(id).is_some() {
+                return None;
+            }
+            Some(Route::Action {
+                action_ids: vec![id.into()],
+            })
+        }
+        MODAL_SUBMIT => Some(Route::View {
+            callback_id: custom_id()?.into(),
+        }),
+        APPLICATION_COMMAND => Some(Route::Command {
+            command: format!("/{}", data["name"].as_str().filter(|n| !n.is_empty())?),
+        }),
+        AUTOCOMPLETE => Some(Route::Other),
+        _ => None,
+    }
+}
+
+/// The interaction response to send: the handler's answer when it is a response
+/// object (it has a `type`), otherwise an acknowledgement that shows nothing new.
+/// Commands get a private "thinking" state the handler can follow up on.
+pub fn interaction_response(kind: u64, answer: &Value) -> Value {
+    if answer.get("type").and_then(Value::as_u64).is_some() {
+        return answer.clone();
+    }
+    match kind {
+        APPLICATION_COMMAND => json!({"type": 5, "data": {"flags": 64}}),
+        AUTOCOMPLETE => json!({"type": 8, "data": {"choices": []}}),
+        _ => json!({"type": 6}),
+    }
+}
+
+/// A dispatched gateway event (opcode 0) as its type and the raw frame.
+pub fn gateway_event(frame: &Value) -> Option<&str> {
+    if frame["op"] != 0 {
+        return None;
+    }
+    frame["t"].as_str().filter(|t| !t.is_empty())
+}
+
+/// The REST path that deletes a message this bot sent.
+pub fn delete_path(message: &Message, bot_id: u64) -> Result<String, &'static str> {
+    let destination = Destination::from_source(message, bot_id)?;
+    Ok(format!(
+        "channels/{}/messages/{}",
+        destination.channel_id, destination.message_id
+    ))
+}
+
+/// Whether a notice for `user_id` can be an ordinary reply: only in a direct
+/// message with that user, where every message is already private.
+/// `POST users/@me/channels` with this body opens (or finds) the direct message
+/// channel with `user_id`.
+pub fn dm_request(user_id: &str) -> Result<Value, &'static str> {
+    if user_id.is_empty() || !user_id.bytes().all(|c| c.is_ascii_digit()) {
+        return Err("Expected a Discord user ID");
+    }
+    Ok(json!({"recipient_id": user_id}))
+}
+
+/// The channel ID in a `users/@me/channels` response.
+pub fn dm_channel(response: &Value) -> Result<u64, &'static str> {
+    receipt(response).map_err(|_| "Discord did not return a direct message channel")
+}
+
+/// A source for messages sent to the direct message `channel_id` with `user_id`,
+/// which need not be answering one of theirs.
+pub fn direct_source(bot_id: u64, channel_id: u64, user_id: &str) -> Message {
+    Message {
+        id: format!("discord:{bot_id}:{channel_id}:direct").into(),
+        conversation_id: conversation(bot_id, None, channel_id).into(),
+        channel: "discord".into(),
+        sender: Sender {
+            id: user_id.into(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        metadata: json!({
+            "bot_id": bot_id,
+            "channel_id": channel_id,
+            "guild_id": null,
+            "message_id": 0,
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+    }
+}
+
+/// `GET` lists a channel's pins (`{"items": [{"message": ...}], "has_more"}`);
+/// `PUT /{message_id}` pins one.
+pub fn pins_path(channel_id: u64) -> String {
+    format!("channels/{channel_id}/messages/pins")
+}
+
+/// The newest pinned message the bot wrote, in a `pins_path` listing.
+pub fn pinned_home(pins: &Value, bot_id: u64) -> Option<u64> {
+    let bot = bot_id.to_string();
+    pins["items"].as_array()?.iter().find_map(|pin| {
+        let message = &pin["message"];
+        if message["author"]["id"].as_str() != Some(bot.as_str()) {
+            return None;
+        }
+        receipt(message).ok()
+    })
+}
+
+pub fn private_reply_allowed(source: &Message, user_id: &str) -> bool {
+    source.metadata.get("guild_id").is_none_or(Value::is_null) && source.sender.id == user_id
+}
+
 #[cfg(test)]
 mod tests {
+    use agentchat_core::Route;
+
+    #[test]
+    fn direct_messages_and_pinned_homes() {
+        let source = direct_source(99, 5, "7");
+        let destination = Destination::from_source(&source, 99).unwrap();
+        assert!(destination.payload("hi").get("message_reference").is_none());
+        assert!(private_reply_allowed(&source, "7"));
+        assert_eq!(dm_request("7").unwrap(), json!({"recipient_id": "7"}));
+        assert!(dm_request("x").is_err());
+        assert_eq!(dm_channel(&json!({"id": "5"})), Ok(5));
+        let pins = json!({"items": [
+            {"message": {"id": "11", "author": {"id": "3"}}},
+            {"message": {"id": "12", "author": {"id": "99"}}}]});
+        assert_eq!(pinned_home(&pins, 99), Some(12));
+        assert_eq!(pinned_home(&json!({"items": []}), 99), None);
+        assert_eq!(pins_path(5), "channels/5/messages/pins");
+    }
+
+    #[test]
+    fn interactions_route_by_type_and_get_a_response() {
+        assert_eq!(
+            interaction_route(MESSAGE_COMPONENT, &json!({"custom_id": "retry"})),
+            Some(Route::Action {
+                action_ids: vec!["retry".into()]
+            })
+        );
+        let token = agentchat_core::prompt_token("0123456789abcdef", "yes").unwrap();
+        assert_eq!(
+            interaction_route(MESSAGE_COMPONENT, &json!({"custom_id": token})),
+            None
+        );
+        assert_eq!(
+            interaction_route(MODAL_SUBMIT, &json!({"custom_id": "settings"})),
+            Some(Route::View {
+                callback_id: "settings".into()
+            })
+        );
+        assert_eq!(
+            interaction_route(APPLICATION_COMMAND, &json!({"name": "deploy"})),
+            Some(Route::Command {
+                command: "/deploy".into()
+            })
+        );
+        assert_eq!(interaction_route(1, &json!({})), None);
+        let modal = json!({"type": 9, "data": {"custom_id": "m"}});
+        assert_eq!(interaction_response(MESSAGE_COMPONENT, &modal), modal);
+        assert_eq!(
+            interaction_response(MESSAGE_COMPONENT, &Value::Null),
+            json!({"type": 6})
+        );
+        assert_eq!(
+            interaction_response(APPLICATION_COMMAND, &json!({"text": "x"}))["type"],
+            5
+        );
+        assert_eq!(
+            gateway_event(&json!({"op": 0, "t": "GUILD_CREATE"})),
+            Some("GUILD_CREATE")
+        );
+        assert_eq!(gateway_event(&json!({"op": 11})), None);
+    }
+
     use super::*;
     #[test]
     fn text_uses_utf16() {

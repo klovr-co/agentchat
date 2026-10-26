@@ -40,6 +40,24 @@ export interface Answer { readonly prompt: string; readonly choice: string; read
 /** Who may answer: by default the sender of the message the prompt is about. */
 export type Allowed = "anyone" | readonly string[];
 
+/** The state of a task shown with a streamed answer. */
+export type TaskStatus = "pending" | "in_progress" | "complete" | "error";
+/** A raw Slack payload: an Events API envelope, interactive payload or slash command. */
+export type SlackPayload = Readonly<Record<string, Json>>;
+/**
+ * Handles a Slack payload. For view submissions, options requests and slash
+ * commands the returned object is the acknowledgement body (for example
+ * `{ response_action: "errors", errors: {...} }`); otherwise it is ignored.
+ */
+export type SlackHandler = (payload: SlackPayload) => Promise<Json | void> | Json | void;
+type SlackRoute =
+  | { kind: "event"; event_type: string }
+  | { kind: "action"; action_ids: string[] }
+  | { kind: "view"; callback_id: string }
+  | { kind: "command"; command: string }
+  | { kind: "other" };
+type HandlerKind = "event" | "action" | "view" | "command";
+
 export interface SlackOptions {
   botToken: string;
   appToken: string;
@@ -50,10 +68,19 @@ export interface SlackOptions {
   shutdownTimeoutMs?: number;
   /** Slack Web API root. HTTP is accepted only for loopback development fixtures. */
   apiBaseUrl?: string;
+  /**
+   * Report working status through Slack agent sessions (`agents.sessions.setStatus`)
+   * instead of `assistant.threads.setStatus`. Needs an app declared as an agent.
+   */
+  agentSessions?: boolean;
 }
 
 export class Slack {
   readonly #options: SlackOptions;
+  readonly #handlers: { kind: HandlerKind; key: string | RegExp; handler: SlackHandler }[] = [];
+  #raw: SlackHandler | undefined;
+  #native: NativeApp | undefined;
+  #index = -1;
 
   constructor(options: SlackOptions) {
     if (!options.botToken || !options.appToken) throw new Error("Slack requires botToken and appToken");
@@ -72,6 +99,92 @@ export class Slack {
 
   /** @internal */
   nativeOptions(): SlackOptions { return { ...this.#options }; }
+
+  /** @internal */
+  attach(native: NativeApp, index: number): void {
+    if (this.#native) throw new Error("This Slack channel already belongs to an AgentChat");
+    this.#native = native;
+    this.#index = index;
+  }
+
+  #register(kind: HandlerKind, key: string | RegExp, handler: SlackHandler): SlackHandler {
+    const keyed = typeof key === "string" || (key instanceof RegExp && kind !== "event" && kind !== "command");
+    if (!keyed) throw new TypeError(kind === "event" || kind === "command" ? "Expected a string" : "Expected a string or a RegExp");
+    if (typeof handler !== "function") throw new TypeError("A Slack handler must be a function");
+    this.#handlers.push({ kind, key, handler });
+    return handler;
+  }
+
+  /** Handle Events API events AgentChat does not turn into messages, such as `app_home_opened`. */
+  onEvent(eventType: string, handler: SlackHandler): SlackHandler { return this.#register("event", eventType, handler); }
+  /** Handle `block_actions` by `action_id`; a RegExp matches anywhere in it. Prompt buttons never reach it. */
+  onAction(actionId: string | RegExp, handler: SlackHandler): SlackHandler { return this.#register("action", actionId, handler); }
+  /** Handle `view_submission` and `view_closed` by `callback_id`; a submission's return value is the acknowledgement. */
+  onView(callbackId: string | RegExp, handler: SlackHandler): SlackHandler { return this.#register("view", callbackId, handler); }
+  /** Handle a slash command such as "/deploy"; the return value is the response. */
+  onCommand(command: string, handler: SlackHandler): SlackHandler { return this.#register("command", command, handler); }
+  /** Handle every other payload no handler above matched, such as shortcuts. */
+  onRaw(handler: SlackHandler): SlackHandler {
+    if (typeof handler !== "function") throw new TypeError("A Slack handler must be a function");
+    this.#raw = handler;
+    return handler;
+  }
+
+  /** @internal */
+  async dispatch(route: SlackRoute, payload: SlackPayload): Promise<Json | null> {
+    const keys = route.kind === "event" ? [route.event_type]
+      : route.kind === "action" ? route.action_ids
+      : route.kind === "view" ? [route.callback_id]
+      : route.kind === "command" ? [route.command] : [];
+    const entry = this.#handlers.find((candidate) => candidate.kind === route.kind && keys.some((key) =>
+      typeof candidate.key === "string" ? candidate.key === key : key.search(candidate.key) !== -1));
+    const handler = entry?.handler ?? this.#raw;
+    if (!handler) return null;
+    const result = await handler(payload);
+    return result === undefined ? null : result;
+  }
+
+  #attached(): { native: NativeApp; index: number } {
+    if (!this.#native) throw new Error("Add this Slack channel to an AgentChat first");
+    return { native: this.#native, index: this.#index };
+  }
+
+  /** Open a modal with an interaction's `trigger_id`, which expires three seconds after Slack sends it. */
+  async openView(triggerId: string, view: Readonly<Record<string, Json>>): Promise<Record<string, Json>> {
+    const { native, index } = this.#attached();
+    return JSON.parse(await native.openView(index, triggerId, JSON.stringify(view), false)) as Record<string, Json>;
+  }
+
+  /** Push a view onto an open modal with the `trigger_id` of an interaction in it. */
+  async pushView(triggerId: string, view: Readonly<Record<string, Json>>): Promise<Record<string, Json>> {
+    const { native, index } = this.#attached();
+    return JSON.parse(await native.openView(index, triggerId, JSON.stringify(view), true)) as Record<string, Json>;
+  }
+
+  /** Replace a view named by `viewId` or `externalId`; `hash` guards against races. */
+  async updateView(view: Readonly<Record<string, Json>>, target: { viewId?: string; externalId?: string; hash?: string }): Promise<Record<string, Json>> {
+    const { native, index } = this.#attached();
+    return JSON.parse(await native.updateView(index, JSON.stringify(view), target.viewId, target.externalId, target.hash)) as Record<string, Json>;
+  }
+
+  /** Publish a user's App Home tab. */
+  async publishHome(userId: string, view: Readonly<Record<string, Json>>, options: { hash?: string } = {}): Promise<Record<string, Json>> {
+    const { native, index } = this.#attached();
+    return JSON.parse(await native.publishHome(index, userId, JSON.stringify(view), options.hash)) as Record<string, Json>;
+  }
+
+  /** Post a notice in `source`'s conversation that only `userId` can see. It is never posted publicly instead. */
+  async sendEphemeral(source: Message, userId: string, text: string, options: { blocks?: RichReply["blocks"] } = {}): Promise<Message> {
+    const { native, index } = this.#attached();
+    const sent = await native.sendEphemeral(index, JSON.stringify(messageToWire(source)), userId, JSON.stringify({ text, blocks: options.blocks ?? [] }));
+    return messageFromWire(JSON.parse(sent) as WireMessage);
+  }
+
+  /** Delete a message this app sent (`chat.delete`). Ephemeral notices cannot be deleted. */
+  async delete(message: Message): Promise<void> {
+    const { native, index } = this.#attached();
+    await native.deleteMessage(index, JSON.stringify(messageToWire(message)));
+  }
 }
 
 interface WireMessage {
@@ -114,10 +227,21 @@ interface NativeStream {
   append(text: string): Promise<void>;
   finish(): Promise<string>;
   abort(): Promise<void>;
+  task(id: string, title: string, status: string, details?: string, output?: string): Promise<void>;
+  plan(title: string): Promise<void>;
 }
 
-interface NativeApp {
-  run(handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>): Promise<void>;
+/** @internal */
+export interface NativeApp {
+  run(
+    handler: (channelIndex: number, messageJson: string, turnId: number) => Promise<string | null>,
+    appHandler?: (channelIndex: number, routedJson: string) => Promise<string | null>,
+  ): Promise<void>;
+  sendEphemeral(channelIndex: number, sourceJson: string, userId: string, contentJson: string): Promise<string>;
+  deleteMessage(channelIndex: number, messageJson: string): Promise<void>;
+  openView(channelIndex: number, triggerId: string, viewJson: string, push: boolean): Promise<string>;
+  updateView(channelIndex: number, viewJson: string, viewId?: string, externalId?: string, hash?: string): Promise<string>;
+  publishHome(channelIndex: number, userId: string, viewJson: string, hash?: string): Promise<string>;
   close(): Promise<void>;
   reply(channelIndex: number, sourceJson: string, text: string): Promise<string>;
   history(conversationId: string, limit?: number): Promise<string>;
@@ -188,6 +312,21 @@ export class AnswerStream {
   /** Close a started stream with the text so far, without adding it to history. */
   async abort(): Promise<void> {
     await this.#native.abort();
+  }
+
+  /**
+   * Show a task's progress with the answer. A later call with the same `id` updates
+   * it; `details` and `output` add text. Channels that cannot show tasks ignore it.
+   * On Slack, call `plan()` or `task()` before the first `append()`: a stream
+   * started with text alone cannot show tasks later.
+   */
+  async task(id: string, title: string, status: TaskStatus = "in_progress", options: { details?: string; output?: string } = {}): Promise<void> {
+    await this.#native.task(id, title, status, options.details, options.output);
+  }
+
+  /** Group the answer's tasks under a plan with `title`; ignored where tasks are not shown. */
+  async plan(title: string): Promise<void> {
+    await this.#native.plan(title);
   }
 }
 
@@ -270,6 +409,14 @@ export class MessageContext {
 
   async setStatus(status: string): Promise<boolean> {
     return this.#native.setStatus(this.#channelIndex, this.#sourceJson, status);
+  }
+
+  /** Post a notice in this conversation that only the sender (or `userId`) can see. */
+  async replyEphemeral(text: string, options: { blocks?: RichReply["blocks"]; userId?: string } = {}): Promise<Message> {
+    const sent = await this.#native.sendEphemeral(
+      this.#channelIndex, this.#sourceJson, options.userId ?? this.sender.id, JSON.stringify({ text, blocks: options.blocks ?? [] }),
+    );
+    return messageFromWire(JSON.parse(sent) as WireMessage);
   }
 
   /** Refresh a transient status. Always await close() in a finally block. */
@@ -361,6 +508,7 @@ export class AgentChat {
     this.#onError = options.onError ?? (() => { console.error("AgentChat message handler failed"); });
     const { NativeAgentChat } = loadNative();
     this.#native = new NativeAgentChat(JSON.stringify(this.channels.map((channel) => channel.nativeOptions())), options.busy ?? "steer");
+    this.channels.forEach((channel, index) => channel.attach(this.#native, index));
   }
 
   /** Ask a conversation's running handler to stop; false when none is running. */
@@ -395,6 +543,15 @@ export class AgentChat {
         throw error;
       } finally {
         this.#active.delete(controller);
+      }
+    }, async (channelIndex, routedJson) => {
+      const { route, payload } = JSON.parse(routedJson) as { route: SlackRoute; payload: SlackPayload };
+      try {
+        const body = await handlerScope.run(this, () => this.channels[channelIndex]!.dispatch(route, payload));
+        return body === null ? null : JSON.stringify(body);
+      } catch (error) {
+        console.error("AgentChat Slack handler failed");
+        throw error;
       }
     }).finally(() => {
       for (const controller of this.#active) controller.abort();

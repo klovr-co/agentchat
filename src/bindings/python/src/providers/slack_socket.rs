@@ -265,9 +265,12 @@ impl SocketMode {
             let acknowledged = Python::attach(|py| -> PyResult<_> {
                 let this = slf.borrow(py);
                 let kind = request.bind(py).getattr("type")?.extract::<String>()?;
-                // Events, and interactions such as presses on prompt buttons.
-                if !matches!(kind.as_str(), "events_api" | "interactive")
-                    || this.is_closed(py)?
+                // Events, interactions such as button presses and view submissions,
+                // and slash commands.
+                if !matches!(
+                    kind.as_str(),
+                    "events_api" | "interactive" | "slash_commands"
+                ) || this.is_closed(py)?
                     || this.tasks.bind(py).len() >= this.max_pending_events
                 {
                     return Ok(None);
@@ -305,9 +308,75 @@ impl SocketMode {
         acknowledged: Object,
     ) -> PyResult<Object> {
         coroutine(py, async move {
+            let (payload, responds) = Python::attach(|py| -> PyResult<_> {
+                let payload = request.bind(py).getattr("payload")?;
+                let responds = agentchat_slack::interaction::responds(
+                    &crate::convert::to_json(&payload).unwrap_or_default(),
+                );
+                Ok((payload.unbind(), responds))
+            })?;
+            let receive =
+                || {
+                    Python::attach(|py| -> PyResult<Object> {
+                        let receiver =
+                            slf.borrow(py).receiver.as_ref().map(copy).ok_or_else(|| {
+                                PyRuntimeError::new_err("Socket receiver is unbound")
+                            })?;
+                        Ok(receiver.bind(py).call1((payload.bind(py),))?.unbind())
+                    })
+                };
+            // A view submission, options request or slash command is acknowledged with
+            // the receiver's answer, within the deadline; everything else first.
+            let (body, pending) = if responds {
+                let task = Python::attach(|py| -> PyResult<Object> {
+                    Ok(py
+                        .import("asyncio")?
+                        .call_method1("ensure_future", (receive()?,))?
+                        .unbind())
+                })?;
+                let waiting = Python::attach(|py| -> PyResult<Object> {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item(
+                        "timeout",
+                        agentchat_slack::interaction::ACK_DEADLINE.as_secs_f64(),
+                    )?;
+                    Ok(py
+                        .import("asyncio")?
+                        .call_method("wait", ((task.bind(py),),), Some(&kwargs))?
+                        .unbind())
+                })?;
+                await_py(waiting).await?;
+                let body = Python::attach(|py| -> PyResult<Object> {
+                    let task = task.bind(py);
+                    if !task.call_method0("done")?.is_truthy()?
+                        || task.call_method0("cancelled")?.is_truthy()?
+                        || !task.call_method0("exception")?.is_none()
+                    {
+                        return Ok(py.None());
+                    }
+                    let result = task.call_method0("result")?;
+                    if result.is_instance_of::<PyDict>() {
+                        Ok(result.unbind())
+                    } else if result.is_none() {
+                        Ok(py.None())
+                    } else {
+                        Ok(py
+                            .import("builtins")?
+                            .getattr("dict")?
+                            .call1((result,))?
+                            .unbind())
+                    }
+                })?;
+                (body, Some(task))
+            } else {
+                (none(), None)
+            };
             let response = Python::attach(|py| -> PyResult<_> {
                 let kw = PyDict::new(py);
                 kw.set_item("envelope_id", request.bind(py).getattr("envelope_id")?)?;
+                if !body.is_none(py) {
+                    kw.set_item("payload", body.bind(py))?;
+                }
                 Ok(py
                     .import(MODULE)?
                     .getattr("SocketModeResponse")?
@@ -325,21 +394,16 @@ impl SocketMode {
                 })?;
                 return Err(error);
             }
-            let pending = Python::attach(|py| -> PyResult<_> {
+            Python::attach(|py| {
                 acknowledged
                     .bind(py)
-                    .call_method1("set_result", (py.None(),))?;
-                let receiver = slf
-                    .borrow(py)
-                    .receiver
-                    .as_ref()
-                    .map(copy)
-                    .ok_or_else(|| PyRuntimeError::new_err("Socket receiver is unbound"))?;
-                Ok(receiver
-                    .bind(py)
-                    .call1((request.bind(py).getattr("payload")?,))?
-                    .unbind())
+                    .call_method1("set_result", (py.None(),))
+                    .map(|_| ())
             })?;
+            let pending = match pending {
+                Some(task) => task,
+                None => receive()?,
+            };
             await_py(pending).await?;
             Ok(none())
         })

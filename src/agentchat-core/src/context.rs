@@ -163,6 +163,19 @@ impl MessageContext {
             .await
     }
 
+    /// Post a notice in this conversation that only the sender can see; see
+    /// [`AgentChat::send_ephemeral`].
+    pub async fn reply_ephemeral(&self, content: &RichReply) -> Result<Message> {
+        self.send_ephemeral(&self.sender.id, content).await
+    }
+
+    /// Post a notice in this conversation that only `user_id` can see.
+    pub async fn send_ephemeral(&self, user_id: &str, content: &RichReply) -> Result<Message> {
+        self.app
+            .send_ephemeral(self.channel.clone(), &self.message, user_id, content)
+            .await
+    }
+
     pub async fn set_status(&self, status: &str) -> Result<bool> {
         self.app
             .set_status(self.channel.clone(), &self.message, status)

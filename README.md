@@ -196,6 +196,29 @@ conversation's handler is running is steered into it by default
 (`context.steered()`); messages the handler leaves unread run afterwards. Earlier
 versions made such messages wait for the next turn; pass
 `AgentChat(busy="queue")` to keep that. See [Live controls](docs/live-controls.md).
+Streams can show task and plan progress next to the answer (`reply.task()`,
+`reply.plan()`) where the channel supports it.
+
+## Slack app features
+
+Every Slack payload reaches your app through AgentChat, so one app token serves
+both the agent and the rest of the app: `@slack.on_event("app_home_opened")`,
+`@slack.on_action("retry")`, `@slack.on_view("settings")` (its return value is
+the acknowledgement, such as `response_action`), `@slack.on_command("/deploy")`
+and `@slack.on_raw`. Slack also gets private notices (`context.reply_ephemeral()`),
+modals and App Home (`slack.open_view()`, `push_view()`, `update_view()`,
+`publish_home()`), `app.delete()`, and Slack's native stop button. See
+[Slack app features](docs/slack.md#slack-app-features) and
+[Moving from Slack Bolt](docs/slack.md#moving-from-slack-bolt).
+
+Telegram, Discord, Teams, WhatsApp, YCloud and iMessage take the same handlers
+and use their own equivalents: Telegram ephemeral messages and draft stop
+buttons, Discord interaction responses and modals, Teams targeted messages,
+dialogs and stream Stop, WhatsApp Flows. Where a provider has none there is a
+fallback: forms asked in the chat (`context.open_form()`), a pinned or edited home
+message (`publish_home()`), notices by direct message (`fallback="dm"`), iMessage
+unsend and edited progress, and WhatsApp task messages. See
+[App features](docs/app-features.md).
 
 ## Supported channels
 

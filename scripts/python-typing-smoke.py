@@ -4,8 +4,9 @@ Run with MYPYPATH=python mypy --ignore-missing-imports --follow-imports silent
 scripts/python-typing-smoke.py, using the project environment's Python executable.
 """
 
+import re
 from collections.abc import Awaitable, Callable, Mapping
-from typing import assert_type
+from typing import Any, Literal, assert_type
 
 from agentchat import AgentChat, Conversation, Message, MessageContext, Sender
 from agentchat.activity import WorkingStatus
@@ -44,6 +45,44 @@ async def check_api(
     async with app.state.lock(context.conversation.id):
         assert_type(await app.state.history(context.conversation.id), tuple[Message, ...])
     assert_type(await slack.get_user("U123"), SlackUser)
+    assert_type(await context.reply_ephemeral("only you"), Message)
+    assert_type(await app.send_ephemeral(slack, message, "U123", "only you"), Message)
+    assert_type(await app.delete(slack, message), Literal["deleted", "edited", "noticed", "failed"])
+    assert_type(await app.edit(telegram, message, "(removed)"), Message)
+    assert_type(await slack.open_view("1.2.3", {"type": "modal"}), dict[str, Any])
+    assert_type(await slack.publish_home("U123", {"type": "home"}), dict[str, Any])
+
+    @slack.on_view(re.compile("^settings"))
+    async def on_view(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        return {"response_action": "clear"}
+
+    @slack.on_raw
+    async def on_raw(payload: Mapping[str, Any]) -> None:
+        return None
+
+    @telegram.on_action(re.compile("^retry"))
+    async def on_press(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        return {"text": "Retrying"}
+
+    @discord.on_command("/deploy")
+    async def on_deploy(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        return {"type": 4, "data": {"content": "Deploying", "flags": 64}}
+
+    assert_type(await teams.send_ephemeral(message, "29:user", "only you"), Message)
+    assert_type(await discord.delete(message), None)
+    assert_type(await whatsapp.reply_rich(message, RichReply(text="Form", blocks=())), Message)
+    assert_type(await context.reply_ephemeral("only you", fallback="dm"), Message)
+    assert_type(await telegram.publish_home("30", "Welcome"), Message)
+    assert_type(await discord.publish_home("30", "Welcome"), Message)
+    assert_type(await teams.publish_home("29:user", "Welcome"), Message)
+    assert_type(await whatsapp.publish_home("15551234567", "Welcome"), Message)
+    form = {"callback_id": "signup", "fields": [{"id": "name", "label": "Your name?"}]}
+    assert_type(await context.open_form(form), None)
+    assert_type(await app.open_form(telegram, message, form), None)
+
+    async with context.stream() as reply:
+        assert_type(await reply.task("t1", "Search", "complete", details="done"), None)
+        assert_type(await reply.plan("Plan"), None)
     assert_type(await telegram.reply(message, "hello"), Message)
     assert_type(await whatsapp.reply(message, "hello"), Message)
     assert_type(await ycloud.reply(message, "hello", external_id="outbox-1"), Message)

@@ -289,7 +289,8 @@ pub fn destination(source: &Message, bot: i64) -> Result<Destination, &'static s
 impl Destination {
     pub fn route(&self, mut payload: Value, quote: bool) -> Value {
         payload["chat_id"] = json!(self.chat_id);
-        if quote {
+        // A direct source (see `private_source`) has no message to quote.
+        if quote && self.message_id > 0 {
             payload["reply_parameters"] =
                 json!({"message_id":self.message_id,"allow_sending_without_reply":true});
         }
@@ -299,6 +300,67 @@ impl Destination {
         payload
     }
 }
+/// A source for messages sent to `user_id`'s private chat with the bot, which
+/// need not be answering one of theirs. Telegram delivers them only to people who
+/// have started the bot.
+pub fn private_source(bot: i64, user_id: &str) -> Result<Message, &'static str> {
+    let user: i64 = user_id
+        .parse()
+        .ok()
+        .filter(|user| *user > 0)
+        .ok_or("Expected a numeric Telegram user ID")?;
+    Ok(Message {
+        id: format!("telegram:{bot}:direct:{user}").into(),
+        conversation_id: format!("telegram:{bot}:{user}").into(),
+        channel: "telegram".into(),
+        sender: Sender {
+            id: user.to_string(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+        metadata: [
+            ("bot_id".into(), json!(bot)),
+            ("chat_id".into(), json!(user)),
+            ("chat_type".into(), json!("private")),
+            ("message_id".into(), json!(0)),
+            ("message_thread_id".into(), Value::Null),
+        ]
+        .into_iter()
+        .collect(),
+    })
+}
+
+/// Whether a notice for `user_id` from `source` must go elsewhere: `source` is
+/// another person's private chat.
+pub fn private_chat_of_other(source: &Message, user_id: &str) -> bool {
+    source.metadata.get("chat_type").and_then(Value::as_str) == Some("private")
+        && source
+            .metadata
+            .get("chat_id")
+            .map(Value::to_string)
+            .as_deref()
+            != Some(user_id)
+}
+
+/// The bot's pinned home message in a `getChat` result, if the chat's latest pin
+/// is one of the bot's messages.
+pub fn pinned_home(chat: &Value, bot: i64) -> Option<i64> {
+    let pinned = &chat["pinned_message"];
+    if pinned["from"]["id"].as_i64() != Some(bot) {
+        return None;
+    }
+    pinned["message_id"].as_i64().filter(|id| *id > 0)
+}
+
+/// `pinChatMessage` without notifying the chat.
+pub fn pin_request(chat_id: i64, message_id: i64) -> Value {
+    json!({"chat_id": chat_id, "message_id": message_id, "disable_notification": true})
+}
+
 pub fn receipt(
     source: &Message,
     bot: i64,
@@ -900,5 +962,403 @@ pub fn close_prompt_request(answered: Option<&str>) -> Result<(&'static str, Val
             "editMessageReplyMarkup",
             json!({"reply_markup": {"inline_keyboard": []}}),
         )),
+    }
+}
+
+/// The kind of an update: its one field besides `update_id`, such as `message`,
+/// `callback_query` or `my_chat_member`.
+pub fn update_kind(update: &Value) -> Option<&str> {
+    update
+        .as_object()?
+        .keys()
+        .find(|key| key.as_str() != "update_id")
+        .map(String::as_str)
+}
+
+/// Where an update goes when the application has a handler for it: a press that
+/// is not a prompt answer is an action (by its `callback_data`), a message starting
+/// with `/name` is a command, and any other update is an event by its kind.
+/// Without a matching handler, presses and messages keep their usual path.
+pub fn route(update: &Value) -> Option<agentchat_core::Route> {
+    use agentchat_core::Route;
+    let kind = update_kind(update)?;
+    match kind {
+        "callback_query" => {
+            let data = nonempty(&update["callback_query"]["data"])?;
+            if agentchat_core::answer_metadata(data).is_some() {
+                return None;
+            }
+            Some(Route::Action {
+                action_ids: vec![data.into()],
+            })
+        }
+        "message" => {
+            let text = update["message"]["text"].as_str()?;
+            agentchat_core::command_of(text).map(|command| Route::Command { command })
+        }
+        _ => Some(Route::Event {
+            event_type: kind.into(),
+        }),
+    }
+}
+
+/// The update types to request: messages and presses, the event types the
+/// application handles, and stop presses on drafts when drafts are streamed.
+pub fn allowed_updates(events: &[String], drafts: bool) -> Vec<String> {
+    let mut allowed = vec!["message".to_owned(), "callback_query".to_owned()];
+    if drafts {
+        allowed.push("stopped_message_generation".into());
+    }
+    for event in events {
+        if !allowed.contains(event) {
+            allowed.push(event.clone());
+        }
+    }
+    allowed
+}
+
+/// The stop button on a streamed draft (`stopped_message_generation`), as a stop
+/// request for that private chat's conversation, sent by its user.
+pub fn normalize_stop(update: &Value, bot: i64) -> Option<Message> {
+    let stopped = &update["stopped_message_generation"];
+    let chat = &stopped["chat"];
+    let chat_id = chat["id"].as_i64()?;
+    if chat["type"] != "private" {
+        return None;
+    }
+    let draft = stopped["draft_id"].as_i64()?;
+    let base = format!("telegram:{bot}:{chat_id}");
+    let thread = stopped["message_thread_id"].as_i64();
+    let mut metadata: serde_json::Map<String, Value> = [
+        ("bot_id".into(), json!(bot)),
+        ("chat_id".into(), json!(chat_id)),
+        ("chat_type".into(), json!("private")),
+        ("message_id".into(), json!(0)),
+        ("message_thread_id".into(), json!(thread)),
+        ("draft_id".into(), json!(draft)),
+    ]
+    .into_iter()
+    .collect();
+    metadata.insert(agentchat_core::STOP_METADATA.into(), json!(true));
+    Some(Message {
+        id: format!(
+            "telegram:{bot}:stop:{chat_id}:{draft}:{}",
+            update["update_id"]
+        )
+        .into(),
+        conversation_id: thread.map(|v| format!("{base}:{v}")).unwrap_or(base).into(),
+        channel: "telegram".into(),
+        sender: Sender {
+            id: chat_id.to_string(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        thread_id: thread.map(|v| v.to_string()),
+        addressed: true,
+        attachments: vec![],
+        metadata,
+    })
+}
+
+/// The `answerCallbackQuery` request for a press the application handled: its
+/// answer may set `text` (up to 200 characters), `show_alert`, `url` and
+/// `cache_time`; anything else is ignored.
+pub fn callback_answer(callback_id: &str, answer: &Value) -> Value {
+    let mut request = json!({"callback_query_id": callback_id});
+    for key in ["text", "show_alert", "url", "cache_time"] {
+        if let Some(value) = answer.get(key).filter(|value| !value.is_null()) {
+            request[key] = value.clone();
+        }
+    }
+    request
+}
+
+/// How a private notice is sent in the source chat.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ephemeral {
+    /// A private chat with that user: an ordinary reply is already private.
+    Reply(Value),
+    /// A group: an ephemeral `sendMessage` only that user sees.
+    Ephemeral(Value),
+}
+
+/// A notice only `user_id` sees. In a group, Telegram accepts it within 15 seconds
+/// of that user's button press (`callback_query_id`), or at any time when the bot
+/// is an administrator.
+pub fn ephemeral_request(
+    source: &Message,
+    bot: i64,
+    user_id: &str,
+    text: &str,
+    reply_markup: Option<&Value>,
+) -> Result<Ephemeral, &'static str> {
+    let user: i64 = user_id
+        .parse()
+        .map_err(|_| "Expected a numeric Telegram user ID")?;
+    let dest = destination(source, bot)?;
+    let mut payload = text_payload(Some(text))?;
+    if let Some(markup) = reply_markup {
+        payload["reply_markup"] = markup.clone();
+    }
+    let private = source.metadata.get("chat_type").and_then(Value::as_str) == Some("private");
+    if private {
+        if dest.chat_id != user {
+            return Err("A private Telegram chat can only show notices to its own user");
+        }
+        return Ok(Ephemeral::Reply(dest.route(payload, true)));
+    }
+    let mut parameters = json!({"receiver_user_id": user});
+    if let Some(callback) = source
+        .metadata
+        .get("callback_query_id")
+        .and_then(Value::as_str)
+    {
+        parameters["callback_query_id"] = json!(callback);
+    }
+    payload["ephemeral_message_parameters"] = parameters;
+    Ok(Ephemeral::Ephemeral(dest.route(payload, false)))
+}
+
+/// The receipt of a group notice; Telegram identifies it by `ephemeral_message_id`.
+pub fn ephemeral_receipt(
+    source: &Message,
+    bot: i64,
+    name: Option<String>,
+    user_id: &str,
+    text: &str,
+    result: &Value,
+) -> Result<Message, &'static str> {
+    let id = result["ephemeral_message_id"]
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or("Telegram did not return an ephemeral message receipt")?;
+    let mut sent = receipt(source, bot, name, text, &json!({"message_id": id}))?;
+    sent.id = format!("{}:ephemeral", sent.id).into();
+    // Notices have no ordinary message ID; they cannot be quoted or edited as one.
+    sent.metadata.insert("message_id".into(), json!(0));
+    sent.metadata
+        .insert("ephemeral_message_id".into(), json!(id));
+    sent.metadata.insert("ephemeral".into(), json!(true));
+    sent.metadata
+        .insert("recipient_user_id".into(), json!(user_id));
+    Ok(sent)
+}
+
+/// `deleteMessage`, or `deleteEphemeralMessage` for a notice, for a message this
+/// bot sent. Telegram deletes messages up to 48 hours old.
+pub fn delete_request(message: &Message, bot: i64) -> Result<(&'static str, Value), &'static str> {
+    let dest = destination(message, bot)?;
+    if message.metadata.get("ephemeral") == Some(&json!(true)) {
+        let id = message
+            .metadata
+            .get("ephemeral_message_id")
+            .and_then(Value::as_i64)
+            .ok_or("Expected a Telegram message to delete")?;
+        let user: i64 = message
+            .metadata
+            .get("recipient_user_id")
+            .and_then(Value::as_str)
+            .and_then(|user| user.parse().ok())
+            .ok_or("Expected a Telegram message to delete")?;
+        return Ok((
+            "deleteEphemeralMessage",
+            json!({"chat_id": dest.chat_id, "receiver_user_id": user, "ephemeral_message_id": id}),
+        ));
+    }
+    if dest.message_id <= 0 {
+        return Err("Expected a Telegram message to delete");
+    }
+    Ok((
+        "deleteMessage",
+        json!({"chat_id": dest.chat_id, "message_id": dest.message_id}),
+    ))
+}
+
+/// `editMessageText` replacing the text of a message this bot sent. Telegram
+/// lets a bot edit its own messages after the 48 hours it may delete them in;
+/// notices cannot be edited.
+pub fn edit_request(message: &Message, bot: i64, text: &str) -> Result<Value, &'static str> {
+    let dest = destination(message, bot)?;
+    if message.metadata.get("ephemeral") == Some(&json!(true)) || dest.message_id <= 0 {
+        return Err("Expected a Telegram message to edit");
+    }
+    let mut payload = text_payload(Some(text))?;
+    payload["chat_id"] = json!(dest.chat_id);
+    payload["message_id"] = json!(dest.message_id);
+    Ok(payload)
+}
+
+/// Whether answers in this chat stream as drafts: private chats only.
+pub fn drafts_allowed(source: &Message) -> bool {
+    source.metadata.get("chat_type").and_then(Value::as_str) == Some("private")
+}
+
+/// `sendMessageDraft` showing `text` with a stop button; empty text shows Telegram's
+/// "Thinking…" placeholder.
+pub fn draft_request(dest: &Destination, draft_id: i64, text: &str) -> Value {
+    let mut payload = if text.trim().is_empty() {
+        json!({"text": ""})
+    } else {
+        text_payload(Some(text)).unwrap_or_else(|_| json!({"text": ""}))
+    };
+    payload["chat_id"] = json!(dest.chat_id);
+    if let Some(thread) = dest.thread_id {
+        payload["message_thread_id"] = json!(thread);
+    }
+    payload["draft_id"] = json!(draft_id);
+    payload["can_stop"] = json!(true);
+    payload
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+    use agentchat_core::Route;
+
+    fn source(chat_type: &str, chat: i64) -> Message {
+        let update = json!({"update_id": 1, "message": {"message_id": 7,
+            "chat": {"id": chat, "type": chat_type}, "from": {"id": 5, "is_bot": false, "first_name": "A"},
+            "text": "@bot hi", "entities": [{"type": "mention", "offset": 0, "length": 4}]}});
+        normalize(&update, 99, "bot").unwrap()
+    }
+
+    #[test]
+    fn routes_presses_commands_and_other_updates() {
+        let press = json!({"update_id": 1, "callback_query": {"id": "c", "data": "retry"}});
+        assert_eq!(
+            route(&press),
+            Some(Route::Action {
+                action_ids: vec!["retry".into()]
+            })
+        );
+        let token = agentchat_core::prompt_token("0123456789abcdef", "yes").unwrap();
+        assert_eq!(
+            route(&json!({"update_id": 1, "callback_query": {"id": "c", "data": token}})),
+            None
+        );
+        assert_eq!(
+            route(&json!({"update_id": 1, "message": {"text": "/start@bot go"}})),
+            Some(Route::Command {
+                command: "/start".into()
+            })
+        );
+        assert_eq!(
+            route(&json!({"update_id": 1, "message": {"text": "hello"}})),
+            None
+        );
+        assert_eq!(
+            route(&json!({"update_id": 1, "my_chat_member": {}})),
+            Some(Route::Event {
+                event_type: "my_chat_member".into()
+            })
+        );
+        assert_eq!(
+            allowed_updates(&["my_chat_member".into(), "message".into()], true),
+            [
+                "message",
+                "callback_query",
+                "stopped_message_generation",
+                "my_chat_member"
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_presses_stop_the_private_chat() {
+        let update = json!({"update_id": 9, "stopped_message_generation": {
+            "chat": {"id": 5, "type": "private"}, "draft_id": 42}});
+        let stop = normalize_stop(&update, 99).unwrap();
+        assert!(agentchat_core::is_stop_request(&stop));
+        assert_eq!(stop.conversation_id.as_ref(), "telegram:99:5");
+        assert_eq!(stop.sender.id, "5");
+        let mut group = update;
+        group["stopped_message_generation"]["chat"]["type"] = json!("group");
+        assert!(normalize_stop(&group, 99).is_none());
+    }
+
+    #[test]
+    fn notices_are_private_replies_or_ephemeral_group_messages() {
+        let private = source("private", 5);
+        assert!(matches!(
+            ephemeral_request(&private, 99, "5", "hi", None),
+            Ok(Ephemeral::Reply(_))
+        ));
+        assert!(ephemeral_request(&private, 99, "6", "hi", None).is_err());
+        let group = source("group", -100);
+        let Ok(Ephemeral::Ephemeral(request)) = ephemeral_request(&group, 99, "6", "hi", None)
+        else {
+            panic!("expected an ephemeral group message");
+        };
+        assert_eq!(
+            request["ephemeral_message_parameters"]["receiver_user_id"],
+            6
+        );
+        assert_eq!(request["chat_id"], -100);
+        assert!(ephemeral_request(&group, 99, "U6", "hi", None).is_err());
+        let notice = ephemeral_receipt(
+            &group,
+            99,
+            None,
+            "6",
+            "hi",
+            &json!({"ephemeral_message_id": 3}),
+        )
+        .unwrap();
+        assert_eq!(
+            delete_request(&notice, 99).unwrap(),
+            (
+                "deleteEphemeralMessage",
+                json!({"chat_id": -100, "receiver_user_id": 6, "ephemeral_message_id": 3})
+            )
+        );
+        assert_eq!(
+            delete_request(&group, 99).unwrap(),
+            ("deleteMessage", json!({"chat_id": -100, "message_id": 7}))
+        );
+        assert_eq!(
+            callback_answer(
+                "c",
+                &json!({"text": "Saved", "show_alert": true, "other": 1})
+            ),
+            json!({"callback_query_id": "c", "text": "Saved", "show_alert": true})
+        );
+        let dest = destination(&private, 99).unwrap();
+        let draft = draft_request(&dest, 42, "");
+        assert_eq!(
+            (
+                draft["draft_id"].clone(),
+                draft["can_stop"].clone(),
+                draft["text"].clone()
+            ),
+            (json!(42), json!(true), json!(""))
+        );
+        assert!(drafts_allowed(&private) && !drafts_allowed(&group));
+    }
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    #[test]
+    fn private_sources_pins_and_other_peoples_chats() {
+        let source = private_source(99, "30").unwrap();
+        assert!(private_source(99, "x").is_err() && private_source(99, "-5").is_err());
+        let dest = destination(&source, 99).unwrap();
+        let payload = dest.route(json!({"text": "hi"}), true);
+        assert_eq!(payload, json!({"text": "hi", "chat_id": 30}));
+        assert!(!private_chat_of_other(&source, "30") && private_chat_of_other(&source, "31"));
+        let chat = json!({"pinned_message": {"message_id": 7, "from": {"id": 99}}});
+        assert_eq!(pinned_home(&chat, 99), Some(7));
+        assert_eq!(pinned_home(&chat, 98), None);
+        assert_eq!(pin_request(30, 7)["disable_notification"], true);
+        let sent = receipt(&source, 99, None, "hi", &json!({"message_id": 8})).unwrap();
+        let edit = edit_request(&sent, 99, "(removed)").unwrap();
+        assert_eq!(
+            (edit["chat_id"].clone(), edit["message_id"].clone()),
+            (json!(30), json!(8))
+        );
+        assert!(edit_request(&source, 99, "x").is_err());
     }
 }

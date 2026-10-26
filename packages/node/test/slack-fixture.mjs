@@ -34,6 +34,10 @@ export async function slackFixture({ replyDelayMs = 0, statusClearDelayMs = 0, s
     else if (method === "chat.appendStream" || method === "chat.stopStream") result = { ok: true, channel: body.channel, ts: body.ts };
     else if (method === "chat.update") result = { ok: true, channel: body.channel, ts: body.ts };
     else if (method === "reactions.add") result = { ok: true };
+    else if (method === "chat.postEphemeral") result = { ok: true, message_ts: `400.${calls.length}` };
+    else if (method === "chat.delete") result = { ok: true, channel: body.channel, ts: body.ts };
+    else if (method === "agents.sessions.setStatus") result = { ok: true, status: body.status };
+    else if (method.startsWith("views.")) result = { ok: true, view: { id: "V1", ...body.view } };
     else if (method === "chat.getPermalink") result = { ok: true, permalink: "https://slack.example/message" };
     else if (method === "files.info") result = { ok: true, file: { id: "F1", name: "hello.txt", size: 5, mimetype: "text/plain", url_private_download: `http://127.0.0.1:${server.address().port}/files-pri/F1` } };
     else if (method === "files.getUploadURLExternal") result = { ok: true, file_id: "F2", upload_url: `http://127.0.0.1:${server.address().port}/upload/F2` };
@@ -86,6 +90,11 @@ export async function slackFixture({ replyDelayMs = 0, statusClearDelayMs = 0, s
           actions: [{ action_id: "agentchat", value, action_ts: ts }],
         },
       }));
+    },
+    /** Send any Socket Mode envelope. */
+    async envelope(envelope) {
+      const socket = await connection;
+      socket.send(JSON.stringify(envelope));
     },
     async close() {
       for (const socket of sockets) socket.terminate();

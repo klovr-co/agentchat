@@ -80,7 +80,7 @@ def harness(request):
         )
         channel._session = YCloudSession(receipt)
         source = ycloud_messages(ycloud_event(), phone_number="+15550001111")[0]
-        capabilities = {StatusChannel}
+        capabilities = {StatusChannel, RichReplyChannel}
     else:
         channel = WhatsApp(
             phone_number_id="123",
@@ -92,7 +92,7 @@ def harness(request):
         )
         channel._session = WhatsAppSession(receipt)
         source = whatsapp_messages(whatsapp_event(), phone_number_id="123")[0]
-        capabilities = {StatusChannel}
+        capabilities = {StatusChannel, RichReplyChannel}
     return SimpleNamespace(
         channel=channel, source=source, receipt=receipt, capabilities=capabilities,
     )

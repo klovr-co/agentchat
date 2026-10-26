@@ -1,6 +1,6 @@
 //! Python foreign-I/O adapter for the portable WhatsApp policies.
 use crate::prompts::PromptFields;
-use crate::{convert, host};
+use crate::{apps, convert, host};
 use agentchat_providers::whatsapp as policy;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -77,7 +77,7 @@ impl WhatsApp {
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self { payload: None }
     }
-    #[pyo3(signature=(*,phone_number_id,access_token,app_secret,verify_token,api_version="v23.0",host="127.0.0.1",port=3979,max_pending_events=64,shutdown_timeout=20.0,prompt_style="buttons"))]
+    #[pyo3(signature=(*,phone_number_id,access_token,app_secret,verify_token,api_version="v23.0",host="127.0.0.1",port=3979,max_pending_events=64,shutdown_timeout=20.0,prompt_style="buttons",task_messages=false))]
     #[allow(clippy::too_many_arguments)]
     fn initialize(
         slf: Py<Self>,
@@ -92,6 +92,7 @@ impl WhatsApp {
         max_pending_events: i64,
         shutdown_timeout: f64,
         prompt_style: &str,
+        task_messages: bool,
     ) -> PyResult<()> {
         if !matches!(prompt_style, "reactions" | "buttons") {
             return Err(PyValueError::new_err(
@@ -131,6 +132,7 @@ impl WhatsApp {
         state.set_item("_session", py.None())?;
         state.set_item("_runner", py.None())?;
         state.set_item("_prompt_style", prompt_style)?;
+        state.set_item("_task_messages", task_messages)?;
         // Reaction prompts by sent message ID: {"prompt": id, "choices": [[emoji, id], …]}.
         state.set_item("_reaction_prompts", PyDict::new(py))?;
         state.set_item(
@@ -145,6 +147,120 @@ impl WhatsApp {
     #[classattr]
     fn name() -> &'static str {
         "whatsapp"
+    }
+    /// Handle webhook items AgentChat does not turn into messages, by type:
+    /// "status" for delivery updates, "reaction", or a message type such as
+    /// "location". The handler receives the change `value` holding that one item.
+    fn on_event(slf: &Bound<'_, Self>, event_type: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "event", event_type)
+    }
+    /// Handle button and list replies (and template quick replies) whose ID matches,
+    /// instead of passing them to the message handler.
+    fn on_action(slf: &Bound<'_, Self>, action_id: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "action", action_id)
+    }
+    /// Handle WhatsApp Flow responses whose `flow_token` matches.
+    fn on_view(slf: &Bound<'_, Self>, callback_id: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "view", callback_id)
+    }
+    /// Handle text messages starting with this command, such as "/start".
+    fn on_command(slf: &Bound<'_, Self>, command: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::decorator(slf.as_any(), "command", command)
+    }
+    /// Handle every other routed item.
+    fn on_raw(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        apps::raw(slf.as_any(), handler)
+    }
+    /// Send one Cloud API `interactive` message (buttons, a list, a CTA URL or a
+    /// Flow) given as the only entry of `content.blocks`; `content.text` is kept as
+    /// the message's text.
+    fn reply_rich(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        content: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let rich = convert::from_rich_reply(content.bind(py))?;
+        let interactive = policy::interactive_object(&rich).map_err(PyValueError::new_err)?;
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let source_host = source;
+            let source = Python::attach(|py| convert::from_message(source_host.bind(py)))?;
+            let phone = extract::<String>(&get(&this, "_phone_number_id")?)?;
+            let destination =
+                policy::destination(&source, &phone).map_err(PyValueError::new_err)?;
+            let payload = policy::interactive_payload(
+                &destination.recipient,
+                &destination.message_id,
+                interactive,
+            );
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            let result = graph_post(&this, &phone, payload, "send").await?;
+            let message = policy::receipt(&source, &phone, &rich.text, &value(&result)?)
+                .map_err(PyRuntimeError::new_err)?;
+            receipt_with_metadata(&source_host, &message)
+        })
+    }
+    /// With `task_messages=True`, each task that finishes in `reply.task()` is a
+    /// short reply, at most five per answer; WhatsApp messages cannot be edited or
+    /// deleted, so nothing is shown otherwise.
+    fn update_stream_tasks(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        stream: Py<PyAny>,
+        updates: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let enabled = slf.bind(py).getattr("_task_messages")?.is_truthy()?;
+        host::coroutine(py, async move {
+            crate::stream::finished_task_replies(
+                slf.into_any(),
+                enabled,
+                source,
+                stream,
+                updates,
+                "agentchat.channels.whatsapp.adapter",
+            )
+            .await
+        })
+    }
+    /// WhatsApp has no home screen and cannot edit messages: each call sends `view`
+    /// (text) to `user_id` as a new message. WhatsApp delivers it only within 24
+    /// hours of that person's last message.
+    fn publish_home(
+        slf: Py<Self>,
+        py: Python<'_>,
+        user_id: String,
+        view: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let phone = slf
+            .bind(py)
+            .getattr("_phone_number_id")?
+            .extract::<String>()?;
+        let source = policy::direct_source(&phone, &user_id).map_err(PyValueError::new_err)?;
+        let source = convert::to_message(py, &source)?;
+        Ok(slf.bind(py).call_method1("reply", (source, view))?.unbind())
+    }
+    /// WhatsApp chats are one-to-one, so a notice for the person this conversation
+    /// is with is an ordinary reply; any other recipient raises ValueError.
+    #[pyo3(signature=(source,user_id,text,*,blocks=None))]
+    fn send_ephemeral(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source: Py<PyAny>,
+        user_id: String,
+        text: String,
+        blocks: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        if blocks.is_some_and(|b| !b.is_none(py)) {
+            return Err(PyValueError::new_err("WhatsApp notices are text only"));
+        }
+        if !policy::private_reply_allowed(&convert::from_message(source.bind(py))?, &user_id) {
+            return Err(PyValueError::new_err(
+                "A WhatsApp chat can only show notices to the person it is with",
+            ));
+        }
+        Ok(slf.bind(py).call_method1("reply", (source, text))?.unbind())
     }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(payload) = self.payload.as_deref() {
@@ -348,6 +464,37 @@ impl WhatsApp {
                 policy::reactions(&payload, &phone),
             )?);
             let delivery = get(&this, "_delivery")?;
+            // Items the application handles; presses, Flow replies and commands it
+            // handles never also become messages.
+            let mut handled = std::collections::HashSet::new();
+            for item in policy::app_items(&payload, &phone) {
+                let handler = Python::attach(|py| apps::find(this.bind(py), &item.route))?;
+                let Some(handler) = handler else { continue };
+                let payload = j(item.payload)?;
+                // A text answer to a press, Flow reply or command is sent as a reply.
+                let source = item
+                    .source
+                    .filter(|_| !matches!(item.route, agentchat_core::Route::Event { .. }));
+                if !Python::attach(|py| match source {
+                    Some(source) => apps::spawn_replying(
+                        this.bind(py),
+                        delivery.bind(py),
+                        &handler,
+                        &payload,
+                        convert::to_message(py, &source)?,
+                    ),
+                    None => apps::spawn(this.bind(py), delivery.bind(py), &handler, &payload),
+                })? {
+                    return Err(fail_response(
+                        "HTTPServiceUnavailable",
+                        "WhatsApp receiver is busy",
+                    ));
+                }
+                if !matches!(item.route, agentchat_core::Route::Event { .. }) {
+                    handled.extend(item.message_id);
+                }
+            }
+            messages.retain(|message| !handled.contains(message.id.as_ref()));
             let busy = Python::attach(|py| -> PyResult<bool> {
                 Ok(delivery.bind(py).getattr("closed")?.extract::<bool>()?
                     || delivery.bind(py).getattr("tasks")?.len()? + messages.len()

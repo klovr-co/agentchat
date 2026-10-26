@@ -130,6 +130,107 @@ pub fn normalize(event: &Value, instance_id: &str) -> Option<Message> {
         attachments,
     })
 }
+/// Whether a chat is one-to-one (`iMessage;-;…`) rather than a group (`iMessage;+;…`).
+pub fn is_direct(chat_guid: &str) -> bool {
+    chat_guid.starts_with("iMessage;-;")
+}
+
+/// Whether `text` is exactly the configured stop keyword, ignoring case and spaces.
+pub fn is_stop_keyword(text: &str, keyword: Option<&str>) -> bool {
+    keyword
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .is_some_and(|keyword| text.trim().eq_ignore_ascii_case(keyword))
+}
+
+/// The message as a stop request for its conversation, from its sender.
+pub fn stop_request(message: &Message) -> Message {
+    let mut stop = message.clone();
+    stop.id = format!("{}:stop", message.id).into();
+    stop.text = String::new();
+    stop.attachments.clear();
+    stop.metadata
+        .insert(agentchat_core::STOP_METADATA.into(), json!(true));
+    stop
+}
+
+/// The one-to-one chat with `address`.
+pub fn direct_chat(address: &str) -> String {
+    format!("iMessage;-;{address}")
+}
+
+/// A source for messages sent to the one-to-one chat with `address`, which need
+/// not have written first. It has no message of its own to quote.
+pub fn direct_source(instance_id: &str, address: &str) -> Result<Message, &'static str> {
+    if strip(address).is_empty() || address.contains(';') {
+        return Err("Expected an iMessage address");
+    }
+    let chat = direct_chat(address);
+    Ok(Message {
+        id: format!("imessage:{}:direct:{}", quote(instance_id), quote(address)).into(),
+        conversation_id: format!("imessage:{}:{}", quote(instance_id), quote(&chat)).into(),
+        channel: "imessage".into(),
+        sender: Sender {
+            id: address.into(),
+            display_name: None,
+        },
+        text: String::new(),
+        role: Role::User,
+        metadata: json!({"instance_id": instance_id, "chat_guid": chat, "message_guid": ""})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        thread_id: None,
+        addressed: true,
+        attachments: Vec::new(),
+    })
+}
+
+/// Apple allows five edits of a message within fifteen minutes of sending it, and
+/// unsending within two minutes.
+pub const MAX_EDITS: u64 = 5;
+pub const EDIT_WINDOW: f64 = 15.0 * 60.0;
+
+/// The GUID of a message this adapter sent, for editing or unsending it.
+pub fn sent_guid<'a>(message: &'a Message, instance: &str) -> Result<&'a str, &'static str> {
+    let invalid = "Expected an iMessage message this adapter sent";
+    if message.channel != "imessage"
+        || message.role != Role::Assistant
+        || message.metadata.get("instance_id").and_then(Value::as_str) != Some(instance)
+    {
+        return Err(invalid);
+    }
+    message
+        .metadata
+        .get("message_guid")
+        .and_then(Value::as_str)
+        .filter(|guid| !guid.is_empty())
+        .ok_or(invalid)
+}
+
+/// `POST` here unsends a message (BlueBubbles Private API).
+pub fn unsend_path(guid: &str) -> String {
+    format!("/api/v1/message/{}/unsend", quote(guid))
+}
+
+pub fn unsend_request() -> Value {
+    json!({"partIndex": 0})
+}
+
+/// `POST` here edits a message's text (BlueBubbles Private API, macOS 13 or later).
+pub fn edit_path(guid: &str) -> String {
+    format!("/api/v1/message/{}/edit", quote(guid))
+}
+
+/// Devices too old to show edits get `backwardsCompatibilityMessage` instead.
+pub fn edit_request(text: &str) -> Value {
+    json!({
+        "editedMessage": text,
+        "backwardsCompatibilityMessage": format!("Edited to \u{201c}{text}\u{201d}"),
+        "partIndex": 0,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Destination {
     pub instance_id: String,
@@ -228,6 +329,40 @@ pub fn receipt(response: &Value) -> Result<&str, &'static str> {
         .filter(|v| !v.is_empty())
         .ok_or("BlueBubbles did not return a successful message receipt")
 }
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn direct_chats_and_stop_keywords() {
+        assert!(is_direct("iMessage;-;+1555") && !is_direct("iMessage;+;chat1"));
+        assert!(is_stop_keyword(" STOP ", Some("stop")));
+        assert!(!is_stop_keyword("stop now", Some("stop")) && !is_stop_keyword("stop", None));
+        let event = json!({"isFromMe": false, "guid": "g", "handle": {"address": "alice"},
+            "chats": [{"guid": "iMessage;-;alice"}], "text": "stop"});
+        let stop = stop_request(&normalize(&event, "mac").unwrap());
+        assert!(agentchat_core::is_stop_request(&stop));
+        assert_eq!(stop.sender.id, "alice");
+    }
+
+    #[test]
+    fn direct_chats_edits_and_unsends() {
+        let source = direct_source("mac", "+1555").unwrap();
+        assert_eq!(source.metadata["chat_guid"], "iMessage;-;+1555");
+        assert!(direct_source("mac", "a;b").is_err() && direct_source("mac", " ").is_err());
+        let route = Destination::from_source(&source, "mac", None).unwrap();
+        let sent = route.confirmed_reply(&source, "hi".into(), "g/1").unwrap();
+        assert_eq!(sent_guid(&sent, "mac"), Ok("g/1"));
+        assert!(sent_guid(&source, "mac").is_err() && sent_guid(&sent, "other").is_err());
+        assert_eq!(unsend_path("g/1"), "/api/v1/message/g%2F1/unsend");
+        assert_eq!(edit_path("g"), "/api/v1/message/g/edit");
+        assert_eq!(
+            edit_request("x")["backwardsCompatibilityMessage"],
+            "Edited to \u{201c}x\u{201d}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

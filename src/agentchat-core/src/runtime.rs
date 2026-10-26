@@ -8,9 +8,10 @@ use async_trait::async_trait;
 
 use crate::control::{Arrival, Control, PendingPrompt};
 use crate::{
-    answer_of, Allowed, Answer, AnswerStream, Attachment, Busy, Channel, Choice, ChoiceStyle,
-    ConversationId, DownloadedFile, Error, MemoryState, Message, MessageContext, Prompt, Result,
-    RichReply, Role, State, Turn, TurnControl, TurnEffect, TurnResult, UploadFile, UploadedFile,
+    answer_of, is_stop_request, Allowed, Answer, AnswerStream, Attachment, Busy, Channel, Choice,
+    ChoiceStyle, ConversationId, DownloadedFile, Error, MemoryState, Message, MessageContext,
+    Prompt, Result, RichReply, Role, State, Turn, TurnControl, TurnEffect, TurnResult, UploadFile,
+    UploadedFile,
 };
 
 /// An application handler; callbacks remain application-owned, never model-owned.
@@ -192,6 +193,11 @@ impl AgentChat {
         if let Some((prompt, choice)) = answer_of(&message) {
             return self.resolve(&message, &prompt, &choice).await;
         }
+        // So does a provider's own stop control.
+        if is_stop_request(&message) {
+            self.stop_from(&message);
+            return Ok(());
+        }
         let arrival = self.control().arrival(
             self.busy,
             &message.conversation_id,
@@ -224,9 +230,11 @@ impl AgentChat {
         let mut waiting = Vec::new();
         let mut first_error = None;
         loop {
-            let control = self
-                .control()
-                .start(&conversation, std::mem::take(&mut waiting));
+            let control = self.control().start(
+                &conversation,
+                std::mem::take(&mut waiting),
+                &current.sender.id,
+            );
             let guard = RunningGuard {
                 app: self,
                 conversation: &conversation,
@@ -491,6 +499,18 @@ impl AgentChat {
         }
     }
 
+    /// Apply a provider stop request: it stops the running turn only when sent by
+    /// the person whose message started it, like a default Stop button.
+    fn stop_from(&self, request: &Message) -> bool {
+        match self.control().running(&request.conversation_id) {
+            Some(turn) if turn.starter() == request.sender.id => {
+                turn.stop();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The control of the conversation's running handler, if one is running.
     pub fn running(&self, conversation: &ConversationId) -> Option<TurnControl> {
         self.control().running(conversation)
@@ -572,6 +592,29 @@ impl AgentChat {
         status: &str,
     ) -> Result<bool> {
         channel.set_status(source, status).await
+    }
+
+    /// Post a notice only `user_id` can see in `source`'s conversation. It is not
+    /// added to history. Fails with [`Error::Unsupported`] on channels without
+    /// private notices; it is never sent publicly instead.
+    pub async fn send_ephemeral(
+        &self,
+        channel: Arc<dyn Channel>,
+        source: &Message,
+        user_id: &str,
+        content: &RichReply,
+    ) -> Result<Message> {
+        if user_id.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "An ephemeral message needs a recipient".into(),
+            ));
+        }
+        channel.send_ephemeral(source, user_id, content).await
+    }
+
+    /// Delete a message this application sent. History keeps it.
+    pub async fn delete(&self, channel: Arc<dyn Channel>, message: &Message) -> Result<()> {
+        channel.delete(message).await
     }
 
     pub async fn mirror(
