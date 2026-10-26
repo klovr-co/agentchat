@@ -440,6 +440,42 @@ impl IMessage {
         }
         Ok(client.call_method1("unsend", (guid,))?.unbind())
     }
+    /// Replace the text of a message this adapter sent. Needs the BlueBubbles
+    /// Private API; Apple allows five edits within fifteen minutes of sending, and
+    /// the chat marks the message as edited.
+    fn edit(slf: Py<Self>, py: Python<'_>, message: Object, text: String) -> Output {
+        let text = imessage_text_payload(text.into_pyobject(py)?.as_any())?;
+        let sent = convert::from_message(message.bind(py))?;
+        let (guid, destination, client) = {
+            let this = slf.borrow(py);
+            let guid = policy::sent_guid(&sent, &this._instance_id)
+                .map_err(PyValueError::new_err)?
+                .to_owned();
+            let destination = this.destination(py, &sent)?;
+            let client = this._client.clone_ref(py);
+            if !client.bind(py).hasattr("edit_text")? {
+                return Err(PyTypeError::new_err(
+                    "This BlueBubbles client cannot edit messages",
+                ));
+            }
+            (guid, destination, client)
+        };
+        host::coroutine(py, async move {
+            let args = Python::attach(|py| {
+                Ok::<_, PyErr>(vec![
+                    guid.clone().into_pyobject(py)?.into_any().unbind(),
+                    text.clone().into_pyobject(py)?.into_any().unbind(),
+                ])
+            })?;
+            call(client, "edit_text", args, vec![]).await?;
+            super::transport::receipt_with_metadata(
+                &message,
+                &destination
+                    .confirmed_reply(&sent, text, &guid)
+                    .map_err(PyRuntimeError::new_err)?,
+            )
+        })
+    }
     /// Seconds between task progress edits: Apple allows five edits of a message.
     #[classattr]
     fn stream_interval() -> f64 {

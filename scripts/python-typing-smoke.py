@@ -6,7 +6,7 @@ scripts/python-typing-smoke.py, using the project environment's Python executabl
 
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, assert_type
+from typing import Any, Literal, assert_type
 
 from agentchat import AgentChat, Conversation, Message, MessageContext, Sender
 from agentchat.activity import WorkingStatus
@@ -47,7 +47,8 @@ async def check_api(
     assert_type(await slack.get_user("U123"), SlackUser)
     assert_type(await context.reply_ephemeral("only you"), Message)
     assert_type(await app.send_ephemeral(slack, message, "U123", "only you"), Message)
-    assert_type(await app.delete(slack, message), None)
+    assert_type(await app.delete(slack, message), Literal["deleted", "edited", "noticed"])
+    assert_type(await app.edit(telegram, message, "(removed)"), Message)
     assert_type(await slack.open_view("1.2.3", {"type": "modal"}), dict[str, Any])
     assert_type(await slack.publish_home("U123", {"type": "home"}), dict[str, Any])
 

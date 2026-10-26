@@ -258,3 +258,32 @@ async def test_a_chat_form_offers_buttons_for_choices_and_takes_text_replies():
     finally:
         await channel.close()
         await task
+
+
+class OldMessageClient(Client):
+    """Refuses to delete, as for a message older than 48 hours."""
+
+    async def call(self, method, payload=None, **options):
+        if method == "deleteMessage":
+            self.calls.append((method, payload))
+            raise TelegramError("Bad Request: message can't be deleted", error_code=400)
+        return await super().call(method, payload, **options)
+
+
+@pytest.mark.asyncio
+async def test_a_message_that_cannot_be_deleted_is_edited_when_asked():
+    client = OldMessageClient()
+    channel = faked(client)
+    app = AgentChat(channels=[channel])
+    await channel._load_bot_identity()
+    sent = await channel.reply(channel._normalize(telegram_update()), "Old news")
+    with pytest.raises(TelegramError):
+        await app.delete(channel, sent)
+    assert await app.delete(channel, sent, fallback="edit") == "edited"
+    edit = client.method_calls("editMessageText")[-1]
+    assert (edit["text"], edit["chat_id"], edit["message_id"]) == (
+        "(This message was removed.)", 30, 101)
+    edited = await app.edit(channel, sent, "Corrected")
+    assert edited.text == "Corrected" and edited.id == sent.id
+    with pytest.raises(ValueError):
+        await app.delete(channel, sent, fallback="hide")

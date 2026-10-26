@@ -603,6 +603,45 @@ impl Discord {
             Ok(sent)
         })
     }
+    /// Replace the text of a message this bot sent.
+    fn edit(slf: Py<Self>, py: Python<'_>, message: Py<PyAny>, text: String) -> Output {
+        let text = discord_text_payload(text.into_pyobject(py)?.as_any())?;
+        let sent = convert::from_message(message.bind(py))?;
+        let (destination, sender, display_name) = {
+            let this = slf.borrow(py);
+            let bot = this._client.bind(py).getattr("user")?;
+            if bot.is_none() {
+                return Err(PyValueError::new_err(
+                    "Source does not belong to this Discord adapter",
+                ));
+            }
+            let destination =
+                policy::Destination::from_source(&sent, bot.getattr("id")?.extract()?)
+                    .map_err(PyValueError::new_err)?;
+            if destination.message_id == 0 || sent.role != agentchat_core::Role::Assistant {
+                return Err(PyValueError::new_err("Expected a Discord message to edit"));
+            }
+            (
+                destination,
+                this._sender.clone_ref(py),
+                bot.getattr("display_name")?.extract::<Option<String>>()?,
+            )
+        };
+        host::coroutine(py, async move {
+            let payload = Python::attach(|py| {
+                convert::from_json(py, &policy::Destination::edit_payload(&text, false))
+            })?;
+            let (channel_id, message_id) = (destination.channel_id, destination.message_id);
+            sender_call(&sender, "edit_text", |py| {
+                (channel_id, message_id, payload).into_pyobject(py)
+            })
+            .await?;
+            let edited = destination
+                .confirmed_reply(&sent, text, message_id, display_name)
+                .map_err(PyRuntimeError::new_err)?;
+            super::transport::receipt_with_metadata(&message, &edited)
+        })
+    }
     /// Delete a message this bot sent.
     fn delete(slf: Py<Self>, py: Python<'_>, message: Py<PyAny>) -> Output {
         let (path, sender) = {

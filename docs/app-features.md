@@ -13,7 +13,7 @@ instead of doing something else.
 | Forms and modals | `open_view`, `push_view`, `update_view` | Fallback: chat form (`open_form`), choices as buttons | Modal as the interaction response | Dialog as the `task/fetch` invoke response | WhatsApp Flows: `reply_rich` with a Flow, `on_view(flow_token)` | Fallback: chat form (`open_form`), numbered choices |
 | Home screen (`publish_home`) | App Home tab | Fallback: a pinned message in the private chat, edited in place | Fallback: a pinned direct message, edited in place | Fallback: a message in the one-to-one chat, updated in place, once the person has messaged the app | Fallback: a new message each time, within 24 hours of their last message | Fallback: a message in the one-to-one chat, edited while Apple allows |
 | Private notices (`send_ephemeral`, `reply_ephemeral`) | `chat.postEphemeral` | Ephemeral messages in groups; a reply in a private chat; `fallback="dm"` sends a refused notice to the private chat | A reply in a direct message; a private interaction response; `fallback="dm"` sends a direct message | Targeted messages; a reply in a one-to-one chat | A reply (chats are one-to-one) | A reply in a one-to-one chat; `fallback="dm"` in groups sends to the one-to-one chat |
-| Delete a sent message (`app.delete`) | `chat.delete` | `deleteMessage` (48 hours), `deleteEphemeralMessage` | Delete message | Delete activity | Not possible: no API deletes a sent message | Fallback: unsend (Private API, within 2 minutes) |
+| Delete a sent message (`app.delete`) | `chat.delete` | `deleteMessage` (48 hours), `deleteEphemeralMessage`; `fallback="edit"` replaces older messages' text | Delete message | Delete activity | Not possible; `fallback="notice"` replies with a correction | Fallback: unsend (Private API, within 2 minutes); `fallback="edit"` replaces the text within 15 minutes |
 | Task and plan progress (`reply.task()`, `reply.plan()`) | Native task cards or plan | A progress message, edited, then removed | A progress message, edited, then removed | Informative stream updates in one-to-one chats; a progress message elsewhere | Fallback: with `task_messages=True`, a short reply per finished task (up to 5) | Fallback: a progress message, edited in place (Private API, 5 edits) |
 | Provider's own stop control | Native stop button | Stop button on drafts (`stream_drafts=True`, private chats) | Fallback: the Stop button from `offer_stop()` | Stop button on streamed answers in one-to-one chats | Fallback: the Stop button from `offer_stop()` | Optional stop keyword (`stop_keyword=`) |
 
@@ -203,13 +203,39 @@ instead; this is never done after an error that leaves delivery uncertain.
 
 ## Deleting messages
 
-`await app.delete(channel, message)` deletes a message the application sent;
-history keeps it. Slack, Telegram (messages up to 48 hours old, and notices),
-Discord and Teams support it. iMessage unsends the message through the
-BlueBubbles Private API; Apple allows that within two minutes of sending, and the
-chat shows that a message was unsent. WhatsApp and YCloud have no way to delete
-a sent message and raise `TypeError`; use the typing indicator instead of a
-temporary message there.
+`await app.delete(channel, message)` deletes a message the application sent and
+returns `"deleted"`; history keeps it. Slack, Telegram (messages up to 48 hours
+old, and notices), Discord and Teams support it. iMessage unsends the message
+through the BlueBubbles Private API; Apple allows that within two minutes of
+sending, and the chat shows that a message was unsent. WhatsApp and YCloud have no
+way to delete a sent message and raise `TypeError`; use the typing indicator
+instead of a temporary message there.
+
+Where a message cannot be deleted, `fallback` hides it as well as the channel can,
+and the result says what happened:
+
+```python
+outcome = await app.delete(channel, sent, fallback="notice")
+# "deleted", "edited" (text replaced) or "noticed" (a correction was sent)
+```
+
+- `fallback="edit"`: when the delete is refused, or the channel cannot delete,
+  replace the message's text with `text` (default "(This message was removed.)").
+  This covers Telegram messages older than 48 hours (bots can still edit their
+  own messages) and iMessage messages between two and fifteen minutes old (Apple
+  allows five edits within fifteen minutes). People can see that the message was
+  edited, and on iMessage they can open the earlier text.
+- `fallback="notice"`: the same, and on channels that can neither delete nor
+  edit (WhatsApp and YCloud) reply to the message with `text` (default "Please
+  disregard my previous message."). The original stays visible.
+- A failed delete is followed only by an edit, never by a notice: when the
+  outcome is uncertain, an edit of a deleted message just fails, while a notice
+  could correct a message that is already gone. If the edit fails too, the
+  delete's error is raised.
+
+`await app.edit(channel, message, text)` replaces the text of a message the
+application sent on Telegram, Discord, Teams and iMessage; history keeps the
+original. Slack is not covered yet, since it can always delete.
 
 ## Task progress where there are no task cards
 

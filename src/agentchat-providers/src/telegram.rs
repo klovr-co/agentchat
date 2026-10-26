@@ -1175,6 +1175,20 @@ pub fn delete_request(message: &Message, bot: i64) -> Result<(&'static str, Valu
     ))
 }
 
+/// `editMessageText` replacing the text of a message this bot sent. Telegram
+/// lets a bot edit its own messages after the 48 hours it may delete them in;
+/// notices cannot be edited.
+pub fn edit_request(message: &Message, bot: i64, text: &str) -> Result<Value, &'static str> {
+    let dest = destination(message, bot)?;
+    if message.metadata.get("ephemeral") == Some(&json!(true)) || dest.message_id <= 0 {
+        return Err("Expected a Telegram message to edit");
+    }
+    let mut payload = text_payload(Some(text))?;
+    payload["chat_id"] = json!(dest.chat_id);
+    payload["message_id"] = json!(dest.message_id);
+    Ok(payload)
+}
+
 /// Whether answers in this chat stream as drafts: private chats only.
 pub fn drafts_allowed(source: &Message) -> bool {
     source.metadata.get("chat_type").and_then(Value::as_str) == Some("private")
@@ -1339,5 +1353,12 @@ mod direct_tests {
         assert_eq!(pinned_home(&chat, 99), Some(7));
         assert_eq!(pinned_home(&chat, 98), None);
         assert_eq!(pin_request(30, 7)["disable_notification"], true);
+        let sent = receipt(&source, 99, None, "hi", &json!({"message_id": 8})).unwrap();
+        let edit = edit_request(&sent, 99, "(removed)").unwrap();
+        assert_eq!(
+            (edit["chat_id"].clone(), edit["message_id"].clone()),
+            (json!(30), json!(8))
+        );
+        assert!(edit_request(&source, 99, "x").is_err());
     }
 }

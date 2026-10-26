@@ -155,6 +155,13 @@ class DeletingChannel(Protocol):
 
 
 @runtime_checkable
+class EditingChannel(Protocol):
+    """Optional replacement of the text of a message this application sent."""
+
+    async def edit(self, message: Message, text: str) -> Message: ...
+
+
+@runtime_checkable
 class InteractiveChannel(Protocol):
     """Optional questions with buttons, for approvals and choices.
 

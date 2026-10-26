@@ -984,6 +984,27 @@ impl Teams {
             super::transport::receipt_with_metadata(&source, &home)
         })
     }
+    /// Replace the text of a message this app sent.
+    fn edit(slf: Py<Self>, py: Python<'_>, message: Object, text: String) -> Output {
+        let text = teams_text_payload(text.into_pyobject(py)?.as_any())?;
+        let id = convert::from_message(message.bind(py))?
+            .metadata
+            .get("activity_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| PyValueError::new_err("Expected a Teams message to edit"))?;
+        host::coroutine(py, async move {
+            let mut activity = policy::text_activity(&text);
+            activity["id"] = json!(id);
+            let (sent, destination, _) =
+                send_activity(&slf, &message, activity, Send::Update).await?;
+            let edited = destination
+                .confirmed_reply(&sent, text, &id)
+                .map_err(PyRuntimeError::new_err)?;
+            super::transport::receipt_with_metadata(&message, &edited)
+        })
+    }
     /// Delete a message this app sent.
     fn delete(slf: Py<Self>, py: Python<'_>, message: Object) -> Output {
         let id = convert::from_message(message.bind(py))?

@@ -163,6 +163,10 @@ async def test_notices_fall_back_to_a_direct_message_and_home_is_a_pinned_dm():
     channel_id, payload = client.receipt.calls[-1][0]
     assert channel_id == 530 and "message_reference" not in payload
     assert notice.metadata["channel_id"] == 530
+    edited = await app.edit(channel, notice, "Changed")
+    assert edited.text == "Changed" and client.edits[-1] == (530, 101, "Changed")
+    with pytest.raises(ValueError):
+        await app.edit(channel, guild, "Not ours")
 
     home = await channel.publish_home("30", "Welcome")
     assert client.pins_listed == [530] and client.pinned == [(530, 101)]

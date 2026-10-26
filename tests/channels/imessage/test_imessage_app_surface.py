@@ -138,8 +138,13 @@ async def test_unsend_progress_edits_and_notices_by_direct_message():
     group = normalize(imessage_event(chats=[{"guid": "iMessage;+;chat1"}]), instance_id="mac")
 
     sent = await channel.reply(direct, "Temporary")
-    await app.delete(channel, sent)
+    assert await app.delete(channel, sent) == "deleted"
     assert client.unsent == ["g1"]
+    # Past Apple's two minutes the unsend fails; the message can still be edited.
+    client.unsend = lambda guid: (_ for _ in ()).throw(RuntimeError("too late"))
+    assert await app.delete(channel, sent, fallback="notice", text="(gone)") == "edited"
+    assert client.edits[-1] == ("g1", "(gone)")
+    del client.unsend
     with pytest.raises(ValueError):
         await app.delete(channel, direct)
 

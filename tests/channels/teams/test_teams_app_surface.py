@@ -216,4 +216,6 @@ async def test_home_message_needs_a_one_to_one_chat_then_updates_in_place():
     assert again.id == home.id
     assert connector.updated[-1][0] == home.metadata["activity_id"]
     assert connector.updated[-1][1].text == "Welcome back"
+    edited = await AgentChat(channels=[channel]).edit(channel, home, "Edited")
+    assert edited.text == "Edited" and connector.updated[-1][1].text == "Edited"
     await channel.close()

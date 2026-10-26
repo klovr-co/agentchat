@@ -33,6 +33,10 @@ pub async fn call(
     })?;
     await_py(pending).await
 }
+/// What a message hidden by `delete(fallback="edit")` says instead.
+const REMOVED_TEXT: &str = "(This message was removed.)";
+/// The reply `delete(fallback="notice")` sends where nothing can hide a message.
+const NOTICE_TEXT: &str = "Please disregard my previous message.";
 fn capability(py: Python<'_>, channel: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
     channel.is_instance(&py.import("agentchat.channels.base")?.getattr(name)?)
 }
@@ -412,19 +416,106 @@ impl AgentChat {
             .await
         })
     }
-    /// Delete a message this application sent. History keeps it. Channels that
-    /// cannot delete raise `TypeError`.
-    fn delete(&self, py: Python<'_>, channel: Object, message: Object) -> PyResult<Object> {
+    /// Delete a message this application sent; returns `"deleted"`. History keeps
+    /// it. Channels that cannot delete raise `TypeError`, and a refused delete
+    /// raises. Where a message cannot be deleted, `fallback` hides it instead:
+    /// `"edit"` replaces its text with `text` on channels that can edit, and
+    /// `"notice"` also sends `text` as a reply to it on channels that can neither
+    /// delete nor edit (returning `"edited"` or `"noticed"`). A notice is never
+    /// sent after a failed delete or edit, whose outcome may be uncertain.
+    #[pyo3(signature=(channel,message,*,fallback=None,text=None))]
+    fn delete(
+        &self,
+        py: Python<'_>,
+        channel: Object,
+        message: Object,
+        fallback: Option<String>,
+        text: Option<String>,
+    ) -> PyResult<Object> {
+        let fallback = match fallback.as_deref() {
+            None => None,
+            Some(mode @ ("edit" | "notice")) => Some(mode.to_owned()),
+            Some(_) => {
+                return Err(PyValueError::new_err(
+                    "fallback must be None, \"edit\" or \"notice\"",
+                ))
+            }
+        };
+        let (deleting, editing) = (
+            capability(py, channel.bind(py), "DeletingChannel")?,
+            capability(py, channel.bind(py), "EditingChannel")?,
+        );
+        let outcome = |name: &str| {
+            Python::attach(|py| Ok::<Object, PyErr>(name.into_pyobject(py)?.into_any().unbind()))
+        };
         coroutine(py, async move {
-            Python::attach(|py| -> PyResult<()> {
-                if !capability(py, channel.bind(py), "DeletingChannel")? {
-                    return Err(PyTypeError::new_err(
-                        "This channel does not support deleting messages",
-                    ));
+            let replacement = |default: &str| {
+                Python::attach(|py| {
+                    text.as_deref()
+                        .unwrap_or(default)
+                        .into_pyobject(py)
+                        .map(|t| t.into_any().unbind())
+                })
+            };
+            if deleting {
+                let deleted = call(copy(&channel), "delete", vec![copy(&message)], vec![]).await;
+                return match deleted {
+                    Ok(_) => outcome("deleted"),
+                    // Editing a message that was deleted after all only fails.
+                    Err(error) if fallback.is_some() && editing => {
+                        let text = replacement(REMOVED_TEXT)?;
+                        match call(channel, "edit", vec![message, text], vec![]).await {
+                            Ok(_) => outcome("edited"),
+                            Err(_) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            match fallback.as_deref() {
+                Some(_) if editing => {
+                    call(
+                        channel,
+                        "edit",
+                        vec![message, replacement(REMOVED_TEXT)?],
+                        vec![],
+                    )
+                    .await?;
+                    outcome("edited")
                 }
-                Ok(())
-            })?;
-            call(channel, "delete", vec![message], vec![]).await
+                Some("notice") => {
+                    call(
+                        channel,
+                        "reply",
+                        vec![message, replacement(NOTICE_TEXT)?],
+                        vec![],
+                    )
+                    .await?;
+                    outcome("noticed")
+                }
+                _ => Err(PyTypeError::new_err(
+                    "This channel does not support deleting messages",
+                )),
+            }
+        })
+    }
+    /// Replace the text of a message this application sent; returns the edited
+    /// message. History keeps the original. Channels that cannot edit raise
+    /// `TypeError`.
+    fn edit(
+        &self,
+        py: Python<'_>,
+        channel: Object,
+        message: Object,
+        text: Object,
+    ) -> PyResult<Object> {
+        if !capability(py, channel.bind(py), "EditingChannel")? {
+            return Err(PyTypeError::new_err(
+                "This channel does not support editing messages",
+            ));
+        }
+        coroutine(py, async move {
+            call(channel, "edit", vec![message, text], vec![]).await
         })
     }
     /// Ask `form` of `source`'s sender in its conversation, one field at a time,

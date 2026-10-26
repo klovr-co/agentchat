@@ -123,6 +123,13 @@ async def test_whatsapp_sends_flows_as_rich_replies_and_notices_as_replies(monke
             await app.send_ephemeral(channel, source, "15550000000", "Not yours")
         with pytest.raises(TypeError, match="deleting"):
             await app.delete(channel, sent)
+        with pytest.raises(TypeError, match="deleting"):
+            await app.delete(channel, sent, fallback="edit")
+        # Nothing can hide a sent WhatsApp message; a notice replies to it.
+        assert await app.delete(channel, sent, fallback="notice") == "noticed"
+        notice = receipt.calls[-1][1]["json"]
+        assert notice["text"]["body"] == "Please disregard my previous message."
+        assert notice["context"] == {"message_id": "wamid.sent"}
     finally:
         await channel.close()
 

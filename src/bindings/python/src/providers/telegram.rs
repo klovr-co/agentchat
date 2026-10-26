@@ -965,6 +965,38 @@ impl Telegram {
             Ok(none())
         })
     }
+    /// Replace the text of a message this bot sent (`editMessageText`). Notices
+    /// cannot be edited.
+    fn edit(
+        slf: Py<Self>,
+        py: Python<'_>,
+        message: Py<PyAny>,
+        text: String,
+    ) -> PyResult<Py<PyAny>> {
+        host::coroutine(py, async move {
+            let this = slf.into_any();
+            let sent = Python::attach(|py| convert::from_message(message.bind(py)))?;
+            let bot = extract(&get(&this, "_bot_id")?)?;
+            let payload = policy::edit_request(&sent, bot, &text).map_err(PyValueError::new_err)?;
+            let id = payload["message_id"].clone();
+            call(&get(&this, "_delivery")?, "check_reply", vec![], None)?;
+            match client_call(&this, "editMessageText", Some(payload), None).await {
+                Err(error) if !error.to_string().contains("message is not modified") => {
+                    return Err(error)
+                }
+                _ => {}
+            }
+            let edited = policy::receipt(
+                &sent,
+                bot,
+                extract(&get(&this, "_first_name")?)?,
+                &text,
+                &json!({"message_id": id}),
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            receipt_with_metadata(&message, &edited)
+        })
+    }
     /// Show task progress as a separate message above the answer, edited in place
     /// and deleted when the answer is finished. A failed update never fails the answer.
     fn update_stream_tasks(
