@@ -1,7 +1,7 @@
 # Public compatibility signatures; update with the corresponding Rust binding API.
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 from aiohttp import web
 
@@ -81,7 +81,9 @@ class Telegram:
     async def send_ephemeral(
         self, source: Message, user_id: str, text: str, *,
         blocks: Sequence[Mapping[str, object]] | None = ...,
+        fallback: Literal["dm"] | None = ...,
     ) -> Message: ...
+    async def publish_home(self, user_id: str, view: str) -> Message: ...
     async def delete(self, message: Message) -> None: ...
     async def update_stream_tasks(
         self, source: Message, stream: object | None, updates: Sequence[Mapping[str, object]],

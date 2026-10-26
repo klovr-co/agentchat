@@ -219,3 +219,42 @@ async def test_home_message_is_pinned_then_edited_and_found_again_after_a_restar
     await channel.publish_home("30", "Still here")
     assert restarted.method_calls("sendMessage") == []
     assert restarted.method_calls("editMessageText")[-1]["message_id"] == 101
+
+
+@pytest.mark.asyncio
+async def test_a_chat_form_offers_buttons_for_choices_and_takes_text_replies():
+    client = Client()
+    channel = faked(client)
+    app = AgentChat(channels=[channel])
+    submitted = []
+
+    @app.on_message
+    async def respond(context):
+        await context.open_form({"callback_id": "team", "fields": [
+            {"id": "plan", "label": "Which plan?", "type": "choice", "options": ["Free", "Pro"]},
+            {"id": "name", "label": "Team name?"},
+        ]})
+
+    @channel.on_view("team")
+    async def created(payload):
+        submitted.append(payload["values"])
+
+    client.batches = [[telegram_update(1, text="start")]]
+    task = await running(channel, client)
+    try:
+        await until(lambda: client.method_calls("sendMessage"))
+        question = client.method_calls("sendMessage")[0]
+        assert question["text"].startswith("Which plan?")
+        buttons = [b for row in question["reply_markup"]["inline_keyboard"] for b in row]
+        pro = next(button for button in buttons if button["text"] == "Pro")
+        channel._has_admitted_all([callback_update(data=pro["callback_data"], update_id=3)])
+        await until(lambda: len(client.method_calls("sendMessage")) == 2)
+        assert client.method_calls("sendMessage")[1]["text"] == "Team name?"
+        # The pressed question loses its buttons and shows the answer.
+        assert "Pro" in client.method_calls("editMessageText")[-1]["text"]
+        channel._has_admitted_all([telegram_update(4, text="Rockets", message_id=102)])
+        await until(lambda: submitted)
+        assert submitted == [{"plan": "Pro", "name": "Rockets"}]
+    finally:
+        await channel.close()
+        await task

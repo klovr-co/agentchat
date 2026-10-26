@@ -214,8 +214,11 @@ modals and App Home (`slack.open_view()`, `push_view()`, `update_view()`,
 Telegram, Discord, Teams, WhatsApp, YCloud and iMessage take the same handlers
 and use their own equivalents: Telegram ephemeral messages and draft stop
 buttons, Discord interaction responses and modals, Teams targeted messages,
-dialogs and stream Stop, WhatsApp Flows, and fallbacks where a provider has
-none. See [App features](docs/app-features.md).
+dialogs and stream Stop, WhatsApp Flows. Where a provider has none there is a
+fallback: forms asked in the chat (`context.open_form()`), a pinned or edited home
+message (`publish_home()`), notices by direct message (`fallback="dm"`), iMessage
+unsend and edited progress, and WhatsApp task messages. See
+[App features](docs/app-features.md).
 
 ## Supported channels
 

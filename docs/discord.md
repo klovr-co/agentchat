@@ -68,7 +68,7 @@ Discord's rate limits.
 
 ## App features
 
-Register handlers for gateway events, component and modal interactions, and slash commands; their return value is the interaction response, which can be private or open a modal. Discord also deletes messages and shows task progress. See [App features](app-features.md).
+Register handlers for gateway events, component and modal interactions, and slash commands; their return value is the interaction response, which can be private or open a modal. Discord also deletes messages and shows task progress. `publish_home()` keeps a pinned home message in a direct message, `fallback="dm"` sends notices as direct messages, and `context.open_form()` asks a form with buttons. See [App features](app-features.md).
 
 ## Troubleshooting and maintenance
 

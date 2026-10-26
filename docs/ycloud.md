@@ -215,7 +215,7 @@ the *service* rate; they do not say it equals the Utility rate. Check
 
 ## App features
 
-Register handlers for webhook events, button and list replies, Flow responses and `/commands`; `bind_events` keeps working alongside. `reply_rich` sends any interactive message, including Flows. See [App features](app-features.md).
+Register handlers for webhook events, button and list replies, Flow responses and `/commands`; `bind_events` keeps working alongside. `reply_rich` sends any interactive message, including Flows. A handler's text answer to a press, Flow reply or command is sent as a reply. `YCloud(task_messages=True)` reports finished tasks as short replies, and `publish_home()` sends a home message. See [App features](app-features.md).
 
 ## Hosting and troubleshooting
 

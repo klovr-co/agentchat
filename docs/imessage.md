@@ -85,7 +85,7 @@ and restarting the adapter.
 
 ## App features
 
-Register handlers for BlueBubbles socket events (such as `updated-message`) and `/commands`. `IMessage(stop_keyword="stop")` lets a message that is exactly the keyword stop the sender's running turn. See [App features](app-features.md).
+Register handlers for BlueBubbles socket events (such as `updated-message`) and `/commands`; a command handler's text answer is sent as a reply. `IMessage(stop_keyword="stop")` lets a message that is exactly the keyword stop the sender's running turn. With the BlueBubbles Private API, `app.delete()` unsends a message (within two minutes), task progress is one message edited in place, and `publish_home()` keeps an edited home message in the person's one-to-one chat. Ask forms in the chat with `context.open_form()`, and send group notices to the one-to-one chat with `fallback="dm"`. See [App features](app-features.md).
 
 ## Troubleshooting
 

@@ -65,7 +65,9 @@ structurally; no capability registry is needed.
 | `MirroringChannel` | `mirror()` | Raises `TypeError` |
 | `StreamingChannel` | `start_stream()`, `append_stream()`, `stop_stream()` | One reply when the stream finishes |
 | `InteractiveChannel` | `send_prompt()`, `close_prompt()` | `ask()` raises `TypeError`; `busy="ask"` steers |
-| `TaskStreamingChannel` | `update_stream_tasks()` | `AnswerStream.task()` and `plan()` are ignored |
+| `TaskProgressChannel` | `update_stream_tasks()` | `AnswerStream.task()` and `plan()` are ignored |
+| `TaskStreamingChannel` | `StreamingChannel` and `TaskProgressChannel` | Task updates start or join the stream |
+| `HomeChannel` | `publish_home()` | No home screen |
 | `EphemeralChannel` | `send_ephemeral()` | Raises `TypeError`; never posted publicly instead |
 | `DeletingChannel` | `delete()` | Raises `TypeError` |
 

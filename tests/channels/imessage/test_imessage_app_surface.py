@@ -176,3 +176,80 @@ async def test_home_message_is_edited_until_apple_stops_allowing_it():
     await channel.publish_home("+15550000000", "Home 7")
     assert client.sent[-1] == ("iMessage;-;+15550000000", "Home 7")
     await channel.close()
+
+
+SIGNUP = {
+    "callback_id": "signup",
+    "title": "Sign up",
+    "fields": [
+        {"id": "name", "label": "Your name?"},
+        {"id": "plan", "label": "Which plan?", "type": "choice", "options": ["Free", "Pro"]},
+        {"id": "news", "label": "Newsletter?", "type": "yes_no"},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_a_chat_form_asks_each_field_and_submits_to_on_view():
+    channel, client = editing_channel()
+    app = AgentChat(channels=[channel])
+    submitted, messages = [], []
+
+    @app.on_message
+    async def respond(context):
+        if context.message.text == "sign me up":
+            await context.open_form(SIGNUP)
+        else:
+            messages.append(context.message.text)
+
+    @channel.on_view("signup")
+    async def signed_up(payload):
+        submitted.append(payload)
+        return {"text": "Thanks!"}
+
+    async def say(text, guid, replies):
+        await channel._socket.handlers["new-message"](imessage_event(text=text, guid=guid))
+        await until(lambda: len(client.sent) == replies)
+        return client.sent[-1][1]
+
+    first = await say("sign me up", "f1", 1)
+    assert first == '**Sign up**\nYour name?\n(Reply "cancel" to stop)'
+    assert await say("Ada", "f2", 2) == "Which plan?\n1. Free\n2. Pro"
+    retry = "Please pick one of the options.\nWhich plan?\n1. Free\n2. Pro"
+    assert await say("Gold", "f3", 3) == retry
+    assert await say("2", "f4", 4) == "Newsletter?\n1. Yes\n2. No"
+    assert await say("yes", "f5", 5) == "Thanks!"
+    assert submitted == [{
+        "type": "form_submission", "callback_id": "signup", "user_id": "+15551234567",
+        "conversation_id": submitted[0]["conversation_id"],
+        "values": {"name": "Ada", "plan": "Pro", "news": True},
+    }]
+    # The form's answers never became messages; afterwards messages flow again.
+    await channel._socket.handlers["new-message"](imessage_event(text="hello", guid="f6"))
+    await until(lambda: messages)
+    assert messages == ["hello"]
+    history = await app.state.history(submitted[0]["conversation_id"])
+    assert [message.text for message in history] == ["sign me up", "hello"]
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_a_chat_form_can_be_cancelled_and_needs_a_view_handler():
+    channel, _ = editing_channel()
+    app = AgentChat(channels=[channel])
+    closed = []
+    source = normalize(imessage_event(), instance_id="mac")
+    with pytest.raises(ValueError, match="on_view"):
+        await app.open_form(channel, source, SIGNUP)
+    with pytest.raises(ValueError):
+        await app.open_form(channel, source, {"callback_id": "signup", "fields": []})
+
+    @channel.on_view("signup")
+    async def signed_up(payload):
+        closed.append(payload["reason"] if payload["type"] == "form_closed" else payload)
+
+    await app.open_form(channel, source, SIGNUP)
+    await channel._socket.handlers["new-message"](imessage_event(text="Cancel", guid="c1"))
+    await until(lambda: closed)
+    assert closed == ["cancelled"]
+    await app.close()

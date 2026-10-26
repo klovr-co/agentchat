@@ -9,6 +9,7 @@ mod channel;
 mod context;
 mod control;
 mod error;
+mod form;
 mod history;
 mod models;
 mod prompt;
@@ -23,6 +24,10 @@ pub use channel::Channel;
 pub use context::{Conversation, MessageContext};
 pub use control::{is_stop_request, Allowed, Busy, TurnControl, STOP_METADATA};
 pub use error::{Error, Result};
+pub use form::{
+    FieldKind, Form, FormField, FormOption, FormSession, FormStep, Question, CANCEL_WORD,
+    DEFAULT_TIMEOUT, MAX_FIELDS, SKIP_WORD,
+};
 pub use history::{select_history, thread_history_indices, HistoryLimit};
 pub use models::*;
 pub use prompt::{

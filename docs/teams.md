@@ -77,7 +77,7 @@ conversation and repeats it every 3 seconds, because Teams clears it quickly.
 
 ## App features
 
-Register handlers for other activities (such as `installationUpdate`), card actions, dialogs and `/commands`; an invoke handler's return value is the invoke response. Teams also sends targeted (private) messages, deletes messages, shows task progress, and stops the turn when someone presses Stop on a streamed answer. See [App features](app-features.md).
+Register handlers for other activities (such as `installationUpdate`), card actions, dialogs and `/commands`; an invoke handler's return value is the invoke response. Teams also sends targeted (private) messages, deletes messages, shows task progress, and stops the turn when someone presses Stop on a streamed answer. `publish_home()` keeps a home message in the one-to-one chat once that person has messaged the app there. See [App features](app-features.md).
 
 ## Troubleshooting and maintenance
 

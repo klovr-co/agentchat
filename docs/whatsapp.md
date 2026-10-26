@@ -83,7 +83,7 @@ no status text.
 
 ## App features
 
-Register handlers for delivery statuses, reactions, button and list replies, Flow responses and `/commands`. `reply_rich` sends any interactive message, including Flows. See [App features](app-features.md).
+Register handlers for delivery statuses, reactions, button and list replies, Flow responses and `/commands`. `reply_rich` sends any interactive message, including Flows. A handler's text answer to a press, Flow reply or command is sent as a reply. `WhatsApp(task_messages=True)` reports finished tasks as short replies, and `publish_home()` sends a home message. WhatsApp cannot delete or edit sent messages. See [App features](app-features.md).
 
 ## Production setup and troubleshooting
 

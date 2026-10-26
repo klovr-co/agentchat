@@ -75,5 +75,9 @@ class AgentChat:
     async def send_ephemeral(
         self, channel: Channel, source: Message, user_id: str, text: str, *,
         blocks: Sequence[Mapping[str, object]] | None = ...,
+        fallback: Literal["dm"] | None = ...,
     ) -> Message: ...
     async def delete(self, channel: Channel, message: Message) -> None: ...
+    async def open_form(
+        self, channel: Channel, source: Message, form: Mapping[str, object]
+    ) -> None: ...

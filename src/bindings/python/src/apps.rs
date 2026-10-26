@@ -193,7 +193,7 @@ pub fn spawn(
 
 /// The text of a handler's answer to send as a reply: a string, or a mapping's
 /// nonempty `"text"`.
-fn reply_text(answer: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+pub fn reply_text(answer: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     let text = if let Ok(text) = answer.extract::<String>() {
         Some(text)
     } else if answer.hasattr("get")? {

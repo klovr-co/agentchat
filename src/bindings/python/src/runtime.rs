@@ -427,6 +427,25 @@ impl AgentChat {
             call(channel, "delete", vec![message], vec![]).await
         })
     }
+    /// Ask `form` of `source`'s sender in its conversation, one field at a time,
+    /// on any channel: buttons for choices where the channel has them, numbered
+    /// options otherwise. Their next messages answer it. The values reach the
+    /// channel's `on_view(form["callback_id"])` handler, as `{"type":
+    /// "form_submission", "values": ...}`, or `{"type": "form_closed", "reason":
+    /// "cancelled" | "timeout"}`. A form already open for that person is replaced.
+    fn open_form(
+        slf: Py<Self>,
+        py: Python<'_>,
+        channel: Object,
+        source: Object,
+        form: Object,
+    ) -> PyResult<Object> {
+        let app = slf.into_any();
+        coroutine(py, async move {
+            crate::forms::open(app, channel, source, form).await?;
+            Ok(none())
+        })
+    }
     #[pyo3(signature=(channel,source,message,*,origin="web"))]
     fn mirror(
         slf: Py<Self>,
@@ -577,7 +596,11 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
         let press = prompts::answer_of(message.bind(py))?;
         let stop = prompts::stop_request(message.bind(py))?;
         let handler = app.bind(py).getattr("_handler")?;
-        if handler.is_none() && press.is_none() && !stop {
+        if handler.is_none()
+            && press.is_none()
+            && !stop
+            && !crate::forms::is_open(app.bind(py), message.bind(py))?
+        {
             return Err(PyRuntimeError::new_err(
                 "Register a message handler with @app.on_message",
             ));
@@ -594,6 +617,10 @@ async fn receive(app: Object, channel: Object, message: Object) -> PyResult<Obje
     let (busy, running, registry) = native_app(&app)?;
     let claimed = call(copy(&state), "claim", vec![copy(&id)], vec![]).await?;
     if !Python::attach(|py| claimed.bind(py).is_truthy())? {
+        return Ok(none());
+    }
+    // A form waiting for this person takes their messages and its buttons.
+    if crate::forms::intercept(&app, &channel, &message, press.as_ref(), stop).await? {
         return Ok(none());
     }
     // A button press answers a prompt; it never starts or joins a turn.
@@ -1032,6 +1059,10 @@ impl MessageContext {
                 ("fallback", fallback.unwrap_or_else(|| py.None())),
             ],
         )
+    }
+    /// Ask a form of this message's sender; see `AgentChat.open_form`.
+    fn open_form(&self, py: Python<'_>, form: Object) -> PyResult<Object> {
+        self.forward(py, "open_form", vec![form], vec![])
     }
     #[pyo3(signature=(attachment,*,max_bytes=10*1024*1024))]
     fn download_attachment(

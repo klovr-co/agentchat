@@ -122,7 +122,7 @@ Telegram implements the optional capabilities:
 
 ## App features
 
-Register handlers for other updates (such as `my_chat_member`), inline-button presses and `/commands`. Telegram also sends private notices in groups, deletes messages, shows task progress, and can stream drafts with its stop button (`stream_drafts=True`). See [App features](app-features.md).
+Register handlers for other updates (such as `my_chat_member`), inline-button presses and `/commands`. Telegram also sends private notices in groups, deletes messages, shows task progress, and can stream drafts with its stop button (`stream_drafts=True`). Where Telegram has no feature there is a fallback: `context.open_form()` asks a form with buttons, `publish_home()` keeps a pinned home message in the private chat, and `fallback="dm"` sends a refused group notice to the private chat. See [App features](app-features.md).
 
 ## Troubleshooting
 

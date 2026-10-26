@@ -16,6 +16,7 @@ mod apps;
 mod control;
 mod convert;
 mod delivery;
+mod forms;
 mod host;
 mod integrations;
 mod prompts;

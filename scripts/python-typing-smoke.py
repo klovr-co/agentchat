@@ -70,6 +70,14 @@ async def check_api(
     assert_type(await teams.send_ephemeral(message, "29:user", "only you"), Message)
     assert_type(await discord.delete(message), None)
     assert_type(await whatsapp.reply_rich(message, RichReply(text="Form", blocks=())), Message)
+    assert_type(await context.reply_ephemeral("only you", fallback="dm"), Message)
+    assert_type(await telegram.publish_home("30", "Welcome"), Message)
+    assert_type(await discord.publish_home("30", "Welcome"), Message)
+    assert_type(await teams.publish_home("29:user", "Welcome"), Message)
+    assert_type(await whatsapp.publish_home("15551234567", "Welcome"), Message)
+    form = {"callback_id": "signup", "fields": [{"id": "name", "label": "Your name?"}]}
+    assert_type(await context.open_form(form), None)
+    assert_type(await app.open_form(telegram, message, form), None)
 
     async with context.stream() as reply:
         assert_type(await reply.task("t1", "Search", "complete", details="done"), None)
